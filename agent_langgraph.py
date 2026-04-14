@@ -29,9 +29,11 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from typing import Any, Dict
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.tools import tool
 from langchain_anthropic import ChatAnthropic
@@ -63,6 +65,55 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOKEN_THRESHOLD = 100000
 
 
+# ==================== ReAct 追踪回调 ====================
+
+class ToolCallbackHandler(BaseCallbackHandler):
+    """ReAct 循环可视化回调
+
+    在每个工具调用时打印：
+    - 工具名称和输入参数
+    - 工具执行结果（截断到 300 字符）
+    """
+
+    step_count: int = 0
+
+    def on_tool_start(
+        self,
+        serialized: Dict[str, Any],
+        input_str: str,
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        self.step_count += 1
+        tool_name = serialized.get("name", serialized.get("id", "?"))
+        # 截断过长的输入
+        display_input = input_str[:500] + "..." if len(input_str) > 500 else input_str
+        print(f"\n\033[33m[Step {self.step_count}] Calling tool: {tool_name}\033[0m")
+        if display_input:
+            print(f"  Input: {display_input}")
+
+    def on_tool_end(
+        self,
+        output: Any,
+        *,
+        run_id: Any,
+        parent_run_id: Any = None,
+        **kwargs: Any,
+    ) -> None:
+        # output 可能是 ToolMessage 对象或字符串
+        try:
+            output_str = str(output.content) if hasattr(output, "content") else str(output)
+        except Exception:
+            output_str = str(output)
+        display_output = output_str[:300] + "..." if len(output_str) > 300 else output_str
+        print(f"\033[32m[Step {self.step_count}] Result\033[0m: {display_output}")
+
+    def reset(self) -> None:
+        self.step_count = 0
+
+
 # ==================== 基础工具 ====================
 
 def safe_path(p: str) -> Path:
@@ -90,23 +141,29 @@ def bash(command: str) -> str:
 
 @tool
 def read_file(path: str, limit: int = None) -> str:
-    """读取文件内容"""
-    try:
-        lines = safe_path(path).read_text().splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)[:50000]
-    except Exception as e:
-        return f"Error: {e}"
+    """读取文件内容，尝试多种编码"""
+    fp = safe_path(path)
+    # 按优先级尝试常见编码
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+        try:
+            lines = fp.read_text(encoding=encoding, errors="replace").splitlines()
+            if limit and limit < len(lines):
+                lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
+            return "\n".join(lines)[:50000]
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return f"Error: {e}"
+    return f"Error: unable to decode {path}"
 
 
 @tool
 def write_file(path: str, content: str) -> str:
-    """写入文件内容"""
+    """写入文件内容（UTF-8 编码）"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -115,12 +172,23 @@ def write_file(path: str, content: str) -> str:
 @tool
 def edit_file(path: str, old_text: str, new_text: str) -> str:
     """替换文件中的指定文本"""
+    fp = safe_path(path)
+    # 按优先级尝试多种编码读取
+    content = None
+    for encoding in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+        try:
+            content = fp.read_text(encoding=encoding, errors="replace")
+            break
+        except UnicodeDecodeError:
+            continue
+        except Exception as e:
+            return f"Error: {e}"
+    if content is None:
+        return f"Error: unable to decode {path}"
+    if old_text not in content:
+        return f"Error: Text not found in {path}"
     try:
-        fp = safe_path(path)
-        c = fp.read_text()
-        if old_text not in c:
-            return f"Error: Text not found in {path}"
-        fp.write_text(c.replace(old_text, new_text, 1))
+        fp.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
@@ -133,9 +201,16 @@ class SkillLoader:
     def __init__(self, skills_dir: Path):
         self.skills = {}
         if skills_dir.exists():
-            # 递归查找所有 SKILL.md
             for f in sorted(skills_dir.rglob("SKILL.md")):
-                text = f.read_text()
+                text = None
+                for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+                    try:
+                        text = f.read_text(encoding=enc, errors="replace")
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if text is None:
+                    continue
                 # 解析 frontmatter (--- ... ---)
                 match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
                 meta, body = {}, text
@@ -198,7 +273,7 @@ def auto_compact(messages: list) -> list:
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     # 保存完整历史到 jsonl 文件
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     # 压缩最后 80000 字符的内容
@@ -316,7 +391,7 @@ def main():
 
     while True:
         try:
-            query = input("\033[36mlanggraph >> \033[0m")
+            query = input("\033[36mLabPilot >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
 
@@ -350,15 +425,18 @@ def main():
             print("[auto-compact triggered]")
             history = auto_compact(history)
 
-        # 调用 agent
+        # 调用 agent（带回调以追踪 ReAct 循环）
         try:
             langchain_messages = [
                 HumanMessage(content=m["content"]) if isinstance(m, dict) else m
                 for m in history
             ]
+
+            # 每次循环重置计数器
+            callback = ToolCallbackHandler()
             result = agent.invoke(
                 {"messages": langchain_messages},
-                config={"max_iterations": 100, "max_tokens": 8000}
+                config={"max_iterations": 100, "max_tokens": 8000, "callbacks": [callback]}
             )
             response_messages = result.get("messages", [])
 
