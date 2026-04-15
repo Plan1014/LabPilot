@@ -1,0 +1,12 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": [
+    "d:/PDHlocking/LabPilot/venv/Scripts/python.exe",
+    "-m",
+    "langgraph"
+  ],
+  "graphs": {
+    "agent": "./src/agent/__init__.py:graph"
+  },
+  "env": ".env"
+}
