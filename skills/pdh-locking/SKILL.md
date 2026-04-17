@@ -2,7 +2,7 @@
 name: pdh-locking
 description: >
   Use this skill whenever interacting with the PDH (Pound-Drever-Hall) optical
-  cavity locking FastAPI service (Linien LLM Control API) running at
+  cavity locking FastAPI service running at
   http://127.0.0.1:8000. Triggers include: any request to calculate PI, query
   task results, check or control lock state, set PID/modulation parameters,
   export waveforms, or monitor power. Also use when user mentions "PDH",
@@ -10,7 +10,6 @@ description: >
   "/pi/", "/lock/", "/pid/", "/modulation/", "/plot/", "/power/" endpoints.
   Do NOT use for general FastAPI services unrelated to PDH locking.
 ---
-
 # PDH Locking System — FastAPI Client Skill
 
 ## Overview
@@ -31,17 +30,17 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 
 ## Endpoint Summary
 
-| Operation | Method | Endpoint | Notes |
-|-----------|--------|----------|-------|
-| PI 计算 | POST | `/pi/calculate` | Returns `task_id`, long-running async |
-| 查询结果 | GET | `/task/{task_id}` | Poll for completion |
-| 锁定状态 | GET | `/lock/status` | Returns `{"locked": bool}` |
-| 执行锁定 | POST | `/lock/manual` | Triggers lock — verify with power check |
-| 执行解锁 | POST | `/lock/stop` | Returns `{"status": "stopped"}` |
-| 设置 PID | POST | `/pid/set` | `{"kp":0-8191,"ki":0-8191,"kd":0-8191}` |
-| 设置调制 | POST | `/modulation/set` | `{"frequency_mhz":0-99,"amplitude_vpp":0-2}` |
-| 导出波形 | POST | `/plot/export` | `{"save_path":"*.png"}` |
-| 读取功率 | GET | `/power/monitor` | Returns power snapshot |
+| Operation | Method | Endpoint            | Notes                                          |
+| --------- | ------ | ------------------- | ---------------------------------------------- |
+| PI 计算   | POST   | `/pi/calculate`   | Returns `task_id`, long-running async        |
+| 查询结果  | GET    | `/task/{task_id}` | Poll for completion                            |
+| 锁定状态  | GET    | `/lock/status`    | Returns `{"locked": bool}`                   |
+| 执行锁定  | POST   | `/lock/manual`    | Triggers lock — verify with power check       |
+| 执行解锁  | POST   | `/lock/stop`      | Returns `{"status": "stopped"}`              |
+| 设置 PID  | POST   | `/pid/set`        | `{"kp":0-8191,"ki":0-8191,"kd":0-8191}`      |
+| 设置调制  | POST   | `/modulation/set` | `{"frequency_mhz":0-99,"amplitude_vpp":0-2}` |
+| 导出波形  | POST   | `/plot/export`    | `{"save_path":"*.png"}`                      |
+| 读取功率  | GET    | `/power/monitor`  | Returns power snapshot                         |
 
 ---
 
@@ -50,6 +49,7 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 ### 1. PI Calculation (Async Task)
 
 **⚠️ Important constraints:**
+
 - PI calculation is **long-running** and can interfere with subsequent
   operations — do NOT主动执行 (do not proactively execute) unless the user
   explicitly requests it
@@ -59,16 +59,19 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 PI calculation runs a `PIComputeThread` in the GUI.
 
 **Step 1: Start calculation (only if explicitly requested and system is unlocked)**
+
 ```
 curl.exe -X POST http://127.0.0.1:8000/pi/calculate
 ```
 
 Response (immediate):
+
 ```json
 {"task_id": "uuid-string", "status": "pending"}
 ```
 
 **Step 2: Poll for result**
+
 ```
 curl.exe http://127.0.0.1:8000/task/{task_id}
 ```
@@ -104,19 +107,23 @@ response from `/lock/manual` does NOT guarantee the physical lock succeeded.
 5. If `power_after >= power_before`, the lock may have **failed** — report this
 
 **Check lock status:**
+
 ```
 curl.exe http://127.0.0.1:8000/lock/status
 ```
 
 **Execute lock:**
+
 ```
 curl.exe -X POST http://127.0.0.1:8000/lock/manual
 ```
 
 **Execute unlock (stop lock):**
+
 ```
 curl.exe -X POST http://127.0.0.1:8000/lock/stop
 ```
+
 Returns: `{"status": "stopped", "message": "Lock successfully stopped"}`
 
 ---
@@ -134,6 +141,7 @@ curl.exe -X POST http://127.0.0.1:8000/pid/set ^
 Response: `{"status": "updated", "kp": 100, "ki": 50, "kd": 10}`
 
 Parameters:
+
 - `kp` — proportional gain (0–8191)
 - `ki` — integral gain (0–8191)
 - `kd` — derivative gain (0–8191)
@@ -151,10 +159,12 @@ curl.exe -X POST http://127.0.0.1:8000/modulation/set ^
 Response: `{"status": "updated", "freq_mhz": 10.5, "amp_vpp": 1.2}`
 
 Parameters:
+
 - `frequency_mhz` — float, range 0–99 MHz
 - `amplitude_vpp` — float, range 0–2 Vpp
 
 **⚠️ Frequency warnings (inform the user):**
+
 - `> 10 MHz`: Signal begins to distort — warn the user
 - `> 31.25 MHz`: Signal is completely unusable — strongly warn the user
 - Always keep frequency to **2 decimal places** when presenting or setting
@@ -187,13 +197,14 @@ as described in the Lock Control section.
 
 ## Response Handling
 
-| Scenario | HTTP Status | Response |
-|----------|-------------|----------|
-| Success | 200 | JSON with result data |
-| Not found | 404 | `{"detail": "Task not found or expired"}` |
-| Validation error | 422 | `{"detail": [...]}`
+| Scenario         | HTTP Status | Response                                    |
+| ---------------- | ----------- | ------------------------------------------- |
+| Success          | 200         | JSON with result data                       |
+| Not found        | 404         | `{"detail": "Task not found or expired"}` |
+| Validation error | 422         | `{"detail": [...]}`                       |
 
 For async tasks (`/pi/calculate`):
+
 - Pending: `{"task_id": "...", "status": "pending"}`
 - Processing: `{"task_id": "...", "status": "processing"}`
 - Completed: `{"task_id": "...", "status": "completed", "result": {...}}`
