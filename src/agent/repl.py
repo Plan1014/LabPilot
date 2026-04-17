@@ -104,7 +104,7 @@ def auto_compact(messages: list) -> list:
 
 def create_repl_agent():
     """Create the REPL-mode agent (no checkpointer, manual history)."""
-    system_prompt = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+    system_prompt = f"""You are a lab agent at {WORKDIR}. Use tools to solve tasks.
 Use spawn_subagent for multi-step or isolated work.
 Use load_skill for specialized knowledge.
 Skills: {SKILLS.descriptions()}"""
