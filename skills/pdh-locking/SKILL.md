@@ -32,8 +32,8 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 
 | Operation | Method | Endpoint            | Notes                                          |
 | --------- | ------ | ------------------- | ---------------------------------------------- |
-| PI 计算   | POST   | `/pi/calculate`   | Returns `task_id`, result pushed via WebSocket |
-| 查询结果  | GET    | `/task/{task_id}` | 仅在用户明确要求时查询                              |
+| PI 计算   | POST   | `/pi/calculate`   | Returns `task_id`, long-running async        |
+| 查询结果  | GET    | `/task/{task_id}` | Poll for completion                            |
 | 锁定状态  | GET    | `/lock/status`    | Returns `{"locked": bool}`                   |
 | 执行锁定  | POST   | `/lock/manual`    | Triggers lock — verify with power check       |
 | 执行解锁  | POST   | `/lock/stop`      | Returns `{"status": "stopped"}`              |
@@ -41,24 +41,6 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 | 设置调制  | POST   | `/modulation/set` | `{"frequency_mhz":0-99,"amplitude_vpp":0-2}` |
 | 导出波形  | POST   | `/plot/export`    | `{"save_path":"*.png"}`                      |
 | 读取功率  | GET    | `/power/monitor`  | Returns power snapshot                         |
-
----
-
-## WebSocket Push Notifications
-
-When PI calculation completes, the result is automatically pushed to the agent via WebSocket. **You do NOT need to poll for results.**
-
-The push notification format:
-```
-[WebSocket] task_completed: P={value}, I={value}
-```
-
-For example:
-```
-[WebSocket] task_completed: P=1800, I=4800
-```
-
-**Important**: When you receive such a WebSocket notification, report the result to the user. Do NOT initiate additional PI calculations unless the user explicitly requests it.
 
 ---
 
@@ -74,9 +56,9 @@ For example:
 - PI calculation **must be performed in unlocked state** — if locked,
   report that it cannot run while locked
 
-**Execution flow:**
+PI calculation runs a `PIComputeThread` in the GUI.
 
-1. Start calculation (only if explicitly requested and system is unlocked):
+**Step 1: Start calculation (only if explicitly requested and system is unlocked)**
 
 ```
 curl.exe -X POST http://127.0.0.1:8000/pi/calculate
@@ -88,24 +70,23 @@ Response (immediate):
 {"task_id": "uuid-string", "status": "pending"}
 ```
 
-2. Tell the user "PI calculation started", then **end immediately**.
-
-3. Do NOT wait for results, do NOT spawn subagents, do NOT poll `/task/{task_id}`.
-
-**Why**: Results are automatically pushed via WebSocket when complete. When you receive a message in this format:
+**Step 2: Poll for result**
 
 ```
-[WebSocket] task_completed: P={value}, I={value}
+curl.exe http://127.0.0.1:8000/task/{task_id}
 ```
 
-It means the result has arrived and this agent will be triggered again to report the result. You do NOT need to do anything else.
+While `status` is `"processing"`, the task is still running. When `status`
+becomes `"completed"`, the `result` field contains the output:
 
-**Forbidden behaviors:**
-- Do NOT spawn subagents to wait for or poll PI results
-- Do NOT use sleep or any waiting mechanism
-- Do NOT manually poll `/task/{task_id}`
+```json
+{"task_id": "uuid-string", "status": "completed", "result": {...}}
+```
 
-The system handles result delivery automatically.
+If the task is not found or expired, returns HTTP 404.
+
+**User-facing presentation:** Start the calculation, tell the user the
+`task_id`, poll in the background, and report the result when ready.
 
 ---
 
@@ -225,14 +206,15 @@ as described in the Lock Control section.
 For async tasks (`/pi/calculate`):
 
 - Pending: `{"task_id": "...", "status": "pending"}`
-- **Do NOT poll for results** — they are delivered automatically via WebSocket
+- Processing: `{"task_id": "...", "status": "processing"}`
+- Completed: `{"task_id": "...", "status": "completed", "result": {...}}`
 
 ---
 
 ## Usage Examples
 
 **"Calculate PI and give me the result"**
-→ Verify system is unlocked (if locked, unlock it) → POST /pi/calculate → get task_id → Tell the user "PI calculation started", then **end immediately**. If WebSocket push arrives → report result
+→ Verify system is unlocked (if locked, report cannot run) → POST /pi/calculate → get task_id → poll /task/{id} until completed → report result
 
 **"Is the PDH system locked?"**
 → GET /lock/status → report locked state

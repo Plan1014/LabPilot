@@ -20,7 +20,3 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 
 # Thresholds
 TOKEN_THRESHOLD = 100000
-
-# WebSocket server configuration
-WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "8001"))
-WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "true").lower() == "true"
