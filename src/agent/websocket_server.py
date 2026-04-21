@@ -21,8 +21,9 @@ class NotificationQueue:
     Decouples WebSocket message reception from agent processing.
 
     Trigger logic:
-    - If REPL is idle (waiting for input): immediately trigger agent
+    - If REPL is idle (waiting for input): immediately trigger agent with latest notification
     - If REPL is busy (processing): queue for later processing
+    - Queue is cleared when triggering, keeping only the latest notification
     """
 
     def __init__(self):
@@ -30,6 +31,7 @@ class NotificationQueue:
         self._lock = threading.Lock()
         self._is_idle = True
         self._trigger_callback: Optional[Callable[[str], None]] = None
+        self._processing = False  # Flag to prevent re-entrant processing
 
     def set_trigger_callback(self, callback: Callable[[str], None]):
         """Set callback to trigger agent with user message."""
@@ -43,32 +45,61 @@ class NotificationQueue:
 
         # When transitioning from busy to idle, process queued notifications
         if not was_idle and is_idle:
-            self._process_all()
+            self._process_one()
 
     def put(self, message: dict):
         """Add a notification to the queue.
 
         If idle, immediately trigger agent. Otherwise, queue for later.
+        Keeps only the latest notification (clears old ones when idle).
         """
-        self._queue.put(message)
-
-        # If idle, immediately trigger agent
+        # If idle, clear old notifications and trigger immediately with new one
         with self._lock:
-            if self._is_idle:
+            if self._is_idle and not self._processing:
+                # Clear old pending notifications
+                while not self._queue.empty():
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
                 self._trigger(message)
+            else:
+                # If busy, queue for later processing
+                self._queue.put(message)
 
     def _trigger(self, message: dict):
         """Trigger agent with formatted notification message."""
         if self._trigger_callback:
-            user_text = self.format_for_user(message)
-            self._trigger_callback(user_text)
+            with self._lock:
+                self._processing = True
+            try:
+                user_text = self.format_for_user(message)
+                self._trigger_callback(user_text)
+            finally:
+                with self._lock:
+                    self._processing = False
 
-    def _process_all(self):
-        """Process all queued notifications."""
+    def _process_one(self):
+        """Process only the latest queued notification (drains old ones)."""
+        if self._processing:
+            return
+
+        # Drain all but the last message
+        latest = None
         while True:
             try:
-                msg = self._queue.get_nowait()
-                self._trigger(msg)
+                latest = self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest:
+            self._trigger(latest)
+
+    def clear(self):
+        """Clear the queue of all pending notifications."""
+        while True:
+            try:
+                self._queue.get_nowait()
             except queue.Empty:
                 break
 
