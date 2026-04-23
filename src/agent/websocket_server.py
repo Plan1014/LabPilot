@@ -21,14 +21,14 @@ class NotificationQueue:
     Decouples WebSocket message reception from agent processing.
 
     Trigger logic:
-    - If REPL is idle (waiting for input): immediately trigger agent with latest notification
-    - If REPL is busy (processing): queue for later processing
-    - Queue is cleared when triggering, keeping only the latest notification
+    - If REPL is idle: immediately trigger agent
+    - If REPL is busy: queue for later processing
+    - When transitioning busy->idle: drain all queued messages and merge into one trigger
     """
 
     def __init__(self):
         self._queue: queue.Queue = queue.Queue()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock allows re-entrant locking from same thread
         self._is_idle = True
         self._trigger_callback: Optional[Callable[[str], None]] = None
         self._processing = False  # Flag to prevent re-entrant processing
@@ -43,57 +43,48 @@ class NotificationQueue:
             was_idle = self._is_idle
             self._is_idle = is_idle
 
-        # When transitioning from busy to idle, process queued notifications
+        # When transitioning from busy to idle, process all queued notifications merged
         if not was_idle and is_idle:
-            self._process_one()
+            self._process_all()
 
     def put(self, message: dict):
         """Add a notification to the queue.
 
         If idle, immediately trigger agent. Otherwise, queue for later.
-        Keeps only the latest notification (clears old ones when idle).
         """
-        # If idle, clear old notifications and trigger immediately with new one
         with self._lock:
             if self._is_idle and not self._processing:
-                # Clear old pending notifications
-                while not self._queue.empty():
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        break
                 self._trigger(message)
             else:
-                # If busy, queue for later processing
                 self._queue.put(message)
 
-    def _trigger(self, message: dict):
-        """Trigger agent with formatted notification message."""
+    def _trigger(self, messages):
+        """Trigger agent with formatted notification message(s)."""
         if self._trigger_callback:
             with self._lock:
                 self._processing = True
             try:
-                user_text = self.format_for_user(message)
+                user_text = self.format_for_user(messages)
                 self._trigger_callback(user_text)
             finally:
                 with self._lock:
                     self._processing = False
 
-    def _process_one(self):
-        """Process only the latest queued notification (drains old ones)."""
+    def _process_all(self):
+        """Drain and merge all queued notifications into a single trigger."""
         if self._processing:
             return
 
-        # Drain all but the last message
-        latest = None
+        # Drain all messages from queue
+        messages = []
         while True:
             try:
-                latest = self._queue.get_nowait()
+                messages.append(self._queue.get_nowait())
             except queue.Empty:
                 break
 
-        if latest:
-            self._trigger(latest)
+        if messages:
+            self._trigger(messages)
 
     def clear(self):
         """Clear the queue of all pending notifications."""
@@ -103,29 +94,49 @@ class NotificationQueue:
             except queue.Empty:
                 break
 
-    def format_for_user(self, msg: dict) -> str:
-        """Format notification as user-facing text.
+    def format_for_user(self, messages) -> str:
+        """Format notification(s) as user-facing text.
 
-        Format: [WebSocket] {type}: {content}
+        Accepts a single dict or a list of dicts.
+        Multiple messages are merged into one notification.
+        Format: [WebSocket] {count} notifications:\n  - {type}: {content}\n  - ...
         """
-        msg_type = msg.get("type", "unknown")
-        result = msg.get("result", {})
+        # Normalize to list
+        if isinstance(messages, dict):
+            messages = [messages]
 
-        # Format the result content
+        if len(messages) == 1:
+            msg = messages[0]
+            msg_type = msg.get("type", "unknown")
+            timestamp = msg.get("timestamp", "")
+            result = msg.get("result", {})
+            content = self._format_result(result)
+            ts_str = f"[{timestamp}] " if timestamp else ""
+            return f"[WebSocket] {ts_str}{msg_type}: {content}"
+
+        # Multiple messages: merge them
+        lines = [f"[WebSocket] {len(messages)} notifications:"]
+        for msg in messages:
+            msg_type = msg.get("type", "unknown")
+            timestamp = msg.get("timestamp", "")
+            result = msg.get("result", {})
+            content = self._format_result(result)
+            ts_str = f"[{timestamp}] " if timestamp else ""
+            lines.append(f"  - {ts_str}{msg_type}: {content}")
+
+        return "\n".join(lines)
+
+    def _format_result(self, result) -> str:
+        """Format a single result dict to user-facing string."""
         if isinstance(result, dict):
             if result.get("status") == "success":
                 p = result.get("P")
                 i = result.get("I")
                 if p is not None and i is not None:
-                    content = f"P={p}, I={i}"
-                else:
-                    content = str(result)
-            else:
-                content = result.get("message", str(result))
-        else:
-            content = str(result)
-
-        return f"[WebSocket] {msg_type}: {content}"
+                    return f"P={p}, I={i}"
+                return str(result)
+            return result.get("message", str(result))
+        return str(result)
 
     def is_empty(self) -> bool:
         """Check if queue is empty."""
