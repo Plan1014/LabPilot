@@ -56,8 +56,12 @@ LabPilot/
 │   ├── llm.py           # LLM 初始化（ChatAnthropic）
 │   ├── repl.py          # REPL 交互入口
 │   ├── state.py         # 状态定义
-│   └── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
+│   ├── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
+│   └── websocket_server.py  # NotificationHub WebSocket 服务
+├── instrument/          # 仪器控制服务
+│   └── pna/              # PNA 相位噪声分析仪服务
 ├── skills/              # 技能定义（SKILL.md）
+├── data/                # 实验数据（PNA_data 等）
 ├── .env                 # 环境变量
 ├── .env.example         # 环境变量模板
 ├── agent_langgraph.py   # LangGraph CLI 入口
@@ -73,12 +77,14 @@ LabPilot/
 
 | 工具               | 功能                          |
 | ------------------ | ----------------------------- |
-| `bash`           | 执行 shell 命令               |
+| `bash`           | 执行 shell 命令（支持后台模式）|
 | `read_file`      | 读取文件（自动编码检测）      |
 | `write_file`     | 写入文件（UTF-8）             |
 | `edit_file`      | 替换文件中第一处指定文本      |
 | `load_skill`     | 加载技能知识（SKILL.md）      |
 | `spawn_subagent` | 派生独立子 agent 处理复杂任务 |
+
+> **bash 后台模式**：`bash(command="...", background=True)` 用于启动长期运行的服务（如 PNA），避免阻塞 agent。
 
 ### 子 Agent
 
@@ -101,6 +107,15 @@ LabPilot/
   - 调制参数配置（频率/幅度）
   - 波形导出
   - 功率监控
+
+- **pna**：相位噪声分析仪（Phase Noise Analyzer）测量技能
+
+  控制 Rohde & Schwarz PNA（http://127.0.0.1:8002），特点：
+
+  - 服务启动时建立持久连接，测量时复用
+  - 异步测量，结果通过 NotificationHub 推送
+  - CSV 格式输出（Frequency_Hz, Power_dBm）
+  - 使用 `bash(command="python -m instrument.pna.main", background=True)` 启动
 
 ---
 
