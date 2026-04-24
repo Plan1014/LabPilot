@@ -26,31 +26,47 @@ def safe_path(p: str) -> Path:
 # ==================== Base Tools ====================
 
 @tool
-def bash(command: str) -> str:
+def bash(command: str, background: bool = False) -> str:
     """Execute a shell command in the agent's working directory.
 
     Args:
         command: The shell command to execute.
+        background: If True, run in background (for long-running services).
+                    Do NOT set to True for commands that should complete.
 
     Returns:
         The combined stdout and stderr output, truncated to 50,000 chars.
+        For background processes, returns confirmation message.
     """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(
-            command,
-            shell=True,
-            cwd=WORKDIR,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-        out = (r.stdout + r.stderr).strip()
-        return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
+        if background:
+            # Windows: hide console window for background process
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = subprocess.SW_HIDE
+            subprocess.Popen(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                startupinfo=startupinfo,
+            )
+            return f"[Background] Process started: {command[:80]}"
+        else:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            out = (r.stdout + r.stderr).strip()
+            return out[:50000] if out else "(no output)"
+    except Exception as e:
+        return f"Error: {e}"
 
 
 @tool

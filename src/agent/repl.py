@@ -11,7 +11,7 @@ from typing import Any, Dict, Union
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
-from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, WEBSOCKET_ENABLED
+from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED
 from src.agent.llm import client
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
@@ -146,14 +146,14 @@ def auto_compact(messages: list) -> list:
 
 def main() -> None:
     """Run the REPL interaction loop."""
-    # Start WebSocket server for Linien GUI notifications
-    if WEBSOCKET_ENABLED:
+    # Start NotificationHub on port 8000
+    if NOTIFICATION_HUB_ENABLED:
         from src.agent.websocket_server import (
-            start_websocket_server_thread,
+            start_notification_hub_thread,
             get_notification_queue,
-            WEBSOCKET_PORT,
+            NOTIFICATION_HUB_PORT,
         )
-        start_websocket_server_thread(WEBSOCKET_PORT)
+        start_notification_hub_thread(NOTIFICATION_HUB_PORT)
         notification_queue = get_notification_queue()
 
     graph = build_graph()
@@ -237,12 +237,12 @@ def main() -> None:
         print()
 
     # 注册 WebSocket 回调
-    if WEBSOCKET_ENABLED:
+    if NOTIFICATION_HUB_ENABLED:
         notification_queue.set_trigger_callback(run_agent_query)
         notification_queue.set_idle(True)
 
     while True:
-        if WEBSOCKET_ENABLED:
+        if NOTIFICATION_HUB_ENABLED:
             notification_queue.set_idle(True)
 
         try:
@@ -250,7 +250,7 @@ def main() -> None:
         except (EOFError, KeyboardInterrupt):
             break
 
-        if WEBSOCKET_ENABLED:
+        if NOTIFICATION_HUB_ENABLED:
             notification_queue.set_idle(False)
 
         if query.strip().lower() in ("q", "exit", ""):

@@ -21,6 +21,6 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 # Thresholds
 TOKEN_THRESHOLD = 100000
 
-# WebSocket server configuration
-WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "8001"))
-WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "true").lower() == "true"
+# NotificationHub port
+NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
+NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
