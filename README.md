@@ -56,8 +56,12 @@ LabPilot/
 │   ├── llm.py           # LLM 初始化（ChatAnthropic）
 │   ├── repl.py          # REPL 交互入口
 │   ├── state.py         # 状态定义
-│   └── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
+│   ├── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
+│   └── websocket_server.py  # NotificationHub WebSocket 服务
+├── instrument/          # 仪器控制服务
+│   └── pna/              # PNA 相位噪声分析仪服务
 ├── skills/              # 技能定义（SKILL.md）
+├── data/                # 实验数据（PNA_data 等）
 ├── .env                 # 环境变量
 ├── .env.example         # 环境变量模板
 ├── agent_langgraph.py   # LangGraph CLI 入口
@@ -69,16 +73,51 @@ LabPilot/
 
 ## 核心功能
 
+### NotificationHub（端口 8000）
+
+集中式通知调度器，连接各仪器服务于 Agent 的桥梁。
+
+**架构：**
+```
+  8001: PDH-Locking 服务  ──┐
+  8002: PNA 服务         ──┼── HTTP POST /notify ──► NotificationHub (8000) ──► Agent (WebSocket)
+  ...                      │                         │
+                          └─────────────────────────┘
+```
+
+**工作流程：**
+1. Agent 启动时连接 `ws://127.0.0.1:8000/ws`
+2. 各仪器服务完成任务后 POST 到 `http://127.0.0.1:8000/notify`
+3. NotificationHub 通过 WebSocket 将通知推送给 Agent
+4. Agent 自动触发处理，报告用户
+
+**通知格式：**
+```json
+{
+  "source": "pna",
+  "task_id": "abc123",
+  "type": "task_completed",
+  "result": {"csv_path": "...", "trace_points": 801},
+  "timestamp": "2026-04-24T12:00:00Z"
+}
+```
+
+**环境变量：**
+- `NOTIFICATION_HUB_PORT`：监听端口（默认 8000）
+- `NOTIFICATION_HUB_ENABLED`：是否启用（默认 true）
+
 ### 工具集
 
 | 工具               | 功能                          |
 | ------------------ | ----------------------------- |
-| `bash`           | 执行 shell 命令               |
+| `bash`           | 执行 shell 命令（支持后台模式）|
 | `read_file`      | 读取文件（自动编码检测）      |
 | `write_file`     | 写入文件（UTF-8）             |
 | `edit_file`      | 替换文件中第一处指定文本      |
 | `load_skill`     | 加载技能知识（SKILL.md）      |
 | `spawn_subagent` | 派生独立子 agent 处理复杂任务 |
+
+> **bash 后台模式**：`bash(command="...", background=True)` 用于启动长期运行的服务（如 PNA），避免阻塞 agent。
 
 ### 子 Agent
 
@@ -93,7 +132,7 @@ LabPilot/
 
 - **pdh-locking**：PDH（Pound-Drever-Hall）光学腔锁定系统控制技能
 
-  控制 FastAPI 服务（http://127.0.0.1:8000），支持：
+  控制 FastAPI 服务（http://127.0.0.1:8001），支持：
 
   - PI 参数计算（异步任务）
   - 锁定/解锁状态控制
@@ -101,6 +140,15 @@ LabPilot/
   - 调制参数配置（频率/幅度）
   - 波形导出
   - 功率监控
+
+- **pna**：相位噪声分析仪（Phase Noise Analyzer）测量技能
+
+  控制 Rohde & Schwarz PNA（http://127.0.0.1:8002），特点：
+
+  - 服务启动时建立持久连接，测量时复用
+  - 异步测量，结果通过 NotificationHub 推送
+  - CSV 格式输出（Frequency_Hz, Power_dBm）
+  - 使用 `bash(command="python -m instrument.pna.main", background=True)` 启动
 
 ---
 

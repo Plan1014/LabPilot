@@ -73,5 +73,6 @@ tmp/
 *.pem
 credentials.json
 secrets/
+data/
 
 tests/

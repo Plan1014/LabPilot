@@ -1,4 +1,17 @@
-"""WebSocket server for real-time task notifications from Linien GUI."""
+"""NotificationHub - Central notification dispatcher on port 8000.
+
+Receives task completion notifications from services (PDH, PNA, etc.)
+via HTTP POST and broadcasts them to connected Agent WebSocket clients.
+
+Architecture:
+  - 8000: NotificationHub (this service)
+  - 8001: PDH-Locking service
+  - 8002: PNA service
+  - ...: Additional services
+
+All services POST to http://127.0.0.1:8000/notify when tasks complete.
+Agent connects to ws://127.0.0.1:8000/ws to receive notifications.
+"""
 
 import asyncio
 import json
@@ -6,14 +19,28 @@ import threading
 import queue
 from datetime import datetime
 from typing import Set, Optional, Callable
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from starlette.websockets import WebSocketState
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from pydantic import BaseModel
 import os
 
 # Load config from environment
-WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "8001"))
-WEBSOCKET_ENABLED = os.getenv("WEBSOCKET_ENABLED", "true").lower() == "true"
+NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
+NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
 
+
+# ==================== Pydantic Models ====================
+
+class NotifyRequest(BaseModel):
+    """Payload from services when a task completes."""
+    source: str  # "pdh-locking", "pna", etc.
+    task_id: str
+    type: str  # "task_completed", "task_failed"
+    result: Optional[dict] = None
+    error: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+# ==================== NotificationQueue ====================
 
 class NotificationQueue:
     """Thread-safe notification queue for WebSocket messages.
@@ -28,30 +55,23 @@ class NotificationQueue:
 
     def __init__(self):
         self._queue: queue.Queue = queue.Queue()
-        self._lock = threading.RLock()  # RLock allows re-entrant locking from same thread
+        self._lock = threading.RLock()
         self._is_idle = True
         self._trigger_callback: Optional[Callable[[str], None]] = None
-        self._processing = False  # Flag to prevent re-entrant processing
+        self._processing = False
 
     def set_trigger_callback(self, callback: Callable[[str], None]):
-        """Set callback to trigger agent with user message."""
         self._trigger_callback = callback
 
     def set_idle(self, is_idle: bool):
-        """Set REPL idle state. When transitioning to idle, process queue."""
         with self._lock:
             was_idle = self._is_idle
             self._is_idle = is_idle
 
-        # When transitioning from busy to idle, process all queued notifications merged
         if not was_idle and is_idle:
             self._process_all()
 
     def put(self, message: dict):
-        """Add a notification to the queue.
-
-        If idle, immediately trigger agent. Otherwise, queue for later.
-        """
         with self._lock:
             if self._is_idle and not self._processing:
                 self._trigger(message)
@@ -59,7 +79,6 @@ class NotificationQueue:
                 self._queue.put(message)
 
     def _trigger(self, messages):
-        """Trigger agent with formatted notification message(s)."""
         if self._trigger_callback:
             with self._lock:
                 self._processing = True
@@ -71,11 +90,9 @@ class NotificationQueue:
                     self._processing = False
 
     def _process_all(self):
-        """Drain and merge all queued notifications into a single trigger."""
         if self._processing:
             return
 
-        # Drain all messages from queue
         messages = []
         while True:
             try:
@@ -87,7 +104,6 @@ class NotificationQueue:
             self._trigger(messages)
 
     def clear(self):
-        """Clear the queue of all pending notifications."""
         while True:
             try:
                 self._queue.get_nowait()
@@ -95,39 +111,34 @@ class NotificationQueue:
                 break
 
     def format_for_user(self, messages) -> str:
-        """Format notification(s) as user-facing text.
-
-        Accepts a single dict or a list of dicts.
-        Multiple messages are merged into one notification.
-        Format: [WebSocket] {count} notifications:\n  - {type}: {content}\n  - ...
-        """
-        # Normalize to list
         if isinstance(messages, dict):
             messages = [messages]
 
         if len(messages) == 1:
             msg = messages[0]
             msg_type = msg.get("type", "unknown")
+            source = msg.get("source", "")
             timestamp = msg.get("timestamp", "")
             result = msg.get("result", {})
             content = self._format_result(result)
             ts_str = f"[{timestamp}] " if timestamp else ""
-            return f"[WebSocket] {ts_str}{msg_type}: {content}"
+            source_str = f"[{source}] " if source else ""
+            return f"[WebSocket] {ts_str}{source_str}{msg_type}: {content}"
 
-        # Multiple messages: merge them
         lines = [f"[WebSocket] {len(messages)} notifications:"]
         for msg in messages:
             msg_type = msg.get("type", "unknown")
+            source = msg.get("source", "")
             timestamp = msg.get("timestamp", "")
             result = msg.get("result", {})
             content = self._format_result(result)
             ts_str = f"[{timestamp}] " if timestamp else ""
-            lines.append(f"  - {ts_str}{msg_type}: {content}")
+            source_str = f"[{source}] " if source else ""
+            lines.append(f"  - {ts_str}{source_str}{msg_type}: {content}")
 
         return "\n".join(lines)
 
     def _format_result(self, result) -> str:
-        """Format a single result dict to user-facing string."""
         if isinstance(result, dict):
             if result.get("status") == "success":
                 p = result.get("P")
@@ -139,17 +150,17 @@ class NotificationQueue:
         return str(result)
 
     def is_empty(self) -> bool:
-        """Check if queue is empty."""
         return self._queue.empty()
 
     def size(self) -> int:
-        """Get approximate queue size."""
         return self._queue.qsize()
 
 
 # Global notification queue instance
 notification_queue = NotificationQueue()
 
+
+# ==================== ConnectionManager ====================
 
 class ConnectionManager:
     """Thread-safe WebSocket connection manager."""
@@ -167,52 +178,71 @@ class ConnectionManager:
         with self._lock:
             self.active_connections.discard(websocket)
 
-    def handle_notification(self, task_id: str, result: dict):
-        """Handle incoming notification from Linien GUI.
+    async def broadcast(self, message: dict):
+        """Broadcast notification to all connected WebSocket clients."""
+        with self._lock:
+            connections = list(self.active_connections)
 
-        Queues the notification. If REPL is idle, triggers agent immediately.
-        """
-        message = {
-            "type": "task_completed",
-            "task_id": task_id,
-            "status": "completed",
-            "result": result,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-        notification_queue.put(message)
+        disconnected = []
+        for conn in connections:
+            try:
+                await conn.send_json(message)
+            except Exception:
+                disconnected.append(conn)
+
+        # Clean up disconnected clients
+        for conn in disconnected:
+            self.active_connections.discard(conn)
 
 
 # Global connection manager
 _manager = ConnectionManager()
 
 
-def create_websocket_router() -> FastAPI:
-    """Create FastAPI app with WebSocket endpoint."""
+# ==================== FastAPI App ====================
+
+def create_notification_hub_app() -> FastAPI:
     from fastapi import APIRouter
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+
+    app = FastAPI(title="NotificationHub", lifespan=lifespan)
     router = APIRouter()
 
+    # HTTP endpoint for services to POST notifications
+    @router.post("/notify")
+    async def receive_notification(req: NotifyRequest):
+        """Receive task completion notification from a service and broadcast to all agents."""
+        message = {
+            "source": req.source,
+            "task_id": req.task_id,
+            "type": req.type,
+            "result": req.result,
+            "error": req.error,
+            "timestamp": req.timestamp or datetime.utcnow().isoformat() + "Z",
+        }
+
+        # Queue for agent processing
+        notification_queue.put(message)
+
+        # Broadcast to all connected agents via WebSocket
+        await _manager.broadcast(message)
+
+        return {"status": "received"}
+
+    # WebSocket endpoint for agents to connect
     @router.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await _manager.connect(websocket)
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(
-                        websocket.receive_text(),
-                        timeout=30.0
-                    )
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
                     if data == "ping":
                         await websocket.send_text("pong")
-                    else:
-                        try:
-                            msg = json.loads(data)
-                            if msg.get("type") == "task_completed":
-                                task_id = msg.get("task_id")
-                                result = msg.get("result", {})
-                                _manager.handle_notification(task_id, result)
-                                await websocket.send_json({"status": "received"})
-                        except json.JSONDecodeError:
-                            pass
                 except asyncio.TimeoutError:
                     try:
                         await websocket.send_text("ping")
@@ -225,28 +255,18 @@ def create_websocket_router() -> FastAPI:
         finally:
             await _manager.disconnect(websocket)
 
-    @router.get("/ws/status")
-    async def ws_status():
-        with _manager._lock:
-            count = len(_manager.active_connections)
-        return {
-            "websocket_enabled": WEBSOCKET_ENABLED,
-            "active_connections": count,
-            "pending_notifications": notification_queue.size()
-        }
-
-    return router
+    app.include_router(router)
+    return app
 
 
-def start_websocket_server_thread(port: int = WEBSOCKET_PORT) -> Optional[threading.Thread]:
-    """Start WebSocket server in background thread."""
-    if not WEBSOCKET_ENABLED:
+def start_notification_hub_thread(port: int = NOTIFICATION_HUB_PORT) -> Optional[threading.Thread]:
+    """Start NotificationHub server in background thread."""
+    if not NOTIFICATION_HUB_ENABLED:
         return None
 
     import uvicorn
 
-    app = FastAPI()
-    app.include_router(create_websocket_router())
+    app = create_notification_hub_app()
 
     def run():
         uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
@@ -257,10 +277,8 @@ def start_websocket_server_thread(port: int = WEBSOCKET_PORT) -> Optional[thread
 
 
 def get_notification_queue() -> NotificationQueue:
-    """Get the global notification queue instance."""
     return notification_queue
 
 
 def get_connection_manager() -> ConnectionManager:
-    """Get the global connection manager instance."""
     return _manager

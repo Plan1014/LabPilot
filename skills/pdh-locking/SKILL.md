@@ -3,7 +3,7 @@ name: pdh-locking
 description: >
   Use this skill whenever interacting with the PDH (Pound-Drever-Hall) optical
   cavity locking FastAPI service running at
-  http://127.0.0.1:8000. Triggers include: any request to calculate PI, query
+  http://127.0.0.1:8001. Triggers include: any request to calculate PI, query
   task results, check or control lock state, set PID/modulation parameters,
   export waveforms, or monitor power. Also use when user mentions "PDH",
   "Pound-Drever-Hall", "lock", "锁定", "PI calculation", "task ID",
@@ -15,13 +15,13 @@ description: >
 ## Overview
 
 Controls a PDH (Pound-Drever-Hall) optical cavity locking system via FastAPI at
-`http://127.0.0.1:8000`. The service wraps a PyQt5 GUI control panel and
+`http://127.0.0.1:8001`. The service wraps a PyQt5 GUI control panel and
 executes operations in the main GUI thread via a thread-safe command queue.
 
 ## Base URL
 
 ```
-http://127.0.0.1:8000
+http://127.0.0.1:8001
 ```
 
 All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
@@ -46,7 +46,7 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 
 ## WebSocket Push Notifications
 
-When PI calculation completes, the result is automatically pushed to the agent via WebSocket. **You do NOT need to poll for results.**
+When PI calculation completes, the result is automatically pushed to the agent via the **NotificationHub (port 8000)**. **You do NOT need to poll for results.**
 
 The push notification format:
 ```
@@ -79,7 +79,7 @@ For example:
 1. Start calculation (only if explicitly requested and system is unlocked):
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/pi/calculate
+curl.exe -X POST http://127.0.0.1:8001/pi/calculate
 ```
 
 Response (immediate):
@@ -128,19 +128,19 @@ response from `/lock/manual` does NOT guarantee the physical lock succeeded.
 **Check lock status:**
 
 ```
-curl.exe http://127.0.0.1:8000/lock/status
+curl.exe http://127.0.0.1:8001/lock/status
 ```
 
 **Execute lock:**
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/lock/manual
+curl.exe -X POST http://127.0.0.1:8001/lock/manual
 ```
 
 **Execute unlock (stop lock):**
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/lock/stop
+curl.exe -X POST http://127.0.0.1:8001/lock/stop
 ```
 
 Returns: `{"status": "stopped", "message": "Lock successfully stopped"}`
@@ -152,7 +152,7 @@ Returns: `{"status": "stopped", "message": "Lock successfully stopped"}`
 PID values are integers in range 0–8191 (inclusive).
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/pid/set ^
+curl.exe -X POST http://127.0.0.1:8001/pid/set ^
   -H "Content-Type: application/json" ^
   -d "{\"kp\":100,\"ki\":50,\"kd\":10}"
 ```
@@ -170,7 +170,7 @@ Parameters:
 ### 4. Modulation Configuration
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/modulation/set ^
+curl.exe -X POST http://127.0.0.1:8001/modulation/set ^
   -H "Content-Type: application/json" ^
   -d "{\"frequency_mhz\":10.5,\"amplitude_vpp\":1.2}"
 ```
@@ -194,7 +194,7 @@ Parameters:
 ### 5. Waveform Export
 
 ```
-curl.exe -X POST http://127.0.0.1:8000/plot/export ^
+curl.exe -X POST http://127.0.0.1:8001/plot/export ^
   -H "Content-Type: application/json" ^
   -d "{\"save_path\":\"spectrum.png\"}"
 ```
@@ -206,7 +206,7 @@ Default path is `spectrum.png` if `save_path` is omitted.
 ### 6. Power Monitoring
 
 ```
-curl.exe http://127.0.0.1:8000/power/monitor
+curl.exe http://127.0.0.1:8001/power/monitor
 ```
 
 Returns the current power reading snapshot. Use this for lock verification
