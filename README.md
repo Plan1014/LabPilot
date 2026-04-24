@@ -73,6 +73,39 @@ LabPilot/
 
 ## 核心功能
 
+### NotificationHub（端口 8000）
+
+集中式通知调度器，连接各仪器服务于 Agent 的桥梁。
+
+**架构：**
+```
+  8001: PDH-Locking 服务  ──┐
+  8002: PNA 服务         ──┼── HTTP POST /notify ──► NotificationHub (8000) ──► Agent (WebSocket)
+  ...                      │                         │
+                          └─────────────────────────┘
+```
+
+**工作流程：**
+1. Agent 启动时连接 `ws://127.0.0.1:8000/ws`
+2. 各仪器服务完成任务后 POST 到 `http://127.0.0.1:8000/notify`
+3. NotificationHub 通过 WebSocket 将通知推送给 Agent
+4. Agent 自动触发处理，报告用户
+
+**通知格式：**
+```json
+{
+  "source": "pna",
+  "task_id": "abc123",
+  "type": "task_completed",
+  "result": {"csv_path": "...", "trace_points": 801},
+  "timestamp": "2026-04-24T12:00:00Z"
+}
+```
+
+**环境变量：**
+- `NOTIFICATION_HUB_PORT`：监听端口（默认 8000）
+- `NOTIFICATION_HUB_ENABLED`：是否启用（默认 true）
+
 ### 工具集
 
 | 工具               | 功能                          |
@@ -99,7 +132,7 @@ LabPilot/
 
 - **pdh-locking**：PDH（Pound-Drever-Hall）光学腔锁定系统控制技能
 
-  控制 FastAPI 服务（http://127.0.0.1:8000），支持：
+  控制 FastAPI 服务（http://127.0.0.1:8001），支持：
 
   - PI 参数计算（异步任务）
   - 锁定/解锁状态控制
