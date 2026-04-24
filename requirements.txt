@@ -25,3 +25,6 @@ click>=8.0
 # WebSocket support
 websockets>=12.0
 uvicorn>=0.27.0
+
+# Instrument control
+RsInstrument>=1.124.0
