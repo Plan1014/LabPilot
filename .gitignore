@@ -29,6 +29,9 @@ build/
 .claude/
 .claude/settings.local.json
 
+# ================= Personal Scripts =================
+start-tauri.ps1
+
 # ================= Node.js / npm =================
 node_modules/
 npm-debug.log*
@@ -37,6 +40,12 @@ yarn-error.log*
 dist/
 build/
 .next/
+
+# ================= Tauri =================
+frontend/src-tauri/target/
+frontend/src-tauri/Cargo.lock
+frontend/node_modules/
+frontend/npm-cache/
 
 # ================= C++ / Qt / CMake =================
 build/

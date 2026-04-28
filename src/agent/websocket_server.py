@@ -15,11 +15,14 @@ Agent connects to ws://127.0.0.1:8000/ws to receive notifications.
 
 import asyncio
 import json
-import threading
 import queue
+import threading
 from datetime import datetime
-from typing import Set, Optional, Callable
+from typing import Optional, Callable, Set
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 
@@ -32,12 +35,17 @@ NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower()
 
 class NotifyRequest(BaseModel):
     """Payload from services when a task completes."""
-    source: str  # "pdh-locking", "pna", etc.
+    source: str
     task_id: str
-    type: str  # "task_completed", "task_failed"
+    type: str
     result: Optional[dict] = None
     error: Optional[str] = None
     timestamp: Optional[str] = None
+
+
+class QueryRequest(BaseModel):
+    """Payload for /query endpoint."""
+    query: str
 
 
 # ==================== NotificationQueue ====================
@@ -46,11 +54,6 @@ class NotificationQueue:
     """Thread-safe notification queue for WebSocket messages.
 
     Decouples WebSocket message reception from agent processing.
-
-    Trigger logic:
-    - If REPL is idle: immediately trigger agent
-    - If REPL is busy: queue for later processing
-    - When transitioning busy->idle: drain all queued messages and merge into one trigger
     """
 
     def __init__(self):
@@ -67,7 +70,6 @@ class NotificationQueue:
         with self._lock:
             was_idle = self._is_idle
             self._is_idle = is_idle
-
         if not was_idle and is_idle:
             self._process_all()
 
@@ -92,14 +94,12 @@ class NotificationQueue:
     def _process_all(self):
         if self._processing:
             return
-
         messages = []
         while True:
             try:
                 messages.append(self._queue.get_nowait())
             except queue.Empty:
                 break
-
         if messages:
             self._trigger(messages)
 
@@ -113,7 +113,6 @@ class NotificationQueue:
     def format_for_user(self, messages) -> str:
         if isinstance(messages, dict):
             messages = [messages]
-
         if len(messages) == 1:
             msg = messages[0]
             msg_type = msg.get("type", "unknown")
@@ -124,7 +123,6 @@ class NotificationQueue:
             ts_str = f"[{timestamp}] " if timestamp else ""
             source_str = f"[{source}] " if source else ""
             return f"[WebSocket] {ts_str}{source_str}{msg_type}: {content}"
-
         lines = [f"[WebSocket] {len(messages)} notifications:"]
         for msg in messages:
             msg_type = msg.get("type", "unknown")
@@ -135,7 +133,6 @@ class NotificationQueue:
             ts_str = f"[{timestamp}] " if timestamp else ""
             source_str = f"[{source}] " if source else ""
             lines.append(f"  - {ts_str}{source_str}{msg_type}: {content}")
-
         return "\n".join(lines)
 
     def _format_result(self, result) -> str:
@@ -156,7 +153,6 @@ class NotificationQueue:
         return self._queue.qsize()
 
 
-# Global notification queue instance
 notification_queue = NotificationQueue()
 
 
@@ -179,24 +175,87 @@ class ConnectionManager:
             self.active_connections.discard(websocket)
 
     async def broadcast(self, message: dict):
-        """Broadcast notification to all connected WebSocket clients."""
         with self._lock:
             connections = list(self.active_connections)
-
         disconnected = []
         for conn in connections:
             try:
                 await conn.send_json(message)
             except Exception:
                 disconnected.append(conn)
-
-        # Clean up disconnected clients
         for conn in disconnected:
             self.active_connections.discard(conn)
 
 
-# Global connection manager
 _manager = ConnectionManager()
+
+
+# ==================== SSE Streaming ====================
+
+def create_sse_router() -> "APIRouter":
+    """Create the SSE query router (lazy import to avoid circular deps)."""
+    from fastapi import APIRouter
+    from langchain_core.messages import HumanMessage
+
+    router = APIRouter()
+
+    @router.post("/query")
+    async def query_agent(req: QueryRequest):
+        """Stream SSE events from agent graph execution."""
+        from src.agent.graph_thinking import (
+            build_graph, set_event_emitter, InterleavedState
+        )
+        graph = build_graph()
+        event_queue: queue.Queue = queue.Queue()
+        seen_keys: set[str] = set()
+
+        def emitter(event: dict):
+            key = f"{event.get('type')}:{event.get('content', '')}:{event.get('name', '')}:{event.get('result', '')}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                event_queue.put(event)
+
+        async def event_generator():
+            set_event_emitter(emitter)
+            try:
+                initial_state = {
+                    "messages": [HumanMessage(content=req.query)],
+                    "pending_tool_calls": [],
+                    "step_count": 0,
+                }
+                async for event in graph.astream_events(
+                    initial_state,
+                    config={"recursion_limit": 100},
+                    stream_mode="values",
+                ):
+                    event_type = event.get("event", "")
+                    if event_type == "on_chain_end":
+                        # Drain queue → sort by step → yield immediately
+                        pending: list[dict] = []
+                        while True:
+                            try:
+                                pending.append(event_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        pending.sort(key=lambda e: e.get("step", 0))
+                        for ev in pending:
+                            yield f"data: {json.dumps(ev)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'step': 0})}\n\n"
+            finally:
+                set_event_emitter(None)
+                seen_keys.clear()
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    return router
 
 
 # ==================== FastAPI App ====================
@@ -210,12 +269,21 @@ def create_notification_hub_app() -> FastAPI:
         yield
 
     app = FastAPI(title="NotificationHub", lifespan=lifespan)
-    router = APIRouter()
 
-    # HTTP endpoint for services to POST notifications
-    @router.post("/notify")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # WebSocket + notify router
+    notify_router = APIRouter()
+
+    @notify_router.post("/notify")
     async def receive_notification(req: NotifyRequest):
-        """Receive task completion notification from a service and broadcast to all agents."""
+        """Receive task completion notification and broadcast to all agents."""
         message = {
             "source": req.source,
             "task_id": req.task_id,
@@ -224,17 +292,11 @@ def create_notification_hub_app() -> FastAPI:
             "error": req.error,
             "timestamp": req.timestamp or datetime.utcnow().isoformat() + "Z",
         }
-
-        # Queue for agent processing
         notification_queue.put(message)
-
-        # Broadcast to all connected agents via WebSocket
         await _manager.broadcast(message)
-
         return {"status": "received"}
 
-    # WebSocket endpoint for agents to connect
-    @router.websocket("/ws")
+    @notify_router.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         await _manager.connect(websocket)
         try:
@@ -255,9 +317,16 @@ def create_notification_hub_app() -> FastAPI:
         finally:
             await _manager.disconnect(websocket)
 
-    app.include_router(router)
+    app.include_router(notify_router)
+
+    # SSE query router (separate to avoid circular imports)
+    sse_router = create_sse_router()
+    app.include_router(sse_router)
+
     return app
 
+
+# ==================== Thread Launcher ====================
 
 def start_notification_hub_thread(port: int = NOTIFICATION_HUB_PORT) -> Optional[threading.Thread]:
     """Start NotificationHub server in background thread."""

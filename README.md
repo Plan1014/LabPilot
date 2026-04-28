@@ -1,23 +1,25 @@
 # LabPilot
 
-光学实验 agent 助手 —— 基于 LangGraph 的 ReAct 智能体。通过FastAPI的api控制和Skill技能系统，实现对实验的智能控制。
+光学实验 agent 助手 —— 基于 LangGraph 的 ReAct 智能体。通过 FastAPI 的 API 控制和 Skill 技能系统，实现对实验的智能控制。
 
-未来计划添加记忆系统和其他Skill。
+未来计划添加记忆系统和其他 Skill。
 
 ## 快速开始
 
 ### 环境要求
 
 - Python 3.11+
+- Node.js 18+（用于 Tauri 前端）
+- Rust 1.70+（用于 Tauri 桌面应用）
 - Anthropic API Key（用于调用 Claude 模型）
 
-### 安装
+### 1. Python 环境
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 配置
+### 2. 配置
 
 复制 `.env.example` 为 `.env`，填入以下环境变量：
 
@@ -27,21 +29,51 @@ ANTHROPIC_BASE_URL=https://api.anthropic.com
 MODEL_ID=claude-sonnet-4-20250514
 ```
 
-### 启动
+### 3. Tauri 桌面应用（可选）
+
+Tauri 前端提供图形化界面，集成了 SSE 流式输出和 WebSocket 实时通知。
+
+**安装 C++ Build Tools（仅 Windows）**
+
+1. 下载 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
+2. 安装时勾选 "C++ Build Tools"
+3. 安装完成后，打开 VS Build Tools 终端（x64 Native Tools Command Prompt）
+
+**安装 Rust**
+
+```bash
+# 从 https://rustup.rs 安装 Rust
+rustup default stable
+```
+
+**启动前端**
+
+```powershell
+# 复制并修改配置
+cp start-tauri.example.ps1 start-tauri.ps1
+# 编辑 start-tauri.ps1，填入你的 MSVC 路径
+
+# 启动（同时运行 Python 后端 + Tauri 前端）
+.\start-tauri.ps1
+```
+
+### 4. 启动方式
+
+**桌面应用模式（推荐）：**
+```powershell
+.\start-tauri.ps1
+```
+自动启动 Python 后端（端口 8000）+ Tauri 桌面应用。
 
 **REPL 交互模式（终端）：**
-
 ```bash
 python -m src.agent.repl
 ```
 
 **LangGraph Server 模式（API 服务）：**
-
 ```bash
 python -m langgraph_cli dev --port 8123
 ```
-
-服务启动后访问 http://127.0.0.1:8123 查看交互界面。
 
 ---
 
@@ -53,20 +85,28 @@ LabPilot/
 │   ├── __init__.py      # LangGraph graph 导出
 │   ├── config.py        # 配置（模型、工作目录、技能路径）
 │   ├── graph.py         # Server 模式图定义
+│   ├── graph_thinking.py # ReAct 图定义（SSE 事件发射）
 │   ├── llm.py           # LLM 初始化（ChatAnthropic）
 │   ├── repl.py          # REPL 交互入口
 │   ├── state.py         # 状态定义
 │   ├── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
 │   └── websocket_server.py  # NotificationHub WebSocket 服务
+├── frontend/            # Tauri 桌面应用
+│   ├── src/             # React 前端源码
+│   │   ├── components/  # UI 组件
+│   │   ├── hooks/       # SSE / WebSocket hooks
+│   │   └── types/       # TypeScript 类型
+│   └── src-tauri/       # Tauri Rust 后端
 ├── instrument/          # 仪器控制服务
 │   └── pna/              # PNA 相位噪声分析仪服务
 ├── skills/              # 技能定义（SKILL.md）
 ├── data/                # 实验数据（PNA_data 等）
 ├── .env                 # 环境变量
 ├── .env.example         # 环境变量模板
-├── agent_langgraph.py   # LangGraph CLI 入口
+├── start-tauri.ps1      # 启动脚本（个人用，gitignore）
+├── start-tauri.example.ps1 # 启动脚本模板
 ├── langgraph.json      # LangGraph CLI 配置
-└── requirements.txt     # 依赖
+└── requirements.txt     # Python 依赖
 ```
 
 ---
