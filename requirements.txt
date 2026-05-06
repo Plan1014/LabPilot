@@ -26,5 +26,8 @@ click>=8.0
 websockets>=12.0
 uvicorn>=0.27.0
 
+# Redis session storage
+redis>=5.0
+
 # Instrument control
 RsInstrument>=1.124.0

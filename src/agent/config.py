@@ -24,3 +24,10 @@ TOKEN_THRESHOLD = 100000
 # NotificationHub port
 NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
 NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
+
+# Redis session storage
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/1")
+SESSION_TTL_DAYS = 7
+
+# Sessions archive directory
+SESSIONS_DIR = WORKDIR / "data" / "sessions"

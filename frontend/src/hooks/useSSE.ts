@@ -1,16 +1,17 @@
 import { useState, useCallback, useRef } from "react";
 import type { SSEEvent } from "../types/events";
+import { persistSessionId } from "./useSession";
 
 interface UseSSEReturn {
   isConnected: boolean;
   error: string | null;
   events: SSEEvent[];
-  sendQuery: (query: string) => Promise<void>;
+  sendQuery: (query: string, sessionId?: string | null) => Promise<string | null>;
   clearEvents: () => void;
 }
 
 export function useSSE(
-  endpoint: string = "http://127.0.0.1:8000/query"
+  endpoint: string = "http://127.0.0.1:8000/session/query"
 ): UseSSEReturn {
   const [isConnected, setIsConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -18,7 +19,7 @@ export function useSSE(
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const sendQuery = useCallback(
-    async (query: string) => {
+    async (query: string, sessionId?: string | null): Promise<string | null> => {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
@@ -28,14 +29,18 @@ export function useSSE(
       setIsConnected(true);
       setEvents([]);
 
-      // Deduplication set on frontend as safety net
       const seenKeys = new Set<string>();
 
       try {
+        const body: { query: string; session_id?: string } = { query };
+        if (sessionId) {
+          body.session_id = sessionId;
+        }
+
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ query }),
+          body: JSON.stringify(body),
           signal: abortControllerRef.current.signal,
         });
 
@@ -47,6 +52,7 @@ export function useSSE(
         if (!reader) throw new Error("No response body");
 
         const decoder = new TextDecoder();
+        let returnedSessionId: string | null = null;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -63,7 +69,6 @@ export function useSSE(
               try {
                 const event = JSON.parse(data) as SSEEvent;
 
-                // Frontend deduplication: skip if we've already seen this exact event
                 let key: string;
                 if (event.type === "thinking") {
                   key = `thinking:${event.content}`;
@@ -82,6 +87,11 @@ export function useSSE(
 
                 if (event.type === "done") {
                   setIsConnected(false);
+                  // Extract session_id from done event or X-Session-Id header
+                  if (event.session_id) {
+                    returnedSessionId = event.session_id;
+                    persistSessionId(event.session_id);
+                  }
                 }
               } catch (e) {
                 console.error("Failed to parse SSE data:", e);
@@ -89,13 +99,16 @@ export function useSSE(
             }
           }
         }
+
+        return returnedSessionId;
       } catch (e) {
         if (e instanceof Error && e.name === "AbortError") {
-          // Request was cancelled, not an error
+          // Request was cancelled
         } else {
           setError(e instanceof Error ? e.message : "Unknown error");
           setIsConnected(false);
         }
+        return null;
       }
     },
     [endpoint]

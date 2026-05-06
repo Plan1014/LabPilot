@@ -1,22 +1,54 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import Message from "./Message";
 import InputArea from "./InputArea";
+import HistoryModal from "./HistoryModal";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
-import type { Message as MessageType } from "../types/events";
-import { CircleNotch } from "@phosphor-icons/react";
+import { getStoredSessionId, persistSessionId } from "../hooks/useSession";
+import type { Message as MessageType, SessionMeta } from "../types/events";
+import { CircleNotch, Clock } from "@phosphor-icons/react";
+
+const API_BASE = "http://127.0.0.1:8000";
 
 export default function ChatWindow() {
   const [messages, setMessages] = useState<MessageType[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(
-    null
-  );
+  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { events, sendQuery, isConnected, error } = useSSE();
 
   // WebSocket for notifications
   const { notifications, isConnected: wsConnected } = useWebSocket();
+
+  // Restore session on mount if there's a stored session_id but no messages yet
+  useEffect(() => {
+    if (messages.length === 0) {
+      const storedId = getStoredSessionId();
+      if (storedId) {
+        // Try to load the session from backend
+        fetch(`${API_BASE}/session/${storedId}/history`)
+          .then((res) => {
+            if (!res.ok) throw new Error("not found");
+            return res.json();
+          })
+          .then((data) => {
+            const msgs: MessageType[] = data.messages.map((msg: any) => ({
+              id: crypto.randomUUID(),
+              role: msg.role === "user" ? "user" : "assistant",
+              content: Array.isArray(msg.content) ? JSON.stringify(msg.content) : msg.content,
+              events: [],
+              isComplete: true,
+            }));
+            setMessages(msgs);
+          })
+          .catch(() => {
+            // Session not found in Redis, clear storage
+            persistSessionId("");
+          });
+      }
+    }
+  }, []); // Only on mount
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
@@ -42,6 +74,11 @@ export default function ChatWindow() {
       );
       setIsStreaming(false);
       setStreamingMessageId(null);
+
+      // Persist session_id from done event
+      if (doneEvent.session_id) {
+        persistSessionId(doneEvent.session_id);
+      }
     }
   }, [events, streamingMessageId]);
 
@@ -67,7 +104,6 @@ export default function ChatWindow() {
       const userMessageId = crypto.randomUUID();
       const assistantMessageId = crypto.randomUUID();
 
-      // Add user message
       setMessages((prev) => [
         ...prev,
         {
@@ -79,7 +115,6 @@ export default function ChatWindow() {
         },
       ]);
 
-      // Add placeholder for assistant
       setMessages((prev) => [
         ...prev,
         {
@@ -94,11 +129,51 @@ export default function ChatWindow() {
       setIsStreaming(true);
       setStreamingMessageId(assistantMessageId);
 
-      // Send query via SSE
-      await sendQuery(query);
+      const storedId = getStoredSessionId();
+      await sendQuery(query, storedId);
     },
     [sendQuery]
   );
+
+  const listSessions = useCallback(async (): Promise<SessionMeta[]> => {
+    const res = await fetch(`${API_BASE}/session/list`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    return data.sessions;
+  }, []);
+
+  const loadSession = useCallback(
+    async (id: string) => {
+      const res = await fetch(`${API_BASE}/session/${id}/history`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      persistSessionId(id);
+      const msgs: MessageType[] = data.messages.map((msg: any) => ({
+        id: crypto.randomUUID(),
+        role: msg.role === "user" ? "user" : "assistant",
+        content: Array.isArray(msg.content) ? JSON.stringify(msg.content) : msg.content,
+        events: [],
+        isComplete: true,
+      }));
+      setMessages(msgs);
+      setShowHistory(false);
+    },
+    []
+  );
+
+  const deleteSession = useCallback(async (id: string) => {
+    await fetch(`${API_BASE}/session/${id}`, { method: "DELETE" });
+    if (id === getStoredSessionId()) {
+      persistSessionId("");
+      setMessages([]);
+    }
+  }, []);
+
+  const handleNewChat = useCallback(() => {
+    persistSessionId("");
+    setMessages([]);
+    setShowHistory(false);
+  }, []);
 
   return (
     <div className="flex flex-col h-[100dvh] bg-[#fafafa]">
@@ -106,6 +181,20 @@ export default function ChatWindow() {
       <header className="border-b border-[#e5e5e5] bg-white px-4 py-3 flex items-center justify-between">
         <h1 className="text-base font-semibold text-[#1a1a1a]">LabPilot</h1>
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleNewChat}
+            className="text-xs text-[#666666] hover:text-[#1a1a1a] px-2 py-1 rounded hover:bg-[#f5f5f5] transition-colors"
+            title="New chat"
+          >
+            New
+          </button>
+          <button
+            onClick={() => setShowHistory(true)}
+            className="flex items-center gap-1 text-xs text-[#666666] hover:text-[#1a1a1a] px-2 py-1 rounded hover:bg-[#f5f5f5] transition-colors"
+          >
+            <Clock size={14} />
+            History
+          </button>
           {/* SSE status */}
           <div className="flex items-center gap-1.5">
             <CircleNotch
@@ -150,6 +239,16 @@ export default function ChatWindow() {
 
       {/* Input */}
       <InputArea onSubmit={handleSubmit} isStreaming={isStreaming} />
+
+      {/* History Modal */}
+      {showHistory && (
+        <HistoryModal
+          onClose={() => setShowHistory(false)}
+          onLoad={loadSession}
+          onDelete={deleteSession}
+          listSessions={listSessions}
+        />
+      )}
     </div>
   );
 }

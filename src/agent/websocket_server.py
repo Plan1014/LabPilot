@@ -48,6 +48,12 @@ class QueryRequest(BaseModel):
     query: str
 
 
+class SessionQueryRequest(BaseModel):
+    """Payload for /session/query endpoint."""
+    query: str
+    session_id: Optional[str] = None
+
+
 # ==================== NotificationQueue ====================
 
 class NotificationQueue:
@@ -190,6 +196,185 @@ class ConnectionManager:
 _manager = ConnectionManager()
 
 
+# ==================== Session Router ====================
+
+def create_session_router() -> "APIRouter":
+    """Create the session management router."""
+    from fastapi import APIRouter
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from src.agent.session_manager import (
+        create_session, get_session_meta, get_session_history,
+        append_to_session, update_session_title, delete_session,
+        list_sessions, archive_session,
+    )
+
+    router = APIRouter()
+
+    @router.get("/session/list")
+    async def session_list():
+        """List all sessions."""
+        sessions = list_sessions()
+        return {"sessions": sessions}
+
+    @router.get("/session/{session_id}")
+    async def get_session(session_id: str):
+        """Get session metadata."""
+        meta = get_session_meta(session_id)
+        if not meta:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Session not found")
+        return meta
+
+    @router.get("/session/{session_id}/history")
+    async def get_session_history_endpoint(session_id: str):
+        """Get full message history for a session."""
+        history = get_session_history(session_id)
+        if not history:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"id": session_id, "messages": history}
+
+    @router.delete("/session/{session_id}")
+    async def delete_session_endpoint(session_id: str):
+        """Delete a session."""
+        deleted = delete_session(session_id)
+        return {"status": "deleted" if deleted else "not_found"}
+
+    @router.post("/session/query")
+    async def session_query(req: SessionQueryRequest):
+        """Stream SSE events with session history management."""
+        from src.agent.graph_thinking import build_graph, set_event_emitter
+        from src.agent.session_manager import message_to_dict
+
+        # Get or create session
+        if req.session_id:
+            session_id = req.session_id
+            history = get_session_history(session_id)
+        else:
+            session_id = create_session()
+            history = []
+
+        # Set session_id in response headers for frontend to pick up
+        graph = build_graph()
+        event_queue: queue.Queue = queue.Queue()
+        seen_keys: set[str] = set()
+
+        # Generate title from first user message if this is a new session
+        if not history:
+            first_title = req.query[:100] if len(req.query) > 100 else req.query
+            update_session_title(session_id, first_title)
+
+        def emitter(event: dict):
+            key = f"{event.get('type')}:{event.get('content', '')}:{event.get('name', '')}:{event.get('result', '')}"
+            if key not in seen_keys:
+                seen_keys.add(key)
+                event_queue.put(event)
+
+        # Track new messages added during this stream (for saving to Redis)
+        new_messages: list[dict] = []
+        # Start with user message
+        user_msg_dict = {"role": "user", "content": req.query}
+        new_messages.append(user_msg_dict)
+
+        async def event_generator():
+            set_event_emitter(emitter)
+            try:
+                # Build messages list from session history
+                langchain_messages = []
+                for msg in history:
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        langchain_messages.append(HumanMessage(content=content))
+                    elif role == "assistant":
+                        langchain_messages.append(AIMessage(content=content))
+                    elif role == "tool":
+                        langchain_messages.append(ToolMessage(
+                            content=content,
+                            name=msg.get("name", ""),
+                            tool_call_id=msg.get("tool_call_id", ""),
+                        ))
+
+                # Append current user message
+                langchain_messages.append(HumanMessage(content=req.query))
+
+                # Stream events
+                async for event in graph.astream_events(
+                    {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0},
+                    config={"recursion_limit": 100},
+                    stream_mode="values",
+                ):
+                    event_type = event.get("event", "")
+                    if event_type == "on_chain_end":
+                        # Capture new messages from this event
+                        chain_output = event.get("data", {}).get("output", {})
+                        if isinstance(chain_output, dict) and "messages" in chain_output:
+                            msgs = chain_output["messages"]
+                            if isinstance(msgs, list):
+                                for msg in msgs[len(langchain_messages):]:
+                                    new_messages.append(message_to_dict(msg))
+                        elif isinstance(chain_output, list):
+                            for msg in chain_output[len(langchain_messages):]:
+                                new_messages.append(message_to_dict(msg))
+
+                        # Drain queue → sort by step → yield immediately
+                        pending: list[dict] = []
+                        while True:
+                            try:
+                                pending.append(event_queue.get_nowait())
+                            except queue.Empty:
+                                break
+                        pending.sort(key=lambda e: e.get("step", 0))
+                        for ev in pending:
+                            yield f"data: {json.dumps(ev)}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'step': 0, 'session_id': session_id})}\n\n"
+            finally:
+                set_event_emitter(None)
+                seen_keys.clear()
+
+        # Return the streaming response; messages will be saved after iteration completes
+        return StreamingResponse(
+            _stream_and_save(event_generator(), session_id, new_messages),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "X-Session-Id": session_id,
+            },
+        )
+
+    return router
+
+
+async def _stream_and_save(generator, session_id: str, new_messages: list[dict]):
+    """Wrap an async generator to save messages to Redis after completion."""
+    from src.agent.session_manager import append_to_session, archive_session
+    import traceback
+    try:
+        async for chunk in generator:
+            yield chunk
+        # Stream completed; save new messages to Redis
+        if new_messages:
+            try:
+                append_to_session(session_id, new_messages)
+            except Exception as e:
+                traceback.print_exc()
+        # Archive to JSON
+        try:
+            archive_session(session_id)
+        except Exception as e:
+            traceback.print_exc()
+    except Exception:
+        # Stream error; still try to save partial messages
+        if new_messages:
+            try:
+                append_to_session(session_id, new_messages)
+            except Exception:
+                pass
+        raise
+
+
 # ==================== SSE Streaming ====================
 
 def create_sse_router() -> "APIRouter":
@@ -318,6 +503,10 @@ def create_notification_hub_app() -> FastAPI:
             await _manager.disconnect(websocket)
 
     app.include_router(notify_router)
+
+    # Session router
+    session_router = create_session_router()
+    app.include_router(session_router)
 
     # SSE query router (separate to avoid circular imports)
     sse_router = create_sse_router()

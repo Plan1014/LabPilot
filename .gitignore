@@ -32,6 +32,9 @@ build/
 # ================= Personal Scripts =================
 start-tauri.ps1
 
+# ================= Superpowers Design Docs =================
+docs/superpowers/
+
 # ================= Node.js / npm =================
 node_modules/
 npm-debug.log*

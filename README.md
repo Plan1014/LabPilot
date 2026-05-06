@@ -145,6 +145,33 @@ LabPilot/
 **环境变量：**
 - `NOTIFICATION_HUB_PORT`：监听端口（默认 8000）
 - `NOTIFICATION_HUB_ENABLED`：是否启用（默认 true）
+- `REDIS_URL`：Redis 连接 URL（默认 `redis://localhost:6379/1`）
+- `SESSION_TTL_DAYS`：Session 保留天数（默认 7 天）
+
+### Session 管理与归档
+
+前端通过 `/session/query` 接口进行带历史的对话管理，后端自动将会话归档到 JSON 文件。
+
+**架构：**
+```
+前端 (localStorage: session_id)
+  ├── POST /session/query ──► 后端 (Redis 存储当前 session)
+  │     Response: SSE 流
+  │     对话结束 → 写入 data/sessions/YYYY-MM-DD-{id}.json
+  ├── GET /session/list ──► 返回 session 列表
+  ├── GET /session/{id}/history ──► 加载历史 session
+  └── DELETE /session/{id} ──► 删除 session
+```
+
+**数据存储：**
+- **短期**：Redis（database 1），TTL 7 天自动清理
+- **长期**：JSON 归档文件（`data/sessions/`），供未来长期记忆模块使用
+
+**历史记录：**
+- 页面刷新后自动从 Redis 恢复 session
+- 通过「History」按钮查看和加载历史 session
+
+**REPL 模式**不受 session 管理影响，直接调用 `graph.invoke`，保留独立调试能力。
 
 ### 工具集
 

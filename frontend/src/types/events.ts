@@ -12,6 +12,15 @@ export interface SSEEvent {
   input?: Record<string, unknown>;
   result?: string;
   step: number;
+  session_id?: string;
+}
+
+export interface SessionMeta {
+  id: string;
+  title: string;
+  created_at: string;
+  last_message_at: string;
+  message_count: number;
 }
 
 export interface Message {
