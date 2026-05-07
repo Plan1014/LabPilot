@@ -13,6 +13,8 @@ All services POST to http://127.0.0.1:8000/notify when tasks complete.
 Agent connects to ws://127.0.0.1:8000/ws to receive notifications.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import queue
@@ -198,7 +200,7 @@ _manager = ConnectionManager()
 
 # ==================== Session Router ====================
 
-def create_session_router() -> "APIRouter":
+def create_session_router():
     """Create the session management router."""
     from fastapi import APIRouter
     from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
@@ -377,7 +379,7 @@ async def _stream_and_save(generator, session_id: str, new_messages: list[dict])
 
 # ==================== SSE Streaming ====================
 
-def create_sse_router() -> "APIRouter":
+def create_sse_router():
     """Create the SSE query router (lazy import to avoid circular deps)."""
     from fastapi import APIRouter
     from langchain_core.messages import HumanMessage
@@ -457,7 +459,12 @@ def create_notification_hub_app() -> FastAPI:
 
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[
+            "http://localhost:1420",
+            "http://127.0.0.1:1420",
+            "tauri://localhost",
+            "tauri://127.0.0.1",
+        ],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
