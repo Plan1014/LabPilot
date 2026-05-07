@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import type { SessionMeta, Message } from "../types/events";
+import type { SessionMeta, Message, SSEEvent } from "../types/events";
 
 const API_BASE = "http://127.0.0.1:8000";
 const SESSION_ID_KEY = "labpilot_session_id";
@@ -42,13 +42,68 @@ export function useSession(): UseSessionReturn {
       localStorage.setItem(SESSION_ID_KEY, id);
 
       // Convert history to Message format
-      const msgs: Message[] = data.messages.map((msg: any) => ({
-        id: crypto.randomUUID(),
-        role: msg.role === "user" ? "user" : "assistant",
-        content: Array.isArray(msg.content) ? JSON.stringify(msg.content) : msg.content,
-        events: [],
-        isComplete: true,
-      }));
+      // Tool results are stored as separate "tool" messages after assistant,
+      // need to merge them together
+      const msgs: Message[] = [];
+      const messages = data.messages;
+
+      for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+
+        if (msg.role === "user") {
+          msgs.push({
+            id: crypto.randomUUID(),
+            role: "user" as const,
+            content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+            events: [],
+            isComplete: true,
+          });
+        } else if (msg.role === "assistant") {
+          const events: SSEEvent[] = [];
+          const contentArray = Array.isArray(msg.content) ? msg.content : [];
+
+          for (const block of contentArray) {
+            if (!block || typeof block !== "object") continue;
+
+            if (block.type === "thinking") {
+              events.push({
+                type: "thinking" as const,
+                content: block.thinking || "",
+                step: block.index ?? 0,
+              });
+            } else if (block.type === "text") {
+              events.push({
+                type: "text" as const,
+                content: block.text || [],
+                step: block.index ?? 0,
+              });
+            }
+            // Note: tool_use blocks are NOT converted to tool_result here
+            // The actual tool results come from following "tool" messages
+          }
+
+          // Check if next messages are tool results
+          let j = i + 1;
+          while (j < messages.length && messages[j].role === "tool") {
+            events.push({
+              type: "tool_result" as const,
+              result: messages[j].content || "",
+              step: events.length > 0 ? (events[events.length - 1].step ?? 0) : 0,
+            });
+            j++;
+          }
+
+          msgs.push({
+            id: crypto.randomUUID(),
+            role: "assistant" as const,
+            content: "",
+            events,
+            isComplete: true,
+          });
+          i = j - 1; // Skip processed tool messages
+        }
+        // Skip tool messages (already processed with assistant)
+      }
       setMessages(msgs);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load session");

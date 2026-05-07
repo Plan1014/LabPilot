@@ -55,6 +55,10 @@ def bash(command: str, background: bool = False) -> str:
             )
             return f"[Background] Process started: {command[:80]}"
         else:
+            # Add -s flag to curl commands to suppress progress output
+            if "curl" in command.lower() and "-s" not in command:
+                command = command.replace("curl.exe", "curl.exe -s")
+                command = command.replace("curl ", "curl -s ")
             r = subprocess.run(
                 command,
                 shell=True,
@@ -63,7 +67,7 @@ def bash(command: str, background: bool = False) -> str:
                 text=True,
                 timeout=120,
             )
-            out = (r.stdout + r.stderr).strip()
+            out = r.stdout.strip()
             return out[:50000] if out else "(no output)"
     except Exception as e:
         return f"Error: {e}"
