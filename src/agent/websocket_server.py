@@ -23,6 +23,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from pydantic import BaseModel
 import os
 
+from src.agent.memory import memory_system
+
 # Load config from environment
 NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
 NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
@@ -224,6 +226,15 @@ def create_notification_hub_app() -> FastAPI:
             "error": req.error,
             "timestamp": req.timestamp or datetime.utcnow().isoformat() + "Z",
         }
+        # ===[新增] 同步更新 SQLite 任务状态表 ===
+        # 将 result 转为字符串存入数据库，供大模型 Retriever 读取
+        result_str = str(req.result) if req.result else (req.error or "")
+        memory_system.update_task_state(
+            task_id=req.task_id, 
+            status=req.type, 
+            result=result_str
+        )
+        # =========================================
 
         # Queue for agent processing
         notification_queue.put(message)
