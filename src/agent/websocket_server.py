@@ -214,13 +214,13 @@ def create_session_router():
 
     router = APIRouter()
 
-    @router.get("/session/list")
+    @router.get("/list")
     async def session_list():
         """List all sessions."""
         sessions = list_sessions()
         return {"sessions": sessions}
 
-    @router.get("/session/{session_id}")
+    @router.get("/{session_id}")
     async def get_session(session_id: str):
         """Get session metadata."""
         meta = get_session_meta(session_id)
@@ -229,7 +229,7 @@ def create_session_router():
             raise HTTPException(status_code=404, detail="Session not found")
         return meta
 
-    @router.get("/session/{session_id}/history")
+    @router.get("/{session_id}/history")
     async def get_session_history_endpoint(session_id: str):
         """Get full message history for a session."""
         history = get_session_history(session_id)
@@ -238,13 +238,13 @@ def create_session_router():
             raise HTTPException(status_code=404, detail="Session not found")
         return {"id": session_id, "messages": history}
 
-    @router.delete("/session/{session_id}")
+    @router.delete("/{session_id}")
     async def delete_session_endpoint(session_id: str):
         """Delete a session."""
         deleted = delete_session(session_id)
         return {"status": "deleted" if deleted else "not_found"}
 
-    @router.post("/session/query")
+    @router.post("/query")
     async def session_query(req: SessionQueryRequest):
         """Stream SSE events with session history management."""
         from src.agent.graph_thinking import build_graph, set_event_emitter
@@ -380,6 +380,56 @@ async def _stream_and_save(generator, session_id: str, new_messages: list[dict])
 
 
 # ==================== SSE Streaming ====================
+
+def create_memory_router():
+    """Create the memory management router for frontend panel."""
+    from fastapi import APIRouter
+    from src.agent.memory import (
+        list_all_facts, list_all_summaries,
+        delete_fact, delete_summary,
+        search_sessions as memory_search_sessions,
+    )
+    from src.agent.session_manager import list_sessions
+
+    router = APIRouter()
+
+    @router.get("/facts")
+    async def get_facts(limit: int = 100, offset: int = 0):
+        """List all stored facts."""
+        return list_all_facts(limit=limit, offset=offset)
+
+    @router.get("/summaries")
+    async def get_summaries(limit: int = 100, offset: int = 0):
+        """List all stored conversation summaries."""
+        return list_all_summaries(limit=limit, offset=offset)
+
+    @router.delete("/facts/{doc_id}")
+    async def remove_fact(doc_id: str):
+        """Delete a specific fact."""
+        deleted = delete_fact(doc_id)
+        return {"status": "deleted" if deleted else "not_found"}
+
+    @router.delete("/summaries/{doc_id}")
+    async def remove_summary(doc_id: str):
+        """Delete a specific summary."""
+        deleted = delete_summary(doc_id)
+        return {"status": "deleted" if deleted else "not_found"}
+
+    @router.get("/search")
+    async def search_memory_endpoint(query: str):
+        """Search memory via vector retrieval."""
+        from src.agent.memory import memory_retriever
+        result = memory_retriever.retrieve_context(query)
+        return {"result": result}
+
+    @router.get("/sessions/search")
+    async def search_sessions_endpoint(query: str, days: int = 7):
+        """Search historical sessions by keyword."""
+        result = memory_search_sessions(query, days)
+        return {"result": result}
+
+    return router
+
 
 def create_sse_router():
     """Create the SSE query router (lazy import to avoid circular deps)."""
@@ -522,11 +572,15 @@ def create_notification_hub_app() -> FastAPI:
 
     # Session router
     session_router = create_session_router()
-    app.include_router(session_router)
+    app.include_router(session_router, prefix="/session")
 
     # SSE query router (separate to avoid circular imports)
     sse_router = create_sse_router()
     app.include_router(sse_router)
+
+    # Memory router
+    memory_router = create_memory_router()
+    app.include_router(memory_router, prefix="/memory")
 
     return app
 

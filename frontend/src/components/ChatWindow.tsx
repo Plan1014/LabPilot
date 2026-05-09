@@ -2,11 +2,12 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import Message from "./Message";
 import InputArea from "./InputArea";
 import HistoryModal from "./HistoryModal";
+import MemoryModal from "./MemoryModal";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { getStoredSessionId, persistSessionId } from "../hooks/useSession";
 import type { Message as MessageType, SessionMeta, SSEEvent } from "../types/events";
-import { CircleNotch, Clock } from "@phosphor-icons/react";
+import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
 const API_BASE = "http://127.0.0.1:8000";
 
@@ -15,6 +16,7 @@ export default function ChatWindow() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [showMemory, setShowMemory] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { events, sendQuery, isConnected, error } = useSSE();
 
@@ -300,6 +302,14 @@ export default function ChatWindow() {
             <Clock size={14} />
             History
           </button>
+          <button
+            onClick={() => setShowMemory(true)}
+            className="flex items-center gap-1 text-xs text-[#666666] hover:text-[#1a1a1a] px-2 py-1 rounded hover:bg-[#f5f5f5] transition-colors"
+            title="Memory Panel"
+          >
+            <Brain size={14} />
+            Memory
+          </button>
           {/* SSE status */}
           <div className="flex items-center gap-1.5">
             <CircleNotch
@@ -353,6 +363,11 @@ export default function ChatWindow() {
           onDelete={deleteSession}
           listSessions={listSessions}
         />
+      )}
+
+      {/* Memory Modal */}
+      {showMemory && (
+        <MemoryModal onClose={() => setShowMemory(false)} />
       )}
     </div>
   );

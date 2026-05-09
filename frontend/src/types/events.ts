@@ -39,3 +39,24 @@ export interface Notification {
   error?: string;
   timestamp: string;
 }
+
+// ==================== Memory types ====================
+
+export interface MemoryFact {
+  doc_id: string;
+  content: string;
+  timestamp: number;
+  source: string;
+}
+
+export interface MemorySummary {
+  doc_id: string;
+  content: string;
+  timestamp: number;
+  filepath: string;
+}
+
+export interface MemoryPage<T> {
+  total: number;
+  items: T[];
+}
