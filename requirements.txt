@@ -26,8 +26,9 @@ click>=8.0
 websockets>=12.0
 uvicorn>=0.27.0
 
-# Redis session storage
-redis>=5.0
-
 # Instrument control
 RsInstrument>=1.124.0
+
+# Memory system
+chromadb>=0.5.0
+sentence-transformers>=2.7.0
