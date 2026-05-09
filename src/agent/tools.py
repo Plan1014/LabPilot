@@ -299,7 +299,7 @@ def spawn_subagent(prompt: str, agent_type: str = "Explore") -> str:
     return subagent(prompt)
 
 # ==================== 记忆管理工具 ====================
-from src.agent.memory import memory_system, memory_retriever
+from src.agent.memory import memory_system, memory_retriever, search_sessions
 
 @tool
 def remember_fact(fact: str) -> str:
@@ -331,6 +331,21 @@ def search_memory(query: str) -> str:
     except Exception as e:
         return f"检索失败: {e}"
 
+@tool
+def search_sessions(query: str, days: int = 7) -> str:
+    """
+    按关键词搜索用户的历史 session，找到后可结合 get_session_history 使用。
+    当用户提到"之前"、"昨天"、"上次"等模糊时间描述时调用。
+
+    Args:
+        query: 检索关键词
+        days: 向前搜索的天数，默认 7 天
+    """
+    try:
+        return search_sessions(query, days)
+    except Exception as e:
+        return f"检索失败: {e}"
+
 # ==================== Tool List ====================
 
 TOOLS: List[Callable] = [
@@ -341,5 +356,6 @@ TOOLS: List[Callable] = [
     load_skill,
     spawn_subagent,
     remember_fact,
-    search_memory, 
+    search_memory,
+    search_sessions,
 ]

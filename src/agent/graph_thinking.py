@@ -17,9 +17,6 @@ from langgraph.graph import StateGraph, END, add_messages
 from src.agent.llm import llm
 from src.agent.tools import TOOLS
 
-from langchain_core.messages import SystemMessage
-from src.agent.memory import memory_retriever
-
 # ==================== State ====================
 
 @dataclass
@@ -120,25 +117,6 @@ def generate(state: InterleavedState) -> dict:
     """
     step = state.step_count + 1
 
-    # === [新增] 被动记忆注入 (RAG 机制) ===
-    messages_to_llm = list(state.messages)
-    
-    # 获取用户最后一次说的内容
-    last_user_msg = ""
-    for msg in reversed(state.messages):
-        if isinstance(msg, HumanMessage):
-            last_user_msg = str(msg.content)
-            break
-            
-    if last_user_msg:
-        # 触发 Retriever，获取格式化好的记忆上下文
-        context = memory_retriever.retrieve_context(last_user_msg)
-        if context and "当前无长期记忆记录" not in context:
-            # 包装成系统消息，插入到对话最前面
-            memory_prompt = f"【系统自动注入的当前状态与长期记忆上下文】\n{context}\n请结合上述信息回答用户。"
-            messages_to_llm.insert(0, SystemMessage(content=memory_prompt))
-    # =====================================
-
     # Bind tools to the LLM - LangChain handles format conversion
     llm_with_tools = llm.bind_tools(TOOLS)
 
@@ -150,7 +128,7 @@ def generate(state: InterleavedState) -> dict:
     # response = llm_with_tools.invoke(state.messages)
 
     # [修改]这里传入拼装了记忆的 messages_to_llm
-    response = llm_with_tools.invoke(messages_to_llm)
+    response = llm_with_tools.invoke(state.messages)
 
     # response is an AIMessage with content containing blocks
     content = response.content

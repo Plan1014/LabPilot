@@ -17,6 +17,8 @@ MODEL_ID = os.getenv("MODEL_ID", "claude-sonnet-4-20250514")
 # Paths
 SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
+SESSIONS_DIR = WORKDIR / "data" / "sessions"
+SESSION_TTL_DAYS = 30
 
 # Thresholds
 TOKEN_THRESHOLD = 100000

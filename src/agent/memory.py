@@ -6,6 +6,7 @@
 
 import time
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
@@ -129,3 +130,107 @@ class MemoryRetriever:
 # 实例化全局单例
 memory_system = MemoryManager()
 memory_retriever = MemoryRetriever(memory_system)
+
+
+# ==================== 4. Session 搜索 (Agent 调用) ====================
+
+def search_sessions(query: str, days: int = 7) -> str:
+    """按关键词和时间范围搜索历史 session。
+
+    用于 Agent 主动加载历史对话上下文。
+    """
+    import sqlite3
+    cutoff = time.time() - days * 86400
+    conn = sqlite3.connect(str(SQLITE_DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute(
+        "SELECT id, title, created_at, last_message_at, message_count FROM sessions WHERE last_message_at > ? ORDER BY last_message_at DESC",
+        (cutoff,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+
+    # 按关键词过滤（简单 LIKE）
+    matched = []
+    for row in rows:
+        if query.lower() in row["title"].lower():
+            matched.append(row)
+        else:
+            # 也搜一下对应 messages（取最近 1 条 user message）
+            conn2 = sqlite3.connect(str(SQLITE_DB_PATH), check_same_thread=False)
+            msg_cur = conn2.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 1",
+                (row["id"],)
+            )
+            msg_row = msg_cur.fetchone()
+            conn2.close()
+            if msg_row and query.lower() in msg_row["content"].lower():
+                matched.append(row)
+
+    if not matched:
+        return f"最近 {days} 天内没有找到相关 session。"
+
+    lines = ["【匹配的 session 列表】"]
+    for row in matched:
+        ts = datetime.fromtimestamp(row["last_message_at"]).strftime("%Y-%m-%d %H:%M")
+        title = row["title"] or "(无标题)"
+        lines.append(f"- [{row['id'][:8]}] {title} ({ts})")
+    return "\n".join(lines)
+
+
+# ==================== 5. 全量查询 (前端面板) ====================
+
+def list_all_facts(limit: int = 100, offset: int = 0) -> list[dict]:
+    """返回所有事实记忆，分页。"""
+    all_data = memory_system.facts_col.get()
+    ids = all_data.get("ids", [])
+    docs = all_data.get("documents", [])
+    metas = all_data.get("metadatas", [])
+
+    total = len(ids)
+    page = []
+    for i in range(offset, min(offset + limit, total)):
+        page.append({
+            "doc_id": ids[i],
+            "content": docs[i],
+            "timestamp": metas[i].get("timestamp"),
+            "source": metas[i].get("source"),
+        })
+    return {"total": total, "items": page}
+
+
+def list_all_summaries(limit: int = 100, offset: int = 0) -> list[dict]:
+    """返回所有对话摘要，分页。"""
+    all_data = memory_system.summaries_col.get()
+    ids = all_data.get("ids", [])
+    docs = all_data.get("documents", [])
+    metas = all_data.get("metadatas", [])
+
+    total = len(ids)
+    page = []
+    for i in range(offset, min(offset + limit, total)):
+        page.append({
+            "doc_id": ids[i],
+            "content": docs[i],
+            "timestamp": metas[i].get("timestamp"),
+            "filepath": metas[i].get("filepath"),
+        })
+    return {"total": total, "items": page}
+
+
+def delete_fact(doc_id: str) -> bool:
+    """删除指定的事实记忆。"""
+    try:
+        memory_system.facts_col.delete(ids=[doc_id])
+        return True
+    except Exception:
+        return False
+
+
+def delete_summary(doc_id: str) -> bool:
+    """删除指定的摘要记忆。"""
+    try:
+        memory_system.summaries_col.delete(ids=[doc_id])
+        return True
+    except Exception:
+        return False
