@@ -248,7 +248,10 @@ def create_session_router():
     async def session_query(req: SessionQueryRequest):
         """Stream SSE events with session history management."""
         from src.agent.graph_thinking import build_graph, set_event_emitter
-        from src.agent.session_manager import message_to_dict
+        from src.agent.session_manager import (
+            message_to_dict, _compact_tool_results,
+            estimate_tokens, session_auto_compact,
+        )
 
         # Get or create session
         if req.session_id:
@@ -257,6 +260,9 @@ def create_session_router():
         else:
             session_id = create_session()
             history = []
+
+        # Layer 1: micro_compact — replace old tool_results with placeholders
+        history = _compact_tool_results(history)
 
         # Set session_id in response headers for frontend to pick up
         graph = build_graph()
@@ -338,7 +344,7 @@ def create_session_router():
 
         # Return the streaming response; messages will be saved after iteration completes
         return StreamingResponse(
-            _stream_and_save(event_generator(), session_id, new_messages),
+            _stream_and_save(event_generator(), session_id, new_messages, history),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -351,19 +357,28 @@ def create_session_router():
     return router
 
 
-async def _stream_and_save(generator, session_id: str, new_messages: list[dict]):
-    """Wrap an async generator to save messages to Redis after completion."""
-    from src.agent.session_manager import append_to_session, archive_session
+async def _stream_and_save(generator, session_id: str, new_messages: list[dict], pre_compacted_history: list[dict]):
+    """Wrap an async generator to save messages to SQLite after completion."""
+    from src.agent.session_manager import append_to_session, archive_session, estimate_tokens
+    from src.agent.config import TOKEN_THRESHOLD
     import traceback
     try:
         async for chunk in generator:
             yield chunk
-        # Stream completed; save new messages to Redis
+        # Stream completed; save new messages
         if new_messages:
             try:
                 append_to_session(session_id, new_messages)
             except Exception as e:
                 traceback.print_exc()
+        # Layer 2: auto_compact if token exceeds threshold
+        try:
+            from src.agent.session_manager import session_auto_compact
+            total = estimate_tokens(pre_compacted_history) + estimate_tokens(new_messages)
+            if total > TOKEN_THRESHOLD:
+                session_auto_compact(session_id)
+        except Exception:
+            traceback.print_exc()
         # Archive to JSON
         try:
             archive_session(session_id)

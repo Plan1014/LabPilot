@@ -14,7 +14,7 @@ from typing import Optional, Union
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
-from src.agent.config import WORKDIR, SESSIONS_DIR, SESSION_TTL_DAYS
+from src.agent.config import WORKDIR, SESSIONS_DIR, SESSION_TTL_DAYS, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID
 
 MEMORY_DIR = WORKDIR / "data" / "memory"
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -159,6 +159,16 @@ def get_session_meta(session_id: str) -> Optional[dict]:
     }
 
 
+def _parse_content(content: str, role: str) -> str | list[dict]:
+    """Parse stored content. For assistant, deserialize from JSON."""
+    if role == "assistant":
+        try:
+            return json.loads(content)
+        except Exception:
+            return content
+    return content
+
+
 def get_session_history(session_id: str) -> list[dict]:
     """Get full message history for a session."""
     if _is_expired(session_id):
@@ -172,7 +182,10 @@ def get_session_history(session_id: str) -> list[dict]:
     )
     result = []
     for row in cursor.fetchall():
-        msg = {"role": row[0], "content": row[1]}
+        role = row[0]
+        raw_content = row[1]
+        content = _parse_content(raw_content, role)
+        msg: dict = {"role": role, "content": content}
         if row[2]:
             msg["name"] = row[2]
         if row[3]:
@@ -187,9 +200,14 @@ def append_to_session(session_id: str, messages: list[dict]) -> int:
     now = time.time()
     with conn:
         for msg in messages:
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = json.dumps(content, default=str)
+            elif not isinstance(content, str):
+                content = str(content)
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, name, tool_call_id) VALUES (?, ?, ?, ?, ?)",
-                (session_id, msg.get("role", ""), msg.get("content", ""), msg.get("name"), msg.get("tool_call_id"))
+                (session_id, msg.get("role", ""), content, msg.get("name"), msg.get("tool_call_id"))
             )
         conn.execute(
             "UPDATE sessions SET last_message_at = ?, message_count = message_count + ? WHERE id = ?",
@@ -232,6 +250,144 @@ def list_sessions() -> list[dict]:
             "message_count": row[4],
         })
     return sessions
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return len(str(messages)) // 4
+
+
+# ==================== Layer 1: micro_compact ====================
+
+KEEP_RECENT = 30
+PRESERVE_RESULT_TOOLS = {"read_file"}
+
+
+def _build_tool_name_map(messages: list) -> dict:
+    """Build tool_use_id -> tool_name mapping from assistant messages."""
+    tool_name_map = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                tool_name_map[block.get("id", "")] = block.get("name", "unknown")
+            elif hasattr(block, "type") and block.type == "tool_use":
+                tool_name_map[getattr(block, "id", "")] = getattr(block, "name", "unknown")
+    return tool_name_map
+
+
+def _compact_tool_results(messages: list) -> list:
+    """Replace old tool_result content with short placeholders, keep last KEEP_RECENT."""
+    tool_results = []
+    for msg_idx, msg in enumerate(messages):
+        if msg.get("role") not in ("user", "assistant"):
+            continue
+        content = msg.get("content", [])
+        if not isinstance(content, list):
+            continue
+        for part_idx, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "tool_result":
+                tool_results.append((msg_idx, part_idx, part))
+            elif hasattr(part, "type") and part.type == "tool_result":
+                tool_results.append((msg_idx, part_idx, part))
+
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+
+    tool_name_map = _build_tool_name_map(messages)
+    to_clear = tool_results[:-KEEP_RECENT]
+
+    for _, _, result in to_clear:
+        content = result.get("content", "") if isinstance(result, dict) else ""
+        if not isinstance(content, str) or len(content) <= 100:
+            continue
+        tool_id = result.get("tool_use_id", "") if isinstance(result, dict) else ""
+        tool_name = tool_name_map.get(tool_id, "unknown")
+        if tool_name in PRESERVE_RESULT_TOOLS:
+            continue
+        if isinstance(result, dict):
+            result["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+
+# ==================== Layer 2: session_auto_compact ====================
+
+def session_auto_compact(session_id: str) -> str:
+    """Compress session history: save transcript, summarize, replace with summary msg.
+
+    Returns the summary text.
+    """
+    history = get_session_history(session_id)
+    if not history:
+        return ""
+
+    # Save full transcript
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for msg in history:
+            f.write(json.dumps(msg, default=str) + "\n")
+
+    # LLM summarize
+    from src.agent.llm import client
+    conv_text = json.dumps(history, default=str)[-80000:]
+    resp = client.messages.create(
+        model=MODEL_ID,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Summarize this conversation for continuity. Include: "
+                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+                "Be concise but preserve critical details.\n\n" + conv_text
+            )
+        }],
+        max_tokens=2000,
+    )
+    # Extract text block
+    summary = ""
+    if isinstance(resp.content, list):
+        for block in resp.content:
+            if hasattr(block, "type") and block.type == "text":
+                summary = block.text
+                break
+            elif isinstance(block, dict) and block.get("type") == "text":
+                summary = block.get("text", "")
+                break
+        if not summary and resp.content:
+            last_block = resp.content[-1]
+            summary = getattr(last_block, "text", str(last_block))
+    else:
+        summary = str(resp.content)
+
+    # Save to ChromaDB
+    from src.agent.memory import memory_system
+    memory_system.save_summary(summary, filepath=str(path))
+
+    # Replace session history with single summary msg
+    conn = _get_conn()
+    with conn:
+        conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, name, tool_call_id) VALUES (?, ?, ?, ?, ?)",
+            (session_id, "user", f"[Conversation compressed. Transcript: {path}]\n\n{summary}", None, None)
+        )
+        conn.execute(
+            "UPDATE sessions SET message_count = 1 WHERE id = ?",
+            (session_id,)
+        )
+
+    return summary
+
+
+# ==================== Layer 3: session_auto_compact (called by compact tool) ====================
+
+def compact_session(session_id: str) -> str:
+    """Manual compression — called by the compact tool. Returns summary."""
+    return session_auto_compact(session_id)
 
 
 # ==================== JSON Archiving ====================
