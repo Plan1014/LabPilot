@@ -281,35 +281,40 @@ def _build_tool_name_map(messages: list) -> dict:
 
 
 def _compact_tool_results(messages: list) -> list:
-    """Replace old tool_result content with short placeholders, keep last KEEP_RECENT."""
-    tool_results = []
-    for msg_idx, msg in enumerate(messages):
-        if msg.get("role") not in ("user", "assistant"):
-            continue
-        content = msg.get("content", [])
-        if not isinstance(content, list):
-            continue
-        for part_idx, part in enumerate(content):
-            if isinstance(part, dict) and part.get("type") == "tool_result":
-                tool_results.append((msg_idx, part_idx, part))
-            elif hasattr(part, "type") and part.type == "tool_result":
-                tool_results.append((msg_idx, part_idx, part))
+    """Replace old tool_result content with short placeholders, keep last KEEP_RECENT.
 
-    if len(tool_results) <= KEEP_RECENT:
+    Handles both SSE format (role='tool' messages) and REPL format (tool_result blocks).
+    """
+    # Collect all tool messages — SSE uses role='tool', REPL uses content blocks
+    tool_messages = []
+    for msg_idx, msg in enumerate(messages):
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        if role == "tool":
+            # SSE format: separate tool message
+            tool_messages.append((msg_idx, msg))
+        elif role in ("user", "assistant") and isinstance(content, list):
+            # REPL format: tool_result blocks inside content
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_messages.append((msg_idx, part))
+
+    if len(tool_messages) <= KEEP_RECENT:
         return messages
 
     tool_name_map = _build_tool_name_map(messages)
-    to_clear = tool_results[:-KEEP_RECENT]
+    to_clear = tool_messages[:-KEEP_RECENT]
 
-    for _, _, result in to_clear:
-        content = result.get("content", "") if isinstance(result, dict) else ""
-        if not isinstance(content, str) or len(content) <= 100:
-            continue
-        tool_id = result.get("tool_use_id", "") if isinstance(result, dict) else ""
-        tool_name = tool_name_map.get(tool_id, "unknown")
-        if tool_name in PRESERVE_RESULT_TOOLS:
-            continue
+    for _, result in to_clear:
         if isinstance(result, dict):
+            content = result.get("content", "")
+            if not isinstance(content, str) or len(content) <= 100:
+                continue
+            tool_id = result.get("tool_call_id", "") or result.get("tool_use_id", "")
+            tool_name = tool_name_map.get(tool_id, "unknown")
+            if tool_name in PRESERVE_RESULT_TOOLS:
+                continue
             result["content"] = f"[Previous: used {tool_name}]"
     return messages
 
