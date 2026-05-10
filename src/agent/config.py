@@ -20,8 +20,8 @@ TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 SESSIONS_DIR = WORKDIR / "data" / "sessions"
 
 # Thresholds
-TOKEN_THRESHOLD = 100000
-SESSION_TTL_DAYS = 30
+TOKEN_THRESHOLD = int(os.getenv("TOKEN_THRESHOLD", "100000"))
+SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 
 # NotificationHub port
 NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
