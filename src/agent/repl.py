@@ -16,6 +16,7 @@ from src.agent.llm import client
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
 
+from src.agent.memory import memory_system
 
 # ==================== Message Serialization ====================
 
@@ -138,7 +139,29 @@ def auto_compact(messages: list) -> list:
         messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
         max_tokens=2000,
     )
-    summary = resp.content[0].text if hasattr(resp.content[0], 'text') else str(resp.content[0])
+    # summary = resp.content[0].text if hasattr(resp.content[0], 'text') else str(resp.content[0])
+    # [新增优化]：正确提取真正的文本摘要，跳过 Thinking 块
+    summary = ""
+    if isinstance(resp.content, list):
+        for block in resp.content:
+            # 兼容带有思考块的模型 (Anthropic / MiniMax 等)
+            if hasattr(block, "type") and block.type == "text":
+                summary = block.text
+                break
+            elif isinstance(block, dict) and block.get("type") == "text":
+                summary = block.get("text", "")
+                break
+        
+        # 如果没找到类型为 text 的块，则 fallback 取最后一个块（通常最后才是结论）
+        if not summary and resp.content:
+            last_block = resp.content[-1]
+            summary = getattr(last_block, "text", str(last_block))
+    else:
+        summary = str(resp.content)
+
+    # [新增]将真正的摘要持久化到 ChromaDB
+    memory_system.save_summary(summary, filepath=str(path))
+    # =====================================
     return [{"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"}]
 
 

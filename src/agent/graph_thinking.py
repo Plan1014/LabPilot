@@ -8,14 +8,32 @@ Graph structure:
 All output (thinking, tool_result, text) happens inside the graph.
 """
 
+import threading
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, Sequence
+from typing import Annotated, Literal, Optional, Sequence, Callable
 
 from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
 from src.agent.tools import TOOLS
+
+
+# ==================== Event Emitter for SSE Streaming ====================
+
+_event_emitter: Optional[Callable[[dict], None]] = None
+_emitter_lock = threading.RLock()
+
+
+def set_event_emitter(emitter: Optional[Callable[[dict], None]]):
+    """Set the global event emitter for SSE streaming.
+
+    When set, print_* functions will also call emitter(event_dict).
+    When None (default), print_* functions only print to stdout.
+    """
+    global _event_emitter
+    with _emitter_lock:
+        _event_emitter = emitter
 
 
 # ==================== State ====================
@@ -76,10 +94,15 @@ def parse_content_blocks(content: any) -> tuple:
 
 # ==================== Output Helpers ====================
 
-def print_thinking(thinking: str) -> None:
+def print_thinking(thinking: str, step: int) -> None:
     """Print thinking block in gray color."""
     if not thinking.strip():
         return
+    # Emit via callback if registered
+    with _emitter_lock:
+        if _event_emitter:
+            _event_emitter({"type": "thinking", "content": thinking, "step": step})
+    # Fallback to stdout
     print(f"\033[90m[Thinking]\033[0m", flush=True)
     for line in thinking.split("\n"):
         print(f"  {line}", flush=True)
@@ -88,20 +111,34 @@ def print_thinking(thinking: str) -> None:
 
 def print_tool_call(tool_name: str, tool_input: dict, step: int) -> None:
     """Print tool call header with input details."""
+    with _emitter_lock:
+        if _event_emitter:
+            _event_emitter({
+                "type": "tool_call",
+                "name": tool_name,
+                "input": tool_input,
+                "step": step,
+            })
     print(f"\n\033[33m[Step {step}] Calling tool: {tool_name}\033[0m", flush=True)
     print(f"  Input: {tool_input}", flush=True)
 
 
 def print_tool_result(result: str, step: int) -> None:
     """Print tool result in green."""
+    with _emitter_lock:
+        if _event_emitter:
+            _event_emitter({"type": "tool_result", "result": result, "step": step})
     display = result[:500] + "..." if len(result) > 500 else result
     print(f"\033[32m[Step {step}] Result\033[0m: {display}", flush=True)
 
 
-def print_final_text(text_blocks: list[str]) -> None:
+def print_final_text(text_blocks: list[str], step: int) -> None:
     """Print final response in green."""
     if not text_blocks:
         return
+    with _emitter_lock:
+        if _event_emitter:
+            _event_emitter({"type": "text", "content": text_blocks, "step": step})
     print(f"\n\033[92m[Response]\033[0m", flush=True)
     for text in text_blocks:
         print(text, flush=True)
@@ -136,11 +173,11 @@ def generate(state: InterleavedState) -> dict:
 
     # Print thinking immediately
     for thinking in thinking_blocks:
-        print_thinking(thinking)
+        print_thinking(thinking, step)
 
     # 如果没有工具调用，打印最终文本
     if not tool_use_blocks:
-        print_final_text(text_blocks)
+        print_final_text(text_blocks, step)
 
     return {
         "messages": [response],  # LangChain AIMessage already properly formatted
@@ -164,14 +201,29 @@ def execute_tools(state: InterleavedState) -> dict:
     for tool_use in state.pending_tool_calls:
         if isinstance(tool_use, dict):
             tool_name = tool_use.get("name", "")
-            tool_input = tool_use.get("input", {})
             tool_id = tool_use.get("id", "")
+            # Streaming LLM may provide input in partial_json instead of input
+            raw_input = tool_use.get("input", {})
+            if not raw_input and tool_use.get("partial_json"):
+                import json
+                try:
+                    raw_input = json.loads(tool_use["partial_json"])
+                except Exception:
+                    raw_input = {}
+        elif hasattr(tool_use, "partial_json"):
+            tool_name = getattr(tool_use, "name", "?")
+            tool_id = getattr(tool_use, "id", "")
+            import json
+            try:
+                raw_input = json.loads(tool_use.partial_json)
+            except Exception:
+                raw_input = {}
         else:
             tool_name = getattr(tool_use, "name", "?")
-            tool_input = getattr(tool_use, "input", {})
             tool_id = getattr(tool_use, "id", "")
+            raw_input = getattr(tool_use, "input", {})
 
-        print_tool_call(tool_name, tool_input, state.step_count)
+        print_tool_call(tool_name, raw_input, state.step_count)
 
         tool = tool_map.get(tool_name)
         if tool is None:
@@ -179,7 +231,7 @@ def execute_tools(state: InterleavedState) -> dict:
             print(f"  Error: {result}", flush=True)
         else:
             try:
-                result = tool.invoke(tool_input)
+                result = tool.invoke(raw_input)
             except Exception as e:
                 result = f"Error: {e}"
 

@@ -55,6 +55,10 @@ def bash(command: str, background: bool = False) -> str:
             )
             return f"[Background] Process started: {command[:80]}"
         else:
+            # Add -s flag to curl commands to suppress progress output
+            if "curl" in command.lower() and "-s" not in command:
+                command = command.replace("curl.exe", "curl.exe -s")
+                command = command.replace("curl ", "curl -s ")
             r = subprocess.run(
                 command,
                 shell=True,
@@ -63,7 +67,7 @@ def bash(command: str, background: bool = False) -> str:
                 text=True,
                 timeout=120,
             )
-            out = (r.stdout + r.stderr).strip()
+            out = r.stdout.strip()
             return out[:50000] if out else "(no output)"
     except Exception as e:
         return f"Error: {e}"
@@ -298,6 +302,80 @@ def spawn_subagent(prompt: str, agent_type: str = "Explore") -> str:
     subagent = create_subagent(agent_type)
     return subagent(prompt)
 
+# ==================== 记忆管理工具 ====================
+from src.agent.memory import memory_system, memory_retriever, search_sessions
+
+@tool
+def remember_fact(fact: str) -> str:
+    """
+    当实验成功、获得最佳参数、或者发现代码 Bug 及解决办法时，主动调用此工具将事实永久保存。
+    
+    Args:
+        fact: 详细的事实描述（如："PDH锁定的最佳 PI 参数为 P=15, I=3"）
+    """
+    try:
+        memory_system.save_fact(fact, source="tool")
+        return "已成功将该事实写入长期记忆库。"
+    except Exception as e:
+        return f"写入失败: {e}"
+
+@tool
+def search_memory(query: str) -> str:
+    """
+    主动从系统的长期记忆中检索历史实验记录、成功的参数或历史总结。
+    当你不确定之前的操作，或需要参考历史经验时调用。
+    
+    Args:
+        query: 检索关键词或自然语言描述
+    """
+    try:
+        # 直接复用 Retriever 的多路召回能力
+        result = memory_retriever.retrieve_context(query)
+        return result if result and "无长期记忆" not in result else "未检索到相关历史记录。"
+    except Exception as e:
+        return f"检索失败: {e}"
+
+@tool
+def search_sessions(query: str, days: int = 7) -> str:
+    """
+    按关键词搜索用户的历史 session，找到后可结合 get_session_history 使用。
+    当用户提到"之前"、"昨天"、"上次"等模糊时间描述时调用。
+
+    Args:
+        query: 检索关键词
+        days: 向前搜索的天数，默认 7 天
+    """
+    try:
+        return search_sessions(query, days)
+    except Exception as e:
+        return f"检索失败: {e}"
+
+@tool
+def compact(focus: str = "") -> str:
+    """
+    手动压缩当前会话历史，将全量对话替换为摘要，保存到长期记忆。
+    当对话变长、上下文快超限、或需要固化关键进展时调用。
+
+    Args:
+        focus: 可选，指定希望在摘要中保留的重点（如"保留PI参数"）
+    """
+    from src.agent.session_manager import compact_session
+    from src.agent.session_manager import get_session_history
+    try:
+        # 从最近的 assistant msg 提取 session_id（hack：通过 message 里的 tool_call_id 或最后一个 session）
+        # 实际上 compact 需要 session_id，这里简化处理 — 获取当前历史来估算
+        summary = compact_session("")  # placeholder, real impl needs session_id
+        return f"会话已压缩: {summary}"
+    except Exception as e:
+        return f"压缩失败: {e}"
+
+
+def _get_current_session_id() -> str | None:
+    """Try to get current session_id from context. Used by compact tool."""
+    # This is a workaround — the tool doesn't have direct access to session_id
+    # For now, return empty to let compact_session handle it
+    return None
+
 
 # ==================== Tool List ====================
 
@@ -308,4 +386,7 @@ TOOLS: List[Callable] = [
     edit_file,
     load_skill,
     spawn_subagent,
+    remember_fact,
+    search_memory,
+    search_sessions,
 ]
