@@ -37,7 +37,7 @@ try {
 Set-Location "$projectRoot\frontend"
 
 Write-Host "Starting Tauri dev server..." -ForegroundColor Cyan
-& 'C:\Users\Charleslee\.cargo\bin\cargo.exe' tauri dev
+& cargo tauri dev
 
 # Cleanup backend on exit
 if ($backendProcess -and !$backendProcess.HasExited) {
