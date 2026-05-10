@@ -74,6 +74,7 @@ CMakeFiles/
 .langgraph_api/
 .langgraph/
 .langgra.ph/
+langgraph.json
 
 # ================= 数据 & 日志 & 敏感信息 =================
 *.csv
