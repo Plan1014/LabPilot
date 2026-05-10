@@ -44,6 +44,9 @@ dist/
 build/
 .next/
 
+# ================= Vite =================
+frontend/.vite/
+
 # ================= Tauri =================
 frontend/src-tauri/target/
 frontend/src-tauri/Cargo.lock

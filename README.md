@@ -1,8 +1,14 @@
 # LabPilot
 
-光学实验 agent 助手 —— 基于 LangGraph 的 ReAct 智能体。通过 FastAPI 的 API 控制和 Skill 技能系统，实现对实验的智能控制。
+光学实验 agent 助手 —— 基于 LangGraph 的 ReAct 智能体。通过 FastAPI 的 SSE 流式输出和 Skill 技能系统，实现对实验的智能控制。
 
-未来计划添加记忆系统和其他 Skill。
+## 核心功能
+
+- **三层对话压缩**：micro_compact（工具结果占位符）→ auto_compact（LLM 总结摘要）→ compact（手动压缩）
+- **长期记忆系统**：ChromaDB 向量存储事实记忆 + 对话摘要，支持语义检索
+- **SSE 流式对话**：前端实时流式输出，支持多会话管理和历史切换
+- **WebSocket 通知**：PDH/PNA 等设备任务完成实时推送
+- **Skill 技能系统**：通过 SKILL.md 定义领域知识，Agent 按需加载
 
 ## 快速开始
 
@@ -11,12 +17,13 @@
 - Python 3.11+
 - Node.js 18+（用于 Tauri 前端）
 - Rust 1.70+（用于 Tauri 桌面应用）
-- Anthropic API Key（用于调用 Claude 模型）
+- Anthropic API Key 或兼容 API
 
 ### 1. Python 环境
 
 ```bash
 pip install -r requirements.txt
+# 首次启动会自动下载 sentence-transformers 模型（约 60MB）
 ```
 
 ### 2. 配置
@@ -29,51 +36,29 @@ ANTHROPIC_BASE_URL=https://api.anthropic.com
 MODEL_ID=claude-sonnet-4-20250514
 ```
 
-### 3. Tauri 桌面应用（可选）
+### 3. 启动方式
 
-Tauri 前端提供图形化界面，集成了 SSE 流式输出和 WebSocket 实时通知。
+三种启动方式：
 
-**安装 C++ Build Tools（仅 Windows）**
-
-1. 下载 [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022)
-2. 安装时勾选 "C++ Build Tools"
-3. 安装完成后，打开 VS Build Tools 终端（x64 Native Tools Command Prompt）
-
-**安装 Rust**
-
+**方式一：REPL 交互（纯终端）**
 ```bash
-# 从 https://rustup.rs 安装 Rust
-rustup default stable
+venv\Scripts\python.exe -m src.agent.repl
 ```
+直接进入命令行 REPL，支持 `/compact` 手动压缩、`/history` 查看历史。
 
-**启动前端**
-
+**方式二：Dev 模式（后端 + Vite 前端）**
 ```powershell
-# 复制并修改配置
-cp start-tauri.example.ps1 start-tauri.ps1
-# 编辑 start-tauri.ps1，填入你的 MSVC 路径
-
-# 启动（同时运行 Python 后端 + Tauri 前端）
-.\start-tauri.ps1
+.\start-dev.ps1
 ```
+启动 Python 后端（端口 8000）+ Vite 前端（端口 1420），适合开发调试。
 
-### 4. 启动方式
-
-**桌面应用模式（推荐）：**
+**方式三：Tauri 桌面应用**
 ```powershell
 .\start-tauri.ps1
 ```
-自动启动 Python 后端（端口 8000）+ Tauri 桌面应用。
+启动 Python 后端 + Tauri 桌面应用，需配置 MSVC Build Tools 和 Rust 环境。
 
-**REPL 交互模式（终端）：**
-```bash
-python -m src.agent.repl
-```
-
-**LangGraph Server 模式（API 服务）：**
-```bash
-python -m langgraph_cli dev --port 8123
-```
+> 手动启动后端：`venv\Scripts\python.exe -m uvicorn src.agent.websocket_server:create_notification_hub_app --factory --host 127.0.0.1 --port 8000`
 
 ---
 
@@ -82,42 +67,92 @@ python -m langgraph_cli dev --port 8123
 ```
 LabPilot/
 ├── src/agent/
-│   ├── __init__.py      # LangGraph graph 导出
-│   ├── config.py        # 配置（模型、工作目录、技能路径）
-│   ├── graph.py         # Server 模式图定义
-│   ├── graph_thinking.py # ReAct 图定义（SSE 事件发射）
-│   ├── llm.py           # LLM 初始化（ChatAnthropic）
-│   ├── repl.py          # REPL 交互入口
-│   ├── state.py         # 状态定义
-│   ├── tools.py         # 工具定义（bash/read/write/edit/subagent/load_skill）
-│   └── websocket_server.py  # NotificationHub WebSocket 服务
-├── frontend/            # Tauri 桌面应用
-│   ├── src/             # React 前端源码
-│   │   ├── components/  # UI 组件
-│   │   ├── hooks/       # SSE / WebSocket hooks
-│   │   └── types/       # TypeScript 类型
-│   └── src-tauri/       # Tauri Rust 后端
-├── instrument/          # 仪器控制服务
-│   └── pna/              # PNA 相位噪声分析仪服务
-├── skills/              # 技能定义（SKILL.md）
-├── data/                # 实验数据（PNA_data 等）
-├── .env                 # 环境变量
-├── .env.example         # 环境变量模板
-├── start-tauri.ps1      # 启动脚本（个人用，gitignore）
-├── start-tauri.example.ps1 # 启动脚本模板
-├── langgraph.json      # LangGraph CLI 配置
-└── requirements.txt     # Python 依赖
+│   ├── __init__.py          # LangGraph graph 导出
+│   ├── config.py            # 配置（模型、工作目录、阈值）
+│   ├── graph.py             # Server 模式图定义
+│   ├── graph_thinking.py     # ReAct 图定义（SSE 事件发射）
+│   ├── llm.py               # LLM 初始化（ChatAnthropic）
+│   ├── memory.py            # 长期记忆系统（ChromaDB + SQLite）
+│   ├── repl.py              # REPL 交互入口
+│   ├── session_manager.py   # 会话存储（SQLite，三层压缩）
+│   ├── state.py             # 状态定义
+│   ├── tools.py             # 工具定义（bash/read/write/edit/subagent/load_skill/remember_fact/search_memory/search_sessions/compact）
+│   └── websocket_server.py  # NotificationHub（SSE + WebSocket）
+├── frontend/                # Tauri 桌面应用
+│   ├── src/                 # React 前端源码
+│   │   ├── components/       # UI 组件（ChatWindow, MemoryModal, HistoryModal...）
+│   │   ├── hooks/           # SSE / WebSocket hooks
+│   │   └── types/           # TypeScript 类型
+│   └── src-tauri/           # Tauri Rust 后端
+├── skills/                  # 技能定义（SKILL.md）
+├── data/
+│   ├── memory/              # ChromaDB + SQLite（记忆系统）
+│   └── sessions/           # JSON 归档会话
+├── .transcripts/           # 压缩后的对话记录
+├── .env                    # 环境变量
+├── .env.example            # 环境变量模板
+├── start-dev.ps1            # 启动脚本
+├── requirements.txt       # Python 依赖
+└── README.md
 ```
 
 ---
 
-## 核心功能
+## 后端 API（端口 8000）
+
+### 会话管理
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/session/query` | POST | SSE 流式查询，支持 session_id |
+| `/session/list` | GET | 会话列表（按最近活动时间排序） |
+| `/session/{id}` | GET | 获取会话元信息 |
+| `/session/{id}/history` | GET | 加载历史会话 |
+| `/session/{id}` | DELETE | 删除会话 |
+
+### 记忆系统
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/memory/facts` | GET | 事实记忆列表（分页） |
+| `/memory/summaries` | GET | 对话摘要列表（分页） |
+| `/memory/facts/{doc_id}` | DELETE | 删除事实记忆 |
+| `/memory/summaries/{doc_id}` | DELETE | 删除摘要记忆 |
+| `/memory/search?query=` | GET | 语义检索记忆 |
+
+### 设备通知
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/notify` | POST | 接收设备任务完成通知 |
+| `/ws` | WebSocket | Agent WebSocket 连接 |
+
+---
+
+## 三层对话压缩
+
+### Layer 1: micro_compact（每次请求自动执行）
+
+保留最近 30 个工具结果，旧的替换为短占位符 `[Previous: used {tool_name}]`。`read_file` 结果始终保留原文（参考材料）。
+
+### Layer 2: auto_compact（token 超过阈值时自动执行）
+
+当对话 token 数超过阈值（默认 100,000）时：
+1. 将完整对话保存到 `.transcripts/`
+2. 调用 LLM 生成摘要
+3. 摘要持久化到 ChromaDB（长期记忆）
+4. 会话历史替换为单条 summary 消息
+
+### Layer 3: compact 工具（Agent 主动触发）
+
+Agent 可通过 `compact` 工具主动压缩当前会话，触发时机由 Agent 自行判断。
+
+---
+
+## 核心架构
 
 ### NotificationHub（端口 8000）
 
-集中式通知调度器，连接各仪器服务于 Agent 的桥梁。
-
-**架构：**
 ```
   8001: PDH-Locking 服务  ──┐
   8002: PNA 服务         ──┼── HTTP POST /notify ──► NotificationHub (8000) ──► Agent (WebSocket)
@@ -125,112 +160,67 @@ LabPilot/
                           └─────────────────────────┘
 ```
 
-**工作流程：**
-1. Agent 启动时连接 `ws://127.0.0.1:8000/ws`
-2. 各仪器服务完成任务后 POST 到 `http://127.0.0.1:8000/notify`
-3. NotificationHub 通过 WebSocket 将通知推送给 Agent
-4. Agent 自动触发处理，报告用户
+### 存储层次
 
-**通知格式：**
-```json
-{
-  "source": "pna",
-  "task_id": "abc123",
-  "type": "task_completed",
-  "result": {"csv_path": "...", "trace_points": 801},
-  "timestamp": "2026-04-24T12:00:00Z"
-}
-```
+- **SQLite**（`data/memory/tasks.db`）：会话历史 + 任务状态（TTL 30 天）
+- **ChromaDB**（`data/memory/chroma_db/`）：事实记忆 + 对话摘要（向量检索）
+- **文件系统**（`.transcripts/`）：压缩后的对话原文归档
+- **JSON**（`data/sessions/`）：会话 JSON 归档
 
-**环境变量：**
-- `NOTIFICATION_HUB_PORT`：监听端口（默认 8000）
-- `NOTIFICATION_HUB_ENABLED`：是否启用（默认 true）
-- `REDIS_URL`：Redis 连接 URL（默认 `redis://localhost:6379/1`）
-- `SESSION_TTL_DAYS`：Session 保留天数（默认 7 天）
+### 长期记忆 RAG
 
-### Session 管理与归档
+Agent 可通过以下工具访问长期记忆：
 
-前端通过 `/session/query` 接口进行带历史的对话管理，后端自动将会话归档到 JSON 文件。
+- `remember_fact(fact)` — 记住关键事实（参数、Bug 解法等）
+- `search_memory(query)` — 语义检索历史记忆
+- `search_sessions(query, days)` — 搜索历史会话
+- `compact()` — 主动压缩当前会话
 
-**架构：**
-```
-前端 (localStorage: session_id)
-  ├── POST /session/query ──► 后端 (Redis 存储当前 session)
-  │     Response: SSE 流
-  │     对话结束 → 写入 data/sessions/YYYY-MM-DD-{id}.json
-  ├── GET /session/list ──► 返回 session 列表
-  ├── GET /session/{id}/history ──► 加载历史 session
-  └── DELETE /session/{id} ──► 删除 session
-```
+---
 
-**数据存储：**
-- **短期**：Redis（database 1），TTL 7 天自动清理
-- **长期**：JSON 归档文件（`data/sessions/`），供未来长期记忆模块使用
+## 工具集
 
-**历史记录：**
-- 页面刷新后自动从 Redis 恢复 session
-- 通过「History」按钮查看和加载历史 session
-
-**REPL 模式**不受 session 管理影响，直接调用 `graph.invoke`，保留独立调试能力。
-
-### 工具集
-
-| 工具               | 功能                          |
-| ------------------ | ----------------------------- |
-| `bash`           | 执行 shell 命令（支持后台模式）|
-| `read_file`      | 读取文件（自动编码检测）      |
-| `write_file`     | 写入文件（UTF-8）             |
-| `edit_file`      | 替换文件中第一处指定文本      |
-| `load_skill`     | 加载技能知识（SKILL.md）      |
+| 工具 | 功能 |
+|------|------|
+| `bash` | 执行 shell 命令（支持后台模式） |
+| `read_file` | 读取文件（自动编码检测） |
+| `write_file` | 写入文件（UTF-8） |
+| `edit_file` | 替换文件中第一处指定文本 |
+| `load_skill` | 加载技能知识（SKILL.md） |
 | `spawn_subagent` | 派生独立子 agent 处理复杂任务 |
+| `remember_fact` | 将关键事实写入长期记忆 |
+| `search_memory` | 语义检索长期记忆 |
+| `search_sessions` | 搜索历史会话 |
+| `compact` | 手动压缩当前会话历史 |
 
-> **bash 后台模式**：`bash(command="...", background=True)` 用于启动长期运行的服务（如 PNA），避免阻塞 agent。
+---
 
-### 子 Agent
-
-通过 `spawn_subagent` 派生两种类型的子 agent：
-
-- **Explore**（只读）：用于代码探索、搜索、理解
-- **general-purpose**（读写）：用于代码修改、文件编辑
-
-### 技能系统
+## 技能系统
 
 在 `skills/` 目录下放置 `SKILL.md` 文件，定义专业化知识。当前内置技能：
 
-- **pdh-locking**：PDH（Pound-Drever-Hall）光学腔锁定系统控制技能
-
-  控制 FastAPI 服务（http://127.0.0.1:8001），支持：
-
-  - PI 参数计算（异步任务）
-  - 锁定/解锁状态控制
-  - PID 参数配置（kp/ki/kd: 0-8191）
-  - 调制参数配置（频率/幅度）
-  - 波形导出
-  - 功率监控
-
-- **pna**：相位噪声分析仪（Phase Noise Analyzer）测量技能
-
-  控制 Rohde & Schwarz PNA（http://127.0.0.1:8002），特点：
-
-  - 服务启动时建立持久连接，测量时复用
-  - 异步测量，结果通过 NotificationHub 推送
-  - CSV 格式输出（Frequency_Hz, Power_dBm）
-  - 使用 `bash(command="python -m instrument.pna.main", background=True)` 启动
+- **pdh-locking**：PDH（Pound-Dreber-Hall）光学腔锁定系统控制技能
+- **pna**：相位噪声分析仪测量技能
 
 ---
 
 ## REPL 命令
 
-| 命令             | 说明             |
-| ---------------- | ---------------- |
-| `/help`        | 显示可用工具     |
-| `/history`     | 显示对话历史     |
-| `/compact`     | 手动压缩历史记录 |
-| `q` / `exit` | 退出 REPL        |
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示可用工具 |
+| `/history` | 显示对话历史 |
+| `/compact` | 手动压缩历史记录 |
+| `q` / `exit` | 退出 REPL |
 
 ---
 
-## 上下文管理
+## 环境变量
 
-- **Micro-compact**：保留最近 3 个工具结果，旧的标记为 `[cleared]`
-- **Auto-compact**：当 token 超过阈值（默认 100,000）时，自动将历史保存到 `.transcripts/` 并用 LLM 摘要替换
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL_ID` | `claude-sonnet-4-20250514` | 模型 ID |
+| `NOTIFICATION_HUB_PORT` | `8000` | API 监听端口 |
+| `NOTIFICATION_HUB_ENABLED` | `true` | 是否启用 NotificationHub |
+| `SESSION_TTL_DAYS` | `30` | 会话保留天数 |
+| `TOKEN_THRESHOLD` | `100000` | 触发 auto_compact 的 token 阈值 |
