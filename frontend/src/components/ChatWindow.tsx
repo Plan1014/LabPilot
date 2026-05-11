@@ -18,7 +18,7 @@ export default function ChatWindow() {
   const [showHistory, setShowHistory] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { events, sendQuery, isConnected, error } = useSSE();
+  const { events, sendQuery, isConnected, error, abort } = useSSE();
 
   // WebSocket for notifications
   const { notifications, isConnected: wsConnected } = useWebSocket();
@@ -212,6 +212,8 @@ export default function ChatWindow() {
         },
       ]);
 
+      lastUserMessageIdRef.current = userMessageId;
+
       setMessages((prev) => [
         ...prev,
         {
@@ -229,7 +231,7 @@ export default function ChatWindow() {
       const storedId = getStoredSessionId();
       await sendQuery(query, storedId);
     },
-    [sendQuery]
+    [abort, sendQuery]
   );
 
   const listSessions = useCallback(async (): Promise<SessionMeta[]> => {
@@ -238,6 +240,29 @@ export default function ChatWindow() {
     const data = await res.json();
     return data.sessions;
   }, []);
+
+  // Track IDs for stop functionality
+  const lastUserMessageIdRef = useRef<string | null>(null);
+
+  const handleStop = useCallback(() => {
+    // 1. Abort SSE request
+    abort();
+
+    // 2. Delete the streaming assistant message
+    if (streamingMessageId) {
+      setMessages((prev) => prev.filter((msg) => msg.id !== streamingMessageId));
+    }
+
+    // 3. Delete the user message that triggered the request
+    if (lastUserMessageIdRef.current) {
+      setMessages((prev) => prev.filter((msg) => msg.id !== lastUserMessageIdRef.current));
+      lastUserMessageIdRef.current = null;
+    }
+
+    // 4. Reset streaming state
+    setIsStreaming(false);
+    setStreamingMessageId(null);
+  }, [abort, streamingMessageId]);
 
   const loadSession = useCallback(
     async (id: string) => {
@@ -399,7 +424,7 @@ export default function ChatWindow() {
       </main>
 
       {/* Input */}
-      <InputArea onSubmit={handleSubmit} isStreaming={isStreaming} />
+      <InputArea onSubmit={handleSubmit} isStreaming={isStreaming} onStop={handleStop} />
 
       {/* History Modal */}
       {showHistory && (

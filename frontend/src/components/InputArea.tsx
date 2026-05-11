@@ -4,14 +4,24 @@ import { PaperPlaneTilt, StopCircle } from "@phosphor-icons/react";
 interface Props {
   onSubmit: (query: string) => void;
   isStreaming: boolean;
+  onStop?: () => void;
 }
 
-export default function InputArea({ onSubmit, isStreaming }: Props) {
+export default function InputArea({ onSubmit, isStreaming, onStop }: Props) {
   const [input, setInput] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (input.trim() && !isStreaming) {
+      onSubmit(input.trim());
+      setInput("");
+    }
+  };
+
+  const handleClick = () => {
+    if (isStreaming && onStop) {
+      onStop();
+    } else if (!isStreaming && input.trim()) {
       onSubmit(input.trim());
       setInput("");
     }
@@ -35,8 +45,8 @@ export default function InputArea({ onSubmit, isStreaming }: Props) {
                      placeholder:text-[#9ca3af]"
         />
         <button
-          type="submit"
-          disabled={!input.trim() || isStreaming}
+          type="button"
+          onClick={handleClick}
           className="p-2 bg-[#d97757] text-white rounded-lg hover:bg-[#c4684a]
                      disabled:bg-[#e5e5e5] disabled:text-[#999999] transition-colors"
         >
