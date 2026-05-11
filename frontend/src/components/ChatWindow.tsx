@@ -43,12 +43,14 @@ export default function ChatWindow() {
               const msg = messages[i];
 
               if (msg.role === "user") {
+                const isSystemPrompt = typeof msg.content === "string" && msg.content.startsWith("[WebSocket]");
                 msgs.push({
                   id: crypto.randomUUID(),
                   role: "user" as const,
                   content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
                   events: [],
                   isComplete: true,
+                  isSystemPrompt,
                 });
               } else if (msg.role === "assistant") {
                 const events: SSEEvent[] = [];
@@ -135,22 +137,64 @@ export default function ChatWindow() {
     }
   }, [events, streamingMessageId]);
 
-  // Show notification as a system message
+  // Show notification as system prompt and notify REPL
   useEffect(() => {
     if (notifications.length === 0) return;
     const last = notifications[notifications.length - 1];
-    const notifId = `notif-${Date.now()}`;
+    const formatted = formatNotification(last);
+
+    // Add system prompt message (this is the query sent to REPL)
+    const userMessageId = `user-${Date.now()}`;
+    const assistantMessageId = `assistant-${Date.now()}`;
+
     setMessages((prev) => [
       ...prev,
       {
-        id: notifId,
-        role: "assistant",
-        content: `[${last.source}] ${last.type}: ${JSON.stringify(last.result || last.error || "")}`,
+        id: userMessageId,
+        role: "user",
+        content: formatted,
         events: [],
         isComplete: true,
+        isSystemPrompt: true,  // Mark as system prompt for gray card rendering
       },
     ]);
+
+    setIsStreaming(true);
+    setStreamingMessageId(assistantMessageId);
+
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
+        events: [],
+        isComplete: false,
+      },
+    ]);
+
+    const storedId = getStoredSessionId();
+    sendQuery(formatted, storedId);
   }, [notifications]);
+
+  const formatNotification = (notif: { source?: string; type?: string; result?: Record<string, unknown>; timestamp?: string }): string => {
+    const ts_str = notif.timestamp ? `[${notif.timestamp}] ` : "";
+    const source_str = notif.source ? `[${notif.source}] ` : "";
+    const result = notif.result || {};
+
+    let content = "";
+    if (notif.type === "task_completed") {
+      const parts: string[] = [];
+      for (const [k, v] of Object.entries(result)) {
+        parts.push(`${k}=${v}`);
+      }
+      content = parts.join(", ");
+    } else {
+      content = JSON.stringify(result);
+    }
+
+    return `[WebSocket] ${ts_str}${source_str}${notif.type}: ${content}`;
+  };
 
   const handleSubmit = useCallback(
     async (query: string) => {
@@ -209,12 +253,14 @@ export default function ChatWindow() {
         const msg = messages[i];
 
         if (msg.role === "user") {
+          const isSystemPrompt = typeof msg.content === "string" && msg.content.startsWith("[WebSocket]");
           msgs.push({
             id: crypto.randomUUID(),
             role: "user" as const,
             content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
             events: [],
             isComplete: true,
+            isSystemPrompt,
           });
         } else if (msg.role === "assistant") {
           const events: SSEEvent[] = [];

@@ -9,6 +9,7 @@ interface Props {
   content: string;
   events: SSEEvent[];
   isComplete: boolean;
+  isSystemPrompt?: boolean;
 }
 
 // Sort order within a step: thinking=0, tool_call=1, tool_result=2, text=3
@@ -19,7 +20,7 @@ const TYPE_ORDER: Record<string, number> = {
   text: 3,
 };
 
-export default function Message({ role, content, events, isComplete }: Props) {
+export default function Message({ role, content, events, isComplete, isSystemPrompt }: Props) {
   const isUser = role === "user";
 
   // Sort by step, then by type order
@@ -76,10 +77,12 @@ export default function Message({ role, content, events, isComplete }: Props) {
   }
 
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div className={`flex ${isUser && !isSystemPrompt ? "justify-end" : "justify-start"}`}>
       <div
         className={`max-w-[80%] rounded-lg px-4 py-3 ${
-          isUser
+          isUser && isSystemPrompt
+            ? "bg-[#f5f5f5] border border-[#e0e0e0]"
+            : isUser
             ? "bg-[#d97757] text-white"
             : "bg-white border border-[#e5e5e5]"
         }`}
