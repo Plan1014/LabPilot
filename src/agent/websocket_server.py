@@ -432,6 +432,15 @@ def create_memory_router():
         search_sessions as memory_search_sessions,
     )
     from src.agent.session_manager import list_sessions
+    from src.agent.memory.core import CoreMemoryManager, Block
+
+    _core_mgr: CoreMemoryManager | None = None
+
+    def _get_core_mgr() -> CoreMemoryManager:
+        global _core_mgr
+        if _core_mgr is None:
+            _core_mgr = CoreMemoryManager()
+        return _core_mgr
 
     router = APIRouter()
 
@@ -469,6 +478,31 @@ def create_memory_router():
         """Search historical sessions by keyword."""
         result = memory_search_sessions(query, days)
         return {"result": result}
+
+    @router.get("/blocks")
+    async def get_blocks():
+        """List all Core Memory blocks (hot memory)."""
+        blocks = _get_core_mgr().get_all_blocks()
+        return {
+            "items": [
+                {
+                    "label": b.label,
+                    "value": b.value,
+                    "description": b.description,
+                    "limit": b.limit,
+                    "read_only": b.read_only,
+                    "created_at": b.created_at,
+                    "updated_at": b.updated_at,
+                }
+                for b in blocks
+            ]
+        }
+
+    @router.delete("/blocks/{label}")
+    async def delete_block(label: str):
+        """Delete a Core Memory block by label."""
+        deleted = _get_core_mgr().delete_block(label)
+        return {"status": "deleted" if deleted else "not_found"}
 
     return router
 

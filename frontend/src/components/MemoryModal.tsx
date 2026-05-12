@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import type { MemoryFact, MemorySummary, MemoryPage } from "../types/events";
-import { Brain, Trash, X, MagnifyingGlass, ChatCircle } from "@phosphor-icons/react";
+import type { MemoryFact, MemorySummary, MemoryPage, MemoryBlock } from "../types/events";
+import { Brain, Trash, X, MagnifyingGlass, ChatCircle, HardDrive } from "@phosphor-icons/react";
 
 const API_BASE = "http://127.0.0.1:8000";
 
@@ -8,12 +8,13 @@ interface MemoryModalProps {
   onClose: () => void;
 }
 
-type Tab = "facts" | "summaries";
+type Tab = "facts" | "summaries" | "hot";
 
 export default function MemoryModal({ onClose }: MemoryModalProps) {
   const [tab, setTab] = useState<Tab>("facts");
   const [facts, setFacts] = useState<MemoryFact[]>([]);
   const [summaries, setSummaries] = useState<MemorySummary[]>([]);
+  const [blocks, setBlocks] = useState<MemoryBlock[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResult, setSearchResult] = useState<string | null>(null);
@@ -41,12 +42,23 @@ export default function MemoryModal({ onClose }: MemoryModalProps) {
     }
   }, []);
 
+  const loadBlocks = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/memory/blocks`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setBlocks(data.items);
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
   useEffect(() => {
     setLoading(true);
-    Promise.all([loadFacts(), loadSummaries()])
+    Promise.all([loadFacts(), loadSummaries(), loadBlocks()])
       .catch(console.error)
       .finally(() => setLoading(false));
-  }, [loadFacts, loadSummaries]);
+  }, [loadFacts, loadSummaries, loadBlocks]);
 
   const handleDeleteFact = async (doc_id: string) => {
     try {
@@ -64,6 +76,17 @@ export default function MemoryModal({ onClose }: MemoryModalProps) {
       const res = await fetch(`${API_BASE}/memory/summaries/${doc_id}`, { method: "DELETE" });
       if (res.ok) {
         setSummaries((prev) => prev.filter((s) => s.doc_id !== doc_id));
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleDeleteBlock = async (label: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/memory/blocks/${encodeURIComponent(label)}`, { method: "DELETE" });
+      if (res.ok) {
+        setBlocks((prev) => prev.filter((b) => b.label !== label));
       }
     } catch (e) {
       console.error(e);
@@ -157,6 +180,17 @@ export default function MemoryModal({ onClose }: MemoryModalProps) {
           >
             Summaries ({summaries.length})
           </button>
+          <button
+            onClick={() => { setTab("hot"); setSearchResult(null); }}
+            className={`flex-1 py-2 text-sm font-medium transition-colors flex items-center justify-center gap-1 ${
+              tab === "hot"
+                ? "border-b-2 border-[#1a1a1a] text-[#1a1a1a]"
+                : "text-[#999999] hover:text-[#666]"
+            }`}
+          >
+            <HardDrive size={14} />
+            Hot ({blocks.length})
+          </button>
         </div>
 
         {/* Content */}
@@ -221,6 +255,33 @@ export default function MemoryModal({ onClose }: MemoryModalProps) {
               >
                 <Trash size={14} className="text-red-500" />
               </button>
+            </div>
+          ))}
+
+          {!loading && tab === "hot" && blocks.length === 0 && !searchResult && (
+            <div className="flex items-center justify-center py-8">
+              <span className="text-sm text-[#999999]">No hot memory blocks</span>
+            </div>
+          )}
+
+          {!loading && tab === "hot" && blocks.map((b) => (
+            <div key={b.label} className="group flex items-start gap-2 p-3 bg-[#fafafa] rounded-lg hover:bg-[#f5f5f5] transition-colors">
+              <div className="flex-1 min-w-0">
+                <div className="text-xs font-mono text-[#666] mb-1">[{b.label}]</div>
+                <div className="text-sm whitespace-pre-wrap">{b.value}</div>
+                <div className="text-xs text-[#999] mt-1">
+                  {b.read_only ? "🔒 " : ""}{b.value.length} / {b.limit} chars
+                </div>
+              </div>
+              {!b.read_only && (
+                <button
+                  onClick={() => handleDeleteBlock(b.label)}
+                  className="p-1.5 hover:bg-red-50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                  title="Delete"
+                >
+                  <Trash size={14} className="text-red-500" />
+                </button>
+              )}
             </div>
           ))}
         </div>

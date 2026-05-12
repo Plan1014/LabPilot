@@ -61,3 +61,13 @@ export interface MemoryPage<T> {
   total: number;
   items: T[];
 }
+
+export interface MemoryBlock {
+  label: string;
+  value: string;
+  description: string;
+  limit: number;
+  read_only: boolean;
+  created_at: number;
+  updated_at: number;
+}

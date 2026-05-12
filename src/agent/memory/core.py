@@ -216,6 +216,15 @@ class CoreMemoryManager:
 
         return "\n".join(lines)
 
+    def delete_block(self, label: str) -> bool:
+        """删除指定 label 的 Block。"""
+        try:
+            with self.conn:
+                self.conn.execute("DELETE FROM blocks WHERE label = ?", (label,))
+            return True
+        except Exception:
+            return False
+
     def close(self):
         """关闭数据库连接"""
         self.conn.close()
