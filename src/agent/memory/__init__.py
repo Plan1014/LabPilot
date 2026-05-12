@@ -1,8 +1,8 @@
-"""Core Memory 模块 - Block 体系热点记忆"""
+"""Core Memory + Archival Memory 模块"""
 
-from src.agent.memory.core import CoreMemoryManager
+from src.agent.memory.core import CoreMemoryManager, Block, BlockHistory
 
-# 全局单例，延迟初始化
+# 全局单例
 core_memory_manager: CoreMemoryManager = None
 
 def get_core_memory_manager() -> CoreMemoryManager:
@@ -10,3 +10,29 @@ def get_core_memory_manager() -> CoreMemoryManager:
     if core_memory_manager is None:
         core_memory_manager = CoreMemoryManager()
     return core_memory_manager
+
+# Archival Memory 兼容导入
+from src.agent.memory.archival import (
+    memory_system,
+    memory_retriever,
+    search_sessions,
+    list_all_facts,
+    list_all_summaries,
+    delete_fact,
+    delete_summary,
+)
+
+__all__ = [
+    "CoreMemoryManager",
+    "Block",
+    "BlockHistory",
+    "get_core_memory_manager",
+    "core_memory_manager",
+    "memory_system",
+    "memory_retriever",
+    "search_sessions",
+    "list_all_facts",
+    "list_all_summaries",
+    "delete_fact",
+    "delete_summary",
+]
