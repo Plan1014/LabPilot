@@ -8,6 +8,7 @@ interface UseSSEReturn {
   events: SSEEvent[];
   sendQuery: (query: string, sessionId?: string | null) => Promise<string | null>;
   clearEvents: () => void;
+  abort: () => void;
 }
 
 export function useSSE(
@@ -119,11 +120,16 @@ export function useSSE(
     setError(null);
   }, []);
 
+  const abort = useCallback(() => {
+    abortControllerRef.current?.abort();
+  }, []);
+
   return {
     isConnected,
     error,
     events,
     sendQuery,
     clearEvents,
+    abort,
   };
 }

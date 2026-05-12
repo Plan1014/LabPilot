@@ -29,6 +29,7 @@ export interface Message {
   content: string;
   events: SSEEvent[];
   isComplete: boolean;
+  isSystemPrompt?: boolean;
 }
 
 export interface Notification {
