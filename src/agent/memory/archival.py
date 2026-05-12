@@ -8,7 +8,8 @@ from src.agent.memory.archival_store import (
     memory_system,
     memory_retriever,
     search_sessions,
-    save_fact,
+    # save_fact 是 memory_system 的方法，不是独立函数
+# memory_system.save_fact(...) 调用即可
     list_all_facts,
     list_all_summaries,
     delete_fact,
@@ -19,7 +20,6 @@ __all__ = [
     "memory_system",
     "memory_retriever",
     "search_sessions",
-    "save_fact",
     "list_all_facts",
     "list_all_summaries",
     "delete_fact",
