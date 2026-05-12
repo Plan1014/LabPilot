@@ -265,6 +265,27 @@ def create_session_router():
         # Layer 1: micro_compact — replace old tool_results with placeholders
         history = _compact_tool_results(history)
 
+        # === Core Memory 注入（缓存失效策略）===
+        from src.agent.memory.core import CoreMemoryManager
+        from langchain_core.messages import SystemMessage
+
+        # 延迟初始化（在模块级变量缓存）
+        if not hasattr(session_query, '_core_memory_manager'):
+            session_query._core_memory_manager = CoreMemoryManager()
+            session_query._last_memory_str = ""
+
+        core_memory_manager = session_query._core_memory_manager
+
+        # 编译当前 memory
+        new_memory_str = core_memory_manager.compile()
+
+        # 缓存失效检测
+        if new_memory_str != session_query._last_memory_str:
+            session_query._last_memory_str = new_memory_str
+
+        compiled_memory = new_memory_str
+        # === Core Memory 注入结束 ===
+
         # Set session_id in response headers for frontend to pick up
         graph = build_graph()
         event_queue: queue.Queue = queue.Queue()
@@ -292,6 +313,11 @@ def create_session_router():
             try:
                 # Build messages list from session history
                 langchain_messages = []
+
+                # 注入 Core Memory 作为 system message
+                if compiled_memory:
+                    langchain_messages.append(SystemMessage(content=compiled_memory))
+
                 for msg in history:
                     role = msg.get("role", "")
                     content = msg.get("content", "")
@@ -461,6 +487,24 @@ def create_sse_router():
             build_graph, set_event_emitter, InterleavedState
         )
         graph = build_graph()
+
+        # === Core Memory 注入（缓存失效策略）===
+        from src.agent.memory.core import CoreMemoryManager
+        from langchain_core.messages import SystemMessage
+
+        if not hasattr(query_agent, '_core_memory_manager'):
+            query_agent._core_memory_manager = CoreMemoryManager()
+            query_agent._last_memory_str = ""
+
+        core_memory_manager = query_agent._core_memory_manager
+        new_memory_str = core_memory_manager.compile()
+
+        if new_memory_str != query_agent._last_memory_str:
+            query_agent._last_memory_str = new_memory_str
+
+        compiled_memory = new_memory_str
+        # === Core Memory 注入结束 ===
+
         event_queue: queue.Queue = queue.Queue()
         seen_keys: set[str] = set()
 
@@ -473,8 +517,14 @@ def create_sse_router():
         async def event_generator():
             set_event_emitter(emitter)
             try:
+                # 构建 initial_state，注入 Core Memory
+                messages_list = []
+                if compiled_memory:
+                    messages_list.append(SystemMessage(content=compiled_memory))
+                messages_list.append(HumanMessage(content=req.query))
+
                 initial_state = {
-                    "messages": [HumanMessage(content=req.query)],
+                    "messages": messages_list,
                     "pending_tool_calls": [],
                     "step_count": 0,
                 }
