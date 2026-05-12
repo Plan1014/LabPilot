@@ -11,6 +11,16 @@ from typing import Callable, List
 from langchain_core.tools import tool
 
 from src.agent.config import WORKDIR, SKILLS_DIR
+from src.agent.memory.core import CoreMemoryManager
+
+# 全局管理器实例（延迟初始化）
+_core_memory_manager: CoreMemoryManager = None
+
+def _get_core_manager() -> CoreMemoryManager:
+    global _core_memory_manager
+    if _core_memory_manager is None:
+        _core_memory_manager = CoreMemoryManager()
+    return _core_memory_manager
 
 
 # ==================== Security ====================
@@ -377,6 +387,99 @@ def _get_current_session_id() -> str | None:
     return None
 
 
+# ==================== Core Memory Tools ====================
+
+from langchain_core.tools import tool as langchain_tool
+
+@langchain_tool
+def save_core_block(label: str, value: str) -> str:
+    """创建或全量替换指定标签的 Core Memory Block。
+
+    如果 Block 不存在则创建；如果已存在则全量替换。
+    写入前检查标签是否在白名单中。
+
+    Args:
+        label: 标签路径，如 "task", "conclusion/parameter"
+        value: 记忆内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.save_block(label, value)
+        return f"Block '{label}' 已保存，共 {len(value)} 字符"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return f"保存失败: {e}"
+
+@langchain_tool
+def append_core_block(label: str, content: str) -> str:
+    """追加内容到指定标签的 Core Memory Block。
+
+    追加而非覆盖，适合持续更新的任务状态。
+    如果 Block 不存在则创建。
+
+    Args:
+        label: 标签路径
+        content: 要追加的内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.append_block(label, content)
+        return f"Block '{label}' 已追加内容，当前共 {len(block.value)} 字符"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return f"追加失败: {e}"
+
+@langchain_tool
+def replace_core_block(label: str, old_content: str, new_content: str) -> str:
+    """精确替换 Block 中的内容。
+
+    old_content 必须精确匹配，否则返回错误。
+    适用于修正错误、保存关键进展。
+
+    Args:
+        label: 标签路径
+        old_content: 要替换的原有内容（必须精确匹配）
+        new_content: 替换后的新内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.replace_block(label, old_content, new_content)
+        return f"Block '{label}' 已更新"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return f"替换失败: {e}"
+
+@langchain_tool
+def search_core_blocks(query: str) -> str:
+    """搜索 Core Memory Blocks。
+
+    按关键词模糊匹配 label 和 value。
+    用于 Agent 查询当前记忆状态。
+
+    Args:
+        query: 搜索关键词
+    """
+    try:
+        manager = _get_core_manager()
+        blocks = manager.get_all_blocks()
+        query_lower = query.lower()
+
+        matched = []
+        for block in blocks:
+            if query_lower in block.label.lower() or query_lower in block.value.lower():
+                matched.append(f"[{block.label}]: {block.value[:100]}")
+
+        if not matched:
+            return f"未找到匹配 '{query}' 的 Block"
+
+        return "\n".join(["【匹配的 Core Memory Blocks】"] + matched)
+    except Exception as e:
+        return f"搜索失败: {e}"
+
+
 # ==================== Tool List ====================
 
 TOOLS: List[Callable] = [
@@ -389,4 +492,9 @@ TOOLS: List[Callable] = [
     remember_fact,
     search_memory,
     search_sessions,
+    # Core Memory tools
+    save_core_block,
+    append_core_block,
+    replace_core_block,
+    search_core_blocks,
 ]
