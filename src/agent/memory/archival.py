@@ -1,27 +1,25 @@
 """Archival Memory 兼容层
 
-指向现有的 memory.py 实现，保持向后兼容。
-未来可将 src/agent/memory.py 重命名为 archival.py。
+指向现有的 memory.py 迁移到 memory/archival_store.py 实现。
 """
 
-# Re-export all Archival Memory symbols from the original memory module
-from src.agent.memory import (
+# 直接导入，因为 archival_store.py 在 memory 包内，不会触发 __init__.py 的循环导入
+from src.agent.memory.archival_store import (
     memory_system,
     memory_retriever,
     search_sessions,
+    save_fact,
     list_all_facts,
     list_all_summaries,
     delete_fact,
     delete_summary,
 )
 
-# Note: save_fact is a method on memory_system.save_fact()
-#       remember_fact and search_memory are in tools.py (Agent tools)
-
 __all__ = [
     "memory_system",
     "memory_retriever",
     "search_sessions",
+    "save_fact",
     "list_all_facts",
     "list_all_summaries",
     "delete_fact",
