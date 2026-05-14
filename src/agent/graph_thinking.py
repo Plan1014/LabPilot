@@ -15,8 +15,18 @@ from typing import Annotated, Literal, Optional, Sequence, Callable
 from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END, add_messages
 
+from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
 from src.agent.llm import llm
-from src.agent.tools import TOOLS
+from src.agent.tools import TOOLS, SKILLS
+
+
+MEMORY_REVIEW_PROMPT = """Before finishing, consider: did you reach any conclusions, parameters, or mistakes worth remembering?
+- Use save_core_block(label="task", value=...) to record current task status
+- Use save_core_block(label="conclusion/parameter", value=...) for experiment parameters
+- Use save_core_block(label="conclusion/technique", value=...) for techniques
+- Use save_core_block(label="error", value=...) to record mistakes to avoid
+- Use remember_fact(fact=...) to store important findings
+If nothing worth recording, just respond with a brief summary."""
 
 
 # ==================== Event Emitter for SSE Streaming ====================
@@ -250,6 +260,45 @@ def execute_tools(state: InterleavedState) -> dict:
     }
 
 
+def memory_review(state: InterleavedState) -> dict:
+    """Prompt the model to consider writing important facts to memory before ending."""
+    from langchain_core.messages import SystemMessage
+
+    # Build the system prompt for this review turn
+    review_system = SYSTEM_PROMPT_TEMPLATE.format(
+        workdir=WORKDIR,
+        skills=SKILLS.descriptions(),
+    )
+
+    # Inject system prompt + memory review hint as a HumanMessage
+    # This way the model sees the full context and can call save_core_block / remember_fact
+    review_msg = HumanMessage(
+        content=f"[System]\n{review_system}\n\n[Memo Review]\n{MEMORY_REVIEW_PROMPT}"
+    )
+
+    step = state.step_count + 1
+
+    # Invoke LLM without tools (just to generate response about whether to write memory)
+    review_llm = llm.bind_tools(TOOLS)
+    response = review_llm.invoke([review_msg])
+
+    content = response.content
+    thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(content)
+
+    for thinking in thinking_blocks:
+        print_thinking(thinking, step)
+
+    if not tool_use_blocks:
+        print_final_text(text_blocks, step)
+
+    # If model chose to call tools, those will be queued as pending_tool_calls
+    return {
+        "messages": [response],
+        "pending_tool_calls": tool_use_blocks,
+        "step_count": step,
+    }
+
+
 def _route(state: InterleavedState) -> Literal["execute_tools", "done"]:
     """Route based on pending tool calls."""
     if state.pending_tool_calls:
@@ -265,20 +314,26 @@ def build_graph() -> StateGraph:
 
     Graph structure:
       generate ──(pending_tool_calls?)──► execute_tools ──► generate
-                ──(else)──► done (END)
+                ──(else)──► memory_review ──(tools?)──► execute_tools ──► generate
+                                              └─(else)──► END
     """
     builder = StateGraph(InterleavedState, input=InterleavedState, output=InterleavedState)
 
     # Add nodes
     builder.add_node("generate", generate)
     builder.add_node("execute_tools", execute_tools)
+    builder.add_node("memory_review", memory_review)
 
     # Edges
     builder.add_conditional_edges("generate", _route, {
         "execute_tools": "execute_tools",
-        "done": END,
+        "done": "memory_review",
     })
     builder.add_edge("execute_tools", "generate")
+    builder.add_conditional_edges("memory_review", _route, {
+        "execute_tools": "execute_tools",
+        "done": END,
+    })
 
     # Set entry point
     builder.set_entry_point("generate")

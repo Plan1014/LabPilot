@@ -11,7 +11,7 @@ from typing import Any, Dict, Union
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
-from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED
+from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
 from src.agent.llm import client
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
@@ -240,9 +240,10 @@ def main() -> None:
         langchain_messages = []
 
         # Base system prompt (Skills descriptions — LangChain doesn't auto-inject these)
-        base_system = f"""You are a lab agent at {WORKDIR}.
-Skills: {SKILLS.descriptions()}
-"""
+        base_system = SYSTEM_PROMPT_TEMPLATE.format(
+            workdir=WORKDIR,
+            skills=SKILLS.descriptions(),
+        )
         langchain_messages.append(SystemMessage(content=base_system))
 
         # 注入 Core Memory 作为 system message（只有变化时才注入）

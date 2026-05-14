@@ -26,3 +26,6 @@ SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "30"))
 # NotificationHub port
 NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
 NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
+
+# System prompt template (Skills descriptions injected at runtime)
+SYSTEM_PROMPT_TEMPLATE = "You are a lab agent at {workdir}.\nSkills: {skills}"
