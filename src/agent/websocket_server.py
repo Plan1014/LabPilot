@@ -437,7 +437,7 @@ def create_memory_router():
     _core_mgr: CoreMemoryManager | None = None
 
     def _get_core_mgr() -> CoreMemoryManager:
-        global _core_mgr
+        nonlocal _core_mgr
         if _core_mgr is None:
             _core_mgr = CoreMemoryManager()
         return _core_mgr
@@ -520,6 +520,8 @@ def create_sse_router():
         from src.agent.graph_thinking import (
             build_graph, set_event_emitter, InterleavedState
         )
+        from src.agent.config import SYSTEM_PROMPT_TEMPLATE
+        from src.agent.tools import SKILLS
         graph = build_graph()
 
         # === Core Memory 注入（缓存失效策略）===
@@ -531,12 +533,7 @@ def create_sse_router():
             query_agent._last_memory_str = ""
 
         core_memory_manager = query_agent._core_memory_manager
-        new_memory_str = core_memory_manager.compile()
-
-        if new_memory_str != query_agent._last_memory_str:
-            query_agent._last_memory_str = new_memory_str
-
-        compiled_memory = new_memory_str
+        compiled_memory = core_memory_manager.compile()
         # === Core Memory 注入结束 ===
 
         event_queue: queue.Queue = queue.Queue()
@@ -551,8 +548,16 @@ def create_sse_router():
         async def event_generator():
             set_event_emitter(emitter)
             try:
-                # 构建 initial_state，注入 Core Memory
+                # 构建 initial_state，注入 Base System + Core Memory
                 messages_list = []
+
+                # Base system prompt (Skills descriptions)
+                base_system = SYSTEM_PROMPT_TEMPLATE.format(
+                    workdir=str(WORKDIR),
+                    skills=SKILLS.descriptions(),
+                )
+                messages_list.append(SystemMessage(content=base_system))
+
                 if compiled_memory:
                     messages_list.append(SystemMessage(content=compiled_memory))
                 messages_list.append(HumanMessage(content=req.query))
