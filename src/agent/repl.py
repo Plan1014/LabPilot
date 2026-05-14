@@ -239,6 +239,12 @@ def main() -> None:
         # 转换为 LangChain messages
         langchain_messages = []
 
+        # Base system prompt (Skills descriptions — LangChain doesn't auto-inject these)
+        base_system = f"""You are a lab agent at {WORKDIR}.
+Skills: {SKILLS.descriptions()}
+"""
+        langchain_messages.append(SystemMessage(content=base_system))
+
         # 注入 Core Memory 作为 system message（只有变化时才注入）
         compiled_memory = getattr(run_agent_query, '_compiled_memory', '')
         if compiled_memory:

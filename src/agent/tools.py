@@ -389,9 +389,8 @@ def _get_current_session_id() -> str | None:
 
 # ==================== Core Memory Tools ====================
 
-from langchain_core.tools import tool as langchain_tool
 
-@langchain_tool
+@tool
 def save_core_block(label: str, value: str) -> str:
     """创建或全量替换指定标签的 Core Memory Block。
 
@@ -411,7 +410,7 @@ def save_core_block(label: str, value: str) -> str:
     except Exception as e:
         return f"保存失败: {e}"
 
-@langchain_tool
+@tool
 def append_core_block(label: str, content: str) -> str:
     """追加内容到指定标签的 Core Memory Block。
 
@@ -431,7 +430,7 @@ def append_core_block(label: str, content: str) -> str:
     except Exception as e:
         return f"追加失败: {e}"
 
-@langchain_tool
+@tool
 def replace_core_block(label: str, old_content: str, new_content: str) -> str:
     """精确替换 Block 中的内容。
 
@@ -452,7 +451,7 @@ def replace_core_block(label: str, old_content: str, new_content: str) -> str:
     except Exception as e:
         return f"替换失败: {e}"
 
-@langchain_tool
+@tool
 def search_core_blocks(query: str) -> str:
     """搜索 Core Memory Blocks。
 
