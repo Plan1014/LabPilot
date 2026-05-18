@@ -8,6 +8,7 @@ LABEL_WHITELIST = frozenset([
     "conclusion/parameter",
     "conclusion/technique",
     "persona",
+    "error",
 ])
 
 # Block 字符上限
@@ -15,3 +16,6 @@ CORE_MEMORY_BLOCK_CHAR_LIMIT = 4000
 
 # 数据库路径（运行时由 CoreMemoryManager 设置）
 BLOCKS_DB_PATH = None
+
+# Silent Summary 触发间隔（每N轮触发一次）
+SILENT_SUMMARY_INTERVAL = 5

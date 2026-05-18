@@ -1,6 +1,8 @@
 """Core Memory + Archival Memory 模块"""
 
 from src.agent.memory.core import CoreMemoryManager, Block, BlockHistory
+from src.agent.memory.memory_agent import memory_agent_summarize, process_pending_cache
+from src.agent.memory.pending import PendingCache
 
 # 全局单例
 core_memory_manager: CoreMemoryManager = None
@@ -35,4 +37,7 @@ __all__ = [
     "list_all_summaries",
     "delete_fact",
     "delete_summary",
+    "memory_agent_summarize",
+    "process_pending_cache",
+    "PendingCache",
 ]

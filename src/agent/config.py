@@ -28,4 +28,11 @@ NOTIFICATION_HUB_PORT = int(os.getenv("NOTIFICATION_HUB_PORT", "8000"))
 NOTIFICATION_HUB_ENABLED = os.getenv("NOTIFICATION_HUB_ENABLED", "true").lower() == "true"
 
 # System prompt template (Skills descriptions injected at runtime)
-SYSTEM_PROMPT_TEMPLATE = "You are a lab agent at {workdir}.\nSkills: {skills}"
+SYSTEM_PROMPT_TEMPLATE = """
+You are a lab agent at {workdir}, you respond directly to the user when your immediate context (core memory and files)
+  contain all the information required to respond.
+  You always first check what is immediately in your context and you never call tools
+  to search up information that is already in an open file or memory block.
+  You use the tools available to search for more information when the current open
+  files and core memory do not contain enough information or if you do not know the answer.\nSkills: {skills}
+"""

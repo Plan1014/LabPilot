@@ -15,18 +15,10 @@ from typing import Annotated, Literal, Optional, Sequence, Callable
 from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import StateGraph, END, add_messages
 
-from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
 from src.agent.llm import llm
-from src.agent.tools import TOOLS, SKILLS
-
-
-MEMORY_REVIEW_PROMPT = """Before finishing, consider: did you reach any conclusions, parameters, or mistakes worth remembering?
-- Use save_core_block(label="task", value=...) to record current task status
-- Use save_core_block(label="conclusion/parameter", value=...) for experiment parameters
-- Use save_core_block(label="conclusion/technique", value=...) for techniques
-- Use save_core_block(label="error", value=...) to record mistakes to avoid
-- Use remember_fact(fact=...) to store important findings
-If nothing worth recording, just respond with a brief summary."""
+from src.agent.tools import TOOLS, is_failure_result
+from src.agent.memory import memory_agent_summarize, process_pending_cache, PendingCache
+from src.agent.memory.constants import SILENT_SUMMARY_INTERVAL
 
 
 # ==================== Event Emitter for SSE Streaming ====================
@@ -102,6 +94,22 @@ def parse_content_blocks(content: any) -> tuple:
     return thinking_blocks, tool_use_blocks, text_blocks
 
 
+# ==================== Silent Summary Trigger ====================
+
+def should_trigger_silent_summary(state: InterleavedState) -> bool:
+    """判断是否应该触发silent summary
+
+    条件：
+    1. step_count > 0 且能被SILENT_SUMMARY_INTERVAL整除
+    2. 没有待执行的tool calls（对话自然结束）
+    """
+    return (
+        state.step_count > 0
+        and state.step_count % SILENT_SUMMARY_INTERVAL == 0
+        and len(state.pending_tool_calls) == 0
+    )
+
+
 # ==================== Output Helpers ====================
 
 def print_thinking(thinking: str, step: int) -> None:
@@ -155,6 +163,43 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     print(flush=True)
 
 
+# ==================== Helper Functions ====================
+
+_pending_cache: Optional[PendingCache] = None
+_pending_processed: bool = False  # 确保每个对话只处理一次pending
+
+
+def _get_pending_cache() -> PendingCache:
+    """Lazy init of pending cache"""
+    global _pending_cache
+    if _pending_cache is None:
+        _pending_cache = PendingCache()
+    return _pending_cache
+
+
+def _reset_pending_flag():
+    """重置pending处理标志（新对话开始时调用）"""
+    global _pending_processed
+    _pending_processed = False
+
+
+def _save_to_pending(messages: list) -> None:
+    """Save messages to pending cache for later processing"""
+    # 转换为dict格式以便JSON序列化
+    dict_messages = []
+    for msg in messages:
+        if hasattr(msg, "content"):
+            dict_messages.append({
+                "role": getattr(msg, "role", "unknown"),
+                "content": getattr(msg, "content", "")
+            })
+        elif isinstance(msg, dict):
+            dict_messages.append(msg)
+    if dict_messages:
+        cache = _get_pending_cache()
+        cache.save_pending(dict_messages)
+
+
 # ==================== Graph Nodes ====================
 
 def generate(state: InterleavedState) -> dict:
@@ -162,8 +207,27 @@ def generate(state: InterleavedState) -> dict:
 
     Uses llm.bind_tools(TOOLS) for proper tool format handling.
     Prints thinking blocks immediately upon receipt.
+    Persists messages to pending cache and processes pending on new session.
     """
     step = state.step_count + 1
+
+    # 每次保存消息到pending cache（跨会话持久化）
+    if state.messages:
+        try:
+            _save_to_pending(state.messages)
+        except Exception as e:
+            print(f"\033[94m[Memory Agent]\033[0m Failed to save pending: {e}")
+
+    # 检查并处理之前的pending内容（新对话开始时，只处理一次）
+    global _pending_processed
+    if not _pending_processed:
+        _pending_processed = True
+        try:
+            result = process_pending_cache()
+            if result:
+                print(f"\033[94m[Memory Agent]\033[0m Processed pending: {result[:100]}")
+        except Exception:
+            pass
 
     # Bind tools to the LLM - LangChain handles format conversion
     llm_with_tools = llm.bind_tools(TOOLS)
@@ -188,6 +252,12 @@ def generate(state: InterleavedState) -> dict:
     # 如果没有工具调用，打印最终文本
     if not tool_use_blocks:
         print_final_text(text_blocks, step)
+
+    # 如果满足触发条件，进行silent summary（后台执行，不阻塞）
+    if should_trigger_silent_summary(state):
+        print(f"\033[94m[Memory Agent]\033[0m Silent summary triggered at step {state.step_count}")
+        thread = threading.Thread(target=memory_agent_summarize, args=(state.messages,))
+        thread.start()  # 非阻塞，立即返回
 
     return {
         "messages": [response],  # LangChain AIMessage already properly formatted
@@ -245,10 +315,15 @@ def execute_tools(state: InterleavedState) -> dict:
             except Exception as e:
                 result = f"Error: {e}"
 
-        print_tool_result(str(result), state.step_count)
+        # 轻量触发：当工具返回失败时，提示模型记录
+        result_str = str(result)
+        if is_failure_result(result_str):
+            result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+
+        print_tool_result(result_str, state.step_count)
 
         tool_msg = ToolMessage(
-            content=str(result),
+            content=result_str,
             name=tool_name,
             tool_call_id=tool_id,
         )
@@ -257,45 +332,6 @@ def execute_tools(state: InterleavedState) -> dict:
     return {
         "messages": tool_messages,
         "pending_tool_calls": [],  # 清空，已执行完毕
-    }
-
-
-def memory_review(state: InterleavedState) -> dict:
-    """Prompt the model to consider writing important facts to memory before ending."""
-    from langchain_core.messages import SystemMessage
-
-    # Build the system prompt for this review turn
-    review_system = SYSTEM_PROMPT_TEMPLATE.format(
-        workdir=WORKDIR,
-        skills=SKILLS.descriptions(),
-    )
-
-    # Inject system prompt + memory review hint as a HumanMessage
-    # This way the model sees the full context and can call save_core_block / remember_fact
-    review_msg = HumanMessage(
-        content=f"[System]\n{review_system}\n\n[Memo Review]\n{MEMORY_REVIEW_PROMPT}"
-    )
-
-    step = state.step_count + 1
-
-    # Invoke LLM without tools (just to generate response about whether to write memory)
-    review_llm = llm.bind_tools(TOOLS)
-    response = review_llm.invoke([review_msg])
-
-    content = response.content
-    thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(content)
-
-    for thinking in thinking_blocks:
-        print_thinking(thinking, step)
-
-    if not tool_use_blocks:
-        print_final_text(text_blocks, step)
-
-    # If model chose to call tools, those will be queued as pending_tool_calls
-    return {
-        "messages": [response],
-        "pending_tool_calls": tool_use_blocks,
-        "step_count": step,
     }
 
 
@@ -314,26 +350,20 @@ def build_graph() -> StateGraph:
 
     Graph structure:
       generate ──(pending_tool_calls?)──► execute_tools ──► generate
-                ──(else)──► memory_review ──(tools?)──► execute_tools ──► generate
-                                              └─(else)──► END
+                ──(else)──► END
     """
     builder = StateGraph(InterleavedState, input=InterleavedState, output=InterleavedState)
 
     # Add nodes
     builder.add_node("generate", generate)
     builder.add_node("execute_tools", execute_tools)
-    builder.add_node("memory_review", memory_review)
 
     # Edges
     builder.add_conditional_edges("generate", _route, {
         "execute_tools": "execute_tools",
-        "done": "memory_review",
-    })
-    builder.add_edge("execute_tools", "generate")
-    builder.add_conditional_edges("memory_review", _route, {
-        "execute_tools": "execute_tools",
         "done": END,
     })
+    builder.add_edge("execute_tools", "generate")
 
     # Set entry point
     builder.set_entry_point("generate")

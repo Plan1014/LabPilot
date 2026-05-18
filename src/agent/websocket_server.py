@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import queue
 import sys
 import threading
@@ -27,7 +29,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+
+logger = logging.getLogger("websocket_server")
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+
+for noisy in ["httpx", "httpcore", "charset_normalizer"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 from src.agent.memory import memory_system
 
@@ -248,6 +258,7 @@ def create_session_router():
     @router.post("/query")
     async def session_query(req: SessionQueryRequest):
         """Stream SSE events with session history management."""
+        logger.info("[/session/query] called — session_id=%s query_len=%d", req.session_id, len(req.query))
         from src.agent.graph_thinking import build_graph, set_event_emitter
         from src.agent.session_manager import (
             message_to_dict, _compact_tool_results,
@@ -317,6 +328,15 @@ def create_session_router():
                 # 注入 Core Memory 作为 system message
                 if compiled_memory:
                     langchain_messages.append(SystemMessage(content=compiled_memory))
+
+                # 注入 Base System Prompt (Skills)
+                from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
+                from src.agent.tools import SKILLS
+                base_system = SYSTEM_PROMPT_TEMPLATE.format(
+                    workdir=str(WORKDIR),
+                    skills=SKILLS.descriptions(),
+                )
+                langchain_messages.insert(0, SystemMessage(content=base_system))
 
                 for msg in history:
                     role = msg.get("role", "")
@@ -517,10 +537,11 @@ def create_sse_router():
     @router.post("/query")
     async def query_agent(req: QueryRequest):
         """Stream SSE events from agent graph execution."""
+        logger.info("[/query] called — query_len=%d", len(req.query))
         from src.agent.graph_thinking import (
             build_graph, set_event_emitter, InterleavedState
         )
-        from src.agent.config import SYSTEM_PROMPT_TEMPLATE
+        from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
         from src.agent.tools import SKILLS
         graph = build_graph()
 

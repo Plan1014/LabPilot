@@ -90,5 +90,6 @@ tmp/
 credentials.json
 secrets/
 data/
+docs/
 
 tests/
