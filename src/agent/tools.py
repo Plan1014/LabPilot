@@ -11,6 +11,43 @@ from typing import Callable, List
 from langchain_core.tools import tool
 
 from src.agent.config import WORKDIR, SKILLS_DIR
+from src.agent.memory.core import CoreMemoryManager
+
+# ==================== Error Type Conventions ====================
+
+ERROR_PREFIXES = [
+    "Error:",
+    "错误:",
+    "写入失败",
+    "检索失败",
+    "压缩失败",
+    "保存失败",
+    "追加失败",
+    "替换失败",
+    "搜索失败",
+]
+
+
+def is_failure_result(result: str) -> bool:
+    """检测工具返回是否表示失败."""
+    if not result or not result.strip():
+        return True
+    return any(prefix in result for prefix in ERROR_PREFIXES)
+
+
+def err(prefix: str, detail: str = "") -> str:
+    """生成标准格式的错误返回."""
+    return f"{prefix}: {detail}" if detail else prefix
+
+
+# 全局管理器实例（延迟初始化）
+_core_memory_manager: CoreMemoryManager = None
+
+def _get_core_manager() -> CoreMemoryManager:
+    global _core_memory_manager
+    if _core_memory_manager is None:
+        _core_memory_manager = CoreMemoryManager()
+    return _core_memory_manager
 
 
 # ==================== Security ====================
@@ -40,7 +77,7 @@ def bash(command: str, background: bool = False) -> str:
     """
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
+        return err("Error", "Dangerous command blocked")
     try:
         if background:
             # Windows: hide console window for background process
@@ -70,7 +107,7 @@ def bash(command: str, background: bool = False) -> str:
             out = r.stdout.strip()
             return out[:50000] if out else "(no output)"
     except Exception as e:
-        return f"Error: {e}"
+        return err("Error", str(e))
 
 
 @tool
@@ -94,7 +131,7 @@ def read_file(path: str, limit: int = None) -> str:
         except UnicodeDecodeError:
             continue
         except Exception as e:
-            return f"Error: {e}"
+            return err("Error", str(e))
     return f"Error: unable to decode {path}"
 
 
@@ -115,7 +152,7 @@ def write_file(path: str, content: str) -> str:
         fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return err("Error", str(e))
 
 
 @tool
@@ -139,7 +176,7 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         except UnicodeDecodeError:
             continue
         except Exception as e:
-            return f"Error: {e}"
+            return err("Error", str(e))
     if content is None:
         return f"Error: unable to decode {path}"
     if old_text not in content:
@@ -148,7 +185,7 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
         fp.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
-        return f"Error: {e}"
+        return err("Error", str(e))
 
 
 # ==================== Skill Loader ====================
@@ -161,31 +198,51 @@ class SkillLoader:
     """
 
     def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
         self.skills = {}
-        if skills_dir.exists():
-            for f in sorted(skills_dir.rglob("SKILL.md")):
-                text = None
-                for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
-                    try:
-                        text = f.read_text(encoding=enc, errors="replace")
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                if text is None:
+        self._scan()
+
+    def _scan(self):
+        """Scan skills directory and load all SKILL.md files."""
+        self.skills.clear()
+        if not self.skills_dir.exists():
+            return
+        for f in sorted(self.skills_dir.rglob("SKILL.md")):
+            text = None
+            for enc in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
+                try:
+                    text = f.read_text(encoding=enc, errors="replace")
+                    break
+                except UnicodeDecodeError:
                     continue
+            if text is None:
+                continue
 
-                # Parse frontmatter
-                match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-                meta, body = {}, text
-                if match:
-                    for line in match.group(1).strip().splitlines():
-                        if ":" in line:
-                            k, v = line.split(":", 1)
-                            meta[k.strip()] = v.strip()
-                    body = match.group(2).strip()
+            match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+            meta, body = {}, text
+            if match:
+                for line in match.group(1).strip().splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip()
+                body = match.group(2).strip()
 
-                name = meta.get("name", f.parent.name)
-                self.skills[name] = {"meta": meta, "body": body}
+            name = meta.get("name", f.parent.name)
+            self.skills[name] = {"meta": meta, "body": body}
+
+    def load(self, name: str) -> str:
+        """Load a skill by name, returning content wrapped in <skill> tags.
+
+        Uses lazy loading: if skill not found in cache, re-scans the directory
+        to pick up newly added skills since startup.
+        """
+        if name not in self.skills:
+            self._scan()
+        s = self.skills.get(name)
+        if not s:
+            available = ", ".join(self.skills.keys())
+            return f"Error: Unknown skill '{name}'. Available: {available}"
+        return f'<skill name="{name}">\n{s["body"]}\n</skill>'
 
     def descriptions(self) -> str:
         """Return a formatted string of all skill names and descriptions."""
@@ -195,14 +252,6 @@ class SkillLoader:
             f"  - {n}: {s['meta'].get('description', '-')}"
             for n, s in self.skills.items()
         )
-
-    def load(self, name: str) -> str:
-        """Load a skill by name, returning content wrapped in <skill> tags."""
-        s = self.skills.get(name)
-        if not s:
-            available = ", ".join(self.skills.keys())
-            return f"Error: Unknown skill '{name}'. Available: {available}"
-        return f'<skill name="{name}">\n{s["body"]}\n</skill>'
 
 
 # Global skill loader instance
@@ -317,7 +366,7 @@ def remember_fact(fact: str) -> str:
         memory_system.save_fact(fact, source="tool")
         return "已成功将该事实写入长期记忆库。"
     except Exception as e:
-        return f"写入失败: {e}"
+        return err("写入失败", str(e))
 
 @tool
 def search_memory(query: str) -> str:
@@ -333,7 +382,7 @@ def search_memory(query: str) -> str:
         result = memory_retriever.retrieve_context(query)
         return result if result and "无长期记忆" not in result else "未检索到相关历史记录。"
     except Exception as e:
-        return f"检索失败: {e}"
+        return err("检索失败", str(e))
 
 @tool
 def search_sessions(query: str, days: int = 7) -> str:
@@ -348,7 +397,7 @@ def search_sessions(query: str, days: int = 7) -> str:
     try:
         return search_sessions(query, days)
     except Exception as e:
-        return f"检索失败: {e}"
+        return err("检索失败", str(e))
 
 @tool
 def compact(focus: str = "") -> str:
@@ -367,7 +416,7 @@ def compact(focus: str = "") -> str:
         summary = compact_session("")  # placeholder, real impl needs session_id
         return f"会话已压缩: {summary}"
     except Exception as e:
-        return f"压缩失败: {e}"
+        return err("压缩失败", str(e))
 
 
 def _get_current_session_id() -> str | None:
@@ -375,6 +424,99 @@ def _get_current_session_id() -> str | None:
     # This is a workaround — the tool doesn't have direct access to session_id
     # For now, return empty to let compact_session handle it
     return None
+
+
+# ==================== Core Memory Tools ====================
+
+
+@tool
+def save_core_block(label: str, value: str) -> str:
+    """创建或全量替换指定标签的 Core Memory Block。
+
+    如果 Block 不存在则创建；如果已存在则全量替换。
+    写入前检查标签是否在白名单中。
+
+    Args:
+        label: 标签路径，如 "task", "conclusion/parameter"
+        value: 记忆内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.save_block(label, value)
+        return f"Block '{label}' 已保存，共 {len(value)} 字符"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return err("保存失败", str(e))
+
+@tool
+def append_core_block(label: str, content: str) -> str:
+    """追加内容到指定标签的 Core Memory Block。
+
+    追加而非覆盖，适合持续更新的任务状态。
+    如果 Block 不存在则创建。
+
+    Args:
+        label: 标签路径
+        content: 要追加的内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.append_block(label, content)
+        return f"Block '{label}' 已追加内容，当前共 {len(block.value)} 字符"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return err("追加失败", str(e))
+
+@tool
+def replace_core_block(label: str, old_content: str, new_content: str) -> str:
+    """精确替换 Block 中的内容。
+
+    old_content 必须精确匹配，否则返回错误。
+    适用于修正错误、保存关键进展。
+
+    Args:
+        label: 标签路径
+        old_content: 要替换的原有内容（必须精确匹配）
+        new_content: 替换后的新内容
+    """
+    try:
+        manager = _get_core_manager()
+        block = manager.replace_block(label, old_content, new_content)
+        return f"Block '{label}' 已更新"
+    except ValueError as e:
+        return f"错误: {e}"
+    except Exception as e:
+        return err("替换失败", str(e))
+
+@tool
+def search_core_blocks(query: str) -> str:
+    """搜索 Core Memory Blocks。
+
+    按关键词模糊匹配 label 和 value。
+    用于 Agent 查询当前记忆状态。
+
+    Args:
+        query: 搜索关键词
+    """
+    try:
+        manager = _get_core_manager()
+        blocks = manager.get_all_blocks()
+        query_lower = query.lower()
+
+        matched = []
+        for block in blocks:
+            if query_lower in block.label.lower() or query_lower in block.value.lower():
+                # 搜索结果应显示完整内容，不截断
+                matched.append(f"[{block.label}]: {block.value}")
+
+        if not matched:
+            return f"未找到匹配 '{query}' 的 Block"
+
+        return "\n".join(["【匹配的 Core Memory Blocks】"] + matched)
+    except Exception as e:
+        return err("搜索失败", str(e))
 
 
 # ==================== Tool List ====================
@@ -389,4 +531,9 @@ TOOLS: List[Callable] = [
     remember_fact,
     search_memory,
     search_sessions,
+    # Core Memory tools
+    save_core_block,
+    append_core_block,
+    replace_core_block,
+    search_core_blocks,
 ]

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 import queue
 import sys
 import threading
@@ -27,7 +29,15 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import os
+
+logger = logging.getLogger("websocket_server")
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+
+for noisy in ["httpx", "httpcore", "charset_normalizer"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 from src.agent.memory import memory_system
 
@@ -248,6 +258,7 @@ def create_session_router():
     @router.post("/query")
     async def session_query(req: SessionQueryRequest):
         """Stream SSE events with session history management."""
+        logger.info("[/session/query] called — session_id=%s query_len=%d", req.session_id, len(req.query))
         from src.agent.graph_thinking import build_graph, set_event_emitter
         from src.agent.session_manager import (
             message_to_dict, _compact_tool_results,
@@ -264,6 +275,27 @@ def create_session_router():
 
         # Layer 1: micro_compact — replace old tool_results with placeholders
         history = _compact_tool_results(history)
+
+        # === Core Memory 注入（缓存失效策略）===
+        from src.agent.memory.core import CoreMemoryManager
+        from langchain_core.messages import SystemMessage
+
+        # 延迟初始化（在模块级变量缓存）
+        if not hasattr(session_query, '_core_memory_manager'):
+            session_query._core_memory_manager = CoreMemoryManager()
+            session_query._last_memory_str = ""
+
+        core_memory_manager = session_query._core_memory_manager
+
+        # 编译当前 memory
+        new_memory_str = core_memory_manager.compile()
+
+        # 缓存失效检测
+        if new_memory_str != session_query._last_memory_str:
+            session_query._last_memory_str = new_memory_str
+
+        compiled_memory = new_memory_str
+        # === Core Memory 注入结束 ===
 
         # Set session_id in response headers for frontend to pick up
         graph = build_graph()
@@ -292,6 +324,20 @@ def create_session_router():
             try:
                 # Build messages list from session history
                 langchain_messages = []
+
+                # 注入 Core Memory 作为 system message
+                if compiled_memory:
+                    langchain_messages.append(SystemMessage(content=compiled_memory))
+
+                # 注入 Base System Prompt (Skills)
+                from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
+                from src.agent.tools import SKILLS
+                base_system = SYSTEM_PROMPT_TEMPLATE.format(
+                    workdir=str(WORKDIR),
+                    skills=SKILLS.descriptions(),
+                )
+                langchain_messages.insert(0, SystemMessage(content=base_system))
+
                 for msg in history:
                     role = msg.get("role", "")
                     content = msg.get("content", "")
@@ -406,6 +452,15 @@ def create_memory_router():
         search_sessions as memory_search_sessions,
     )
     from src.agent.session_manager import list_sessions
+    from src.agent.memory.core import CoreMemoryManager, Block
+
+    _core_mgr: CoreMemoryManager | None = None
+
+    def _get_core_mgr() -> CoreMemoryManager:
+        nonlocal _core_mgr
+        if _core_mgr is None:
+            _core_mgr = CoreMemoryManager()
+        return _core_mgr
 
     router = APIRouter()
 
@@ -444,6 +499,31 @@ def create_memory_router():
         result = memory_search_sessions(query, days)
         return {"result": result}
 
+    @router.get("/blocks")
+    async def get_blocks():
+        """List all Core Memory blocks (hot memory)."""
+        blocks = _get_core_mgr().get_all_blocks()
+        return {
+            "items": [
+                {
+                    "label": b.label,
+                    "value": b.value,
+                    "description": b.description,
+                    "limit": b.limit,
+                    "read_only": b.read_only,
+                    "created_at": b.created_at,
+                    "updated_at": b.updated_at,
+                }
+                for b in blocks
+            ]
+        }
+
+    @router.delete("/blocks/{label}")
+    async def delete_block(label: str):
+        """Delete a Core Memory block by label."""
+        deleted = _get_core_mgr().delete_block(label)
+        return {"status": "deleted" if deleted else "not_found"}
+
     return router
 
 
@@ -457,10 +537,26 @@ def create_sse_router():
     @router.post("/query")
     async def query_agent(req: QueryRequest):
         """Stream SSE events from agent graph execution."""
+        logger.info("[/query] called — query_len=%d", len(req.query))
         from src.agent.graph_thinking import (
             build_graph, set_event_emitter, InterleavedState
         )
+        from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
+        from src.agent.tools import SKILLS
         graph = build_graph()
+
+        # === Core Memory 注入（缓存失效策略）===
+        from src.agent.memory.core import CoreMemoryManager
+        from langchain_core.messages import SystemMessage
+
+        if not hasattr(query_agent, '_core_memory_manager'):
+            query_agent._core_memory_manager = CoreMemoryManager()
+            query_agent._last_memory_str = ""
+
+        core_memory_manager = query_agent._core_memory_manager
+        compiled_memory = core_memory_manager.compile()
+        # === Core Memory 注入结束 ===
+
         event_queue: queue.Queue = queue.Queue()
         seen_keys: set[str] = set()
 
@@ -473,8 +569,22 @@ def create_sse_router():
         async def event_generator():
             set_event_emitter(emitter)
             try:
+                # 构建 initial_state，注入 Base System + Core Memory
+                messages_list = []
+
+                # Base system prompt (Skills descriptions)
+                base_system = SYSTEM_PROMPT_TEMPLATE.format(
+                    workdir=str(WORKDIR),
+                    skills=SKILLS.descriptions(),
+                )
+                messages_list.append(SystemMessage(content=base_system))
+
+                if compiled_memory:
+                    messages_list.append(SystemMessage(content=compiled_memory))
+                messages_list.append(HumanMessage(content=req.query))
+
                 initial_state = {
-                    "messages": [HumanMessage(content=req.query)],
+                    "messages": messages_list,
                     "pending_tool_calls": [],
                     "step_count": 0,
                 }

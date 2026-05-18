@@ -1,3 +1,15 @@
+---
+name: pna
+description: >
+  Controls the Rohde & Schwarz Phase Noise Analyzer via REST API. Use this
+  skill when the user wants to measure phase noise, start PNA sweeps, check
+  instrument health, or read frequency-domain data. Triggers include: "PNA",
+  "phase noise", "sweep", "measure noise", "start measurement", "/measure/",
+  "/health/". Also use when user mentions "Rohde & Schwarz", "spectrum",
+  "PNR", or asks about "carrier suppression", "SSB phase noise".
+  Do NOT use for general network requests unrelated to PNA instruments.
+---
+
 # PNA Service Skill
 
 Use this skill when working with PNA (Phase Noise Analyzer) measurements.

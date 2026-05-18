@@ -16,7 +16,9 @@ from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMes
 from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
-from src.agent.tools import TOOLS
+from src.agent.tools import TOOLS, is_failure_result
+from src.agent.memory import memory_agent_summarize, process_pending_cache, PendingCache
+from src.agent.memory.constants import SILENT_SUMMARY_INTERVAL
 
 
 # ==================== Event Emitter for SSE Streaming ====================
@@ -92,6 +94,22 @@ def parse_content_blocks(content: any) -> tuple:
     return thinking_blocks, tool_use_blocks, text_blocks
 
 
+# ==================== Silent Summary Trigger ====================
+
+def should_trigger_silent_summary(state: InterleavedState) -> bool:
+    """判断是否应该触发silent summary
+
+    条件：
+    1. step_count > 0 且能被SILENT_SUMMARY_INTERVAL整除
+    2. 没有待执行的tool calls（对话自然结束）
+    """
+    return (
+        state.step_count > 0
+        and state.step_count % SILENT_SUMMARY_INTERVAL == 0
+        and len(state.pending_tool_calls) == 0
+    )
+
+
 # ==================== Output Helpers ====================
 
 def print_thinking(thinking: str, step: int) -> None:
@@ -145,6 +163,43 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     print(flush=True)
 
 
+# ==================== Helper Functions ====================
+
+_pending_cache: Optional[PendingCache] = None
+_pending_processed: bool = False  # 确保每个对话只处理一次pending
+
+
+def _get_pending_cache() -> PendingCache:
+    """Lazy init of pending cache"""
+    global _pending_cache
+    if _pending_cache is None:
+        _pending_cache = PendingCache()
+    return _pending_cache
+
+
+def _reset_pending_flag():
+    """重置pending处理标志（新对话开始时调用）"""
+    global _pending_processed
+    _pending_processed = False
+
+
+def _save_to_pending(messages: list) -> None:
+    """Save messages to pending cache for later processing"""
+    # 转换为dict格式以便JSON序列化
+    dict_messages = []
+    for msg in messages:
+        if hasattr(msg, "content"):
+            dict_messages.append({
+                "role": getattr(msg, "role", "unknown"),
+                "content": getattr(msg, "content", "")
+            })
+        elif isinstance(msg, dict):
+            dict_messages.append(msg)
+    if dict_messages:
+        cache = _get_pending_cache()
+        cache.save_pending(dict_messages)
+
+
 # ==================== Graph Nodes ====================
 
 def generate(state: InterleavedState) -> dict:
@@ -152,8 +207,27 @@ def generate(state: InterleavedState) -> dict:
 
     Uses llm.bind_tools(TOOLS) for proper tool format handling.
     Prints thinking blocks immediately upon receipt.
+    Persists messages to pending cache and processes pending on new session.
     """
     step = state.step_count + 1
+
+    # 每次保存消息到pending cache（跨会话持久化）
+    if state.messages:
+        try:
+            _save_to_pending(state.messages)
+        except Exception as e:
+            print(f"\033[94m[Memory Agent]\033[0m Failed to save pending: {e}")
+
+    # 检查并处理之前的pending内容（新对话开始时，只处理一次）
+    global _pending_processed
+    if not _pending_processed:
+        _pending_processed = True
+        try:
+            result = process_pending_cache()
+            if result:
+                print(f"\033[94m[Memory Agent]\033[0m Processed pending: {result[:100]}")
+        except Exception:
+            pass
 
     # Bind tools to the LLM - LangChain handles format conversion
     llm_with_tools = llm.bind_tools(TOOLS)
@@ -178,6 +252,12 @@ def generate(state: InterleavedState) -> dict:
     # 如果没有工具调用，打印最终文本
     if not tool_use_blocks:
         print_final_text(text_blocks, step)
+
+    # 如果满足触发条件，进行silent summary（后台执行，不阻塞）
+    if should_trigger_silent_summary(state):
+        print(f"\033[94m[Memory Agent]\033[0m Silent summary triggered at step {state.step_count}")
+        thread = threading.Thread(target=memory_agent_summarize, args=(state.messages,))
+        thread.start()  # 非阻塞，立即返回
 
     return {
         "messages": [response],  # LangChain AIMessage already properly formatted
@@ -235,10 +315,15 @@ def execute_tools(state: InterleavedState) -> dict:
             except Exception as e:
                 result = f"Error: {e}"
 
-        print_tool_result(str(result), state.step_count)
+        # 轻量触发：当工具返回失败时，提示模型记录
+        result_str = str(result)
+        if is_failure_result(result_str):
+            result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+
+        print_tool_result(result_str, state.step_count)
 
         tool_msg = ToolMessage(
-            content=str(result),
+            content=result_str,
             name=tool_name,
             tool_call_id=tool_id,
         )
@@ -265,7 +350,7 @@ def build_graph() -> StateGraph:
 
     Graph structure:
       generate ──(pending_tool_calls?)──► execute_tools ──► generate
-                ──(else)──► done (END)
+                ──(else)──► END
     """
     builder = StateGraph(InterleavedState, input=InterleavedState, output=InterleavedState)
 

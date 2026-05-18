@@ -11,7 +11,7 @@ from typing import Any, Dict, Union
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
-from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED
+from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
 from src.agent.llm import client
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
@@ -193,6 +193,28 @@ def main() -> None:
         """Run a single agent query."""
         nonlocal history
 
+        # === Core Memory 注入（缓存失效策略）===
+        from src.agent.memory.core import CoreMemoryManager
+        from langchain_core.messages import SystemMessage
+
+        # 延迟初始化 CoreMemoryManager（在函数属性上缓存）
+        if not hasattr(run_agent_query, '_core_memory_manager'):
+            run_agent_query._core_memory_manager = CoreMemoryManager()
+            run_agent_query._last_memory_str = ""
+
+        core_memory_manager = run_agent_query._core_memory_manager
+
+        # 编译当前 memory
+        new_memory_str = core_memory_manager.compile()
+
+        # 缓存失效检测：只有变化时才更新
+        if new_memory_str != run_agent_query._last_memory_str:
+            run_agent_query._last_memory_str = new_memory_str
+
+        # 保存 compiled memory 供后续使用
+        run_agent_query._compiled_memory = new_memory_str
+        # === Core Memory 注入结束 ===
+
         # 添加用户消息到历史
         history.append({"role": "user", "content": query})
 
@@ -216,6 +238,19 @@ def main() -> None:
 
         # 转换为 LangChain messages
         langchain_messages = []
+
+        # Base system prompt (Skills descriptions — LangChain doesn't auto-inject these)
+        base_system = SYSTEM_PROMPT_TEMPLATE.format(
+            workdir=WORKDIR,
+            skills=SKILLS.descriptions(),
+        )
+        langchain_messages.append(SystemMessage(content=base_system))
+
+        # 注入 Core Memory 作为 system message（只有变化时才注入）
+        compiled_memory = getattr(run_agent_query, '_compiled_memory', '')
+        if compiled_memory:
+            langchain_messages.append(SystemMessage(content=compiled_memory))
+
         for msg in history:
             if isinstance(msg, HumanMessage):
                 langchain_messages.append(msg)
