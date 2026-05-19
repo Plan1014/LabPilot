@@ -53,7 +53,8 @@ class PendingCache:
             result = []
             for row in cursor.fetchall():
                 result.extend(json.loads(row["messages_json"]))
-            return result
+            # 保护：最多保留最近 100 条，避免跨 session 累积爆炸
+            return result[-100:] if len(result) > 100 else result
 
     def clear_pending(self):
         """Clear all pending messages"""
