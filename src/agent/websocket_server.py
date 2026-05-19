@@ -297,6 +297,11 @@ def create_session_router():
         compiled_memory = new_memory_str
         # === Core Memory 注入结束 ===
 
+        # === RAG 检索 fact 库 ===
+        from src.agent.memory import memory_retriever
+        rag_context = memory_retriever.retrieve_context(req.query)
+        # === RAG 检索结束 ===
+
         # Set session_id in response headers for frontend to pick up
         graph = build_graph()
         event_queue: queue.Queue = queue.Queue()
@@ -328,6 +333,9 @@ def create_session_router():
                 # 注入 Core Memory 作为 system message
                 if compiled_memory:
                     langchain_messages.append(SystemMessage(content=compiled_memory))
+
+                if rag_context and rag_context != "当前无长期记忆记录。":
+                    langchain_messages.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
 
                 # 注入 Base System Prompt (Skills)
                 from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
@@ -557,6 +565,11 @@ def create_sse_router():
         compiled_memory = core_memory_manager.compile()
         # === Core Memory 注入结束 ===
 
+        # === RAG 检索 fact 库 ===
+        from src.agent.memory import memory_retriever
+        rag_context = memory_retriever.retrieve_context(req.query)
+        # === RAG 检索结束 ===
+
         event_queue: queue.Queue = queue.Queue()
         seen_keys: set[str] = set()
 
@@ -581,6 +594,9 @@ def create_sse_router():
 
                 if compiled_memory:
                     messages_list.append(SystemMessage(content=compiled_memory))
+
+                if rag_context and rag_context != "当前无长期记忆记录。":
+                    messages_list.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
                 messages_list.append(HumanMessage(content=req.query))
 
                 initial_state = {

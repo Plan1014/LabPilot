@@ -212,9 +212,12 @@ def generate(state: InterleavedState) -> dict:
     step = state.step_count + 1
 
     # 每次保存消息到pending cache（跨会话持久化）
+    # 注意：state.messages 是累积列表，每个 step 都在增长
+    # 为避免重复保存，只取该 step 新增的最后一条消息
     if state.messages:
         try:
-            _save_to_pending(state.messages)
+            last_msg = state.messages[-1]
+            _save_to_pending([last_msg])
         except Exception as e:
             print(f"\033[94m[Memory Agent]\033[0m Failed to save pending: {e}")
 
