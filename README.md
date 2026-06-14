@@ -151,6 +151,97 @@ Agent 可通过 `compact` 工具主动压缩当前会话，触发时机由 Agent
 
 ## 核心架构
 
+### 系统工作流图
+
+```mermaid
+flow TB
+    subgraph 前端
+        User["用户"]
+    end
+
+    subgraph FastAPI网关_8000
+        SSE["/session/query SSE"]
+        Notify["/notify 通知接收"]
+        WS["/ws WebSocket"]
+        MemAPI["/memory/* 记忆接口"]
+    end
+
+    subgraph NotificationHub
+        Queue>"通知队列"]
+        ConnMgr["连接管理器"]
+    end
+
+    subgraph Agent_LangGraph_ReAct
+        Graph["Graph"]
+        Tools["工具集"]
+        CoreMem["Core Memory 热记忆"]
+        MemAgent["Memory Agent"]
+    end
+
+    subgraph 热记忆层
+        CoreBlock["CoreBlock task/error/conclusion"]
+        Pending["PendingCache 待总结"]
+    end
+
+    subgraph 冷记忆层
+        ChromaDB["ChromaDB 事实+摘要"]
+        SQLite["SQLite 会话+任务"]
+        PendingDB["PendingCache.db"]
+    end
+
+    subgraph SKILL系统
+        SkillFiles["skills/*.md"]
+        SkillMgr["SKILL 管理器"]
+    end
+
+    subgraph 设备服务
+        PDH["PDH-Locking :8001"]
+        PNA["PNA :8002"]
+    end
+
+    User --> SSE
+    SSE --> SQLite
+    SSE --> CoreBlock
+    SSE --> ChromaDB
+    SSE --> SkillMgr
+    SSE --> Graph
+
+    Graph --> Tools
+    Tools --> ChromaDB
+    Tools --> CoreBlock
+    Tools --> PendingDB
+    Tools --> SkillMgr
+
+    Graph --> SSE
+    SSE --> SQLite
+    SQLite --> ChromaDB
+
+    MemAgent -.-> PendingDB
+    MemAgent -.-> CoreBlock
+    MemAgent -.-> ChromaDB
+
+    PDH -.-> Notify
+    PNA -.-> Notify
+    Notify -.-> Queue
+    Queue -.-> ConnMgr
+    ConnMgr -.-> WS
+
+    SkillFiles -.-> SkillMgr
+    SkillMgr -.-> Graph
+
+    classDef hot fill:#ff6b6b,color:#fff
+    classDef cold fill:#4dabf7,color:#fff
+    classDef api fill:#ffd43b,color:#000
+    classDef agent fill:#69db7c,color:#000
+    classDef device fill:#da77f2,color:#fff
+
+    class CoreBlock,Pending,CoreMem,热记忆层 hot
+    class ChromaDB,SQLite,PendingDB,冷记忆层 cold
+    class SSE,Notify,WS,MemAPI,FastAPI网关_8000 api
+    class Graph,Tools,MemAgent,Agent_LangGraph_ReAct agent
+    class PDH,PNA,设备服务 device
+```
+
 ### NotificationHub（端口 8000）
 
 ```
