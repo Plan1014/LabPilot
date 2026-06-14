@@ -50,7 +50,7 @@ SYSTEM_PROMPT = """
 - 临时参数/中间结论(conclusion)
 - 用户即时偏好或约束(persona)
 
-**注意**: 不要写入重复的内容, 不要重复放入不同的标签
+**注意**: 不要写入重复的内容, 不要重复放入不同的标签, 写入core memory不要覆盖原来的error和conclusion
 
 **标签规范**: `task`, `error`, `persona`, `conclusion`
 
@@ -168,7 +168,7 @@ def memory_agent_summarize(messages: list, debug: bool = True) -> str:
 
 def _build_summary_prompt(messages: list) -> str:
     """将消息列表格式化为文本"""
-    lines = ["请整理以下对话内容的记忆：\n"]
+    lines = ["请整理以下对话内容的记忆, 注意core_memory是热点记忆：\n"]
 
     for i, msg in enumerate(messages):
         # 支持 dict 格式和 LangChain Message 对象

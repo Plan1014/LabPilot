@@ -28,6 +28,7 @@ build/
 # ================= Claude Code =================
 .claude/
 .claude/settings.local.json
+.agents
 
 # ================= Personal Scripts =================
 start-tauri.ps1
@@ -91,5 +92,6 @@ credentials.json
 secrets/
 data/
 docs/
+skills-lock.json
 
 tests/
