@@ -29,6 +29,7 @@ build/
 .claude/
 .claude/settings.local.json
 .agents
+CLAUDE.md
 
 # ================= Personal Scripts =================
 start-tauri.ps1

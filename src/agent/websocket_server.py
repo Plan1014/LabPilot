@@ -211,6 +211,34 @@ class ConnectionManager:
 _manager = ConnectionManager()
 
 
+# ==================== Pending Drain Helpers (fix/pending-session-id) ====================
+
+def _spawn_drain_others_thread(current_session_id: str) -> None:
+    """Trigger B: 后台异步 drain 所有"其它" WebSocket session 的 pending.
+
+    调用点: session_query 入口 (req.session_id 确定后立即触发).
+    设计:
+      - 显式排除 session_id IS NULL (legacy/REPL),不误清
+      - 显式排除 == current_session_id (本 session 由 Trigger A 处理)
+      - 异步 daemon 线程,不阻塞 SSE 流
+      - single-flight 由 memory_agent._drain_lock 处理,这里不重复加锁
+      - 失败静默 (符合 memory agent 设计原则)
+    """
+    def _drain():
+        try:
+            from src.agent.memory import process_pending_others
+            result = process_pending_others(current_session_id)
+            if result:
+                logger.info(
+                    f"[Memory Agent] Trigger B drained for current={current_session_id[:8]}: {result[:200]}"
+                )
+        except Exception:
+            pass
+
+    thread = threading.Thread(target=_drain, daemon=True)
+    thread.start()
+
+
 # ==================== Session Router ====================
 
 def create_session_router():
@@ -272,6 +300,12 @@ def create_session_router():
         else:
             session_id = create_session()
             history = []
+
+        # === Trigger B: 后台异步清掉其它 WebSocket session 的 pending ===
+        # 每次 session_query 都触发: 切回 session 时也能清理掉之前遗留的其它 session pending
+        # 注意: REPL 完全不走这里,此触发仅在 WebSocket 上下文存在
+        _spawn_drain_others_thread(current_session_id=session_id)
+        # === Trigger B 触发结束 ===
 
         # Layer 1: micro_compact — replace old tool_results with placeholders
         history = _compact_tool_results(history)
@@ -365,7 +399,7 @@ def create_session_router():
 
                 # Stream events
                 async for event in graph.astream_events(
-                    {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0},
+                    {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0, "session_id": session_id},
                     config={"recursion_limit": 100},
                     stream_mode="values",
                 ):
