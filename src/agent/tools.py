@@ -13,6 +13,58 @@ from langchain_core.tools import tool
 from src.agent.config import WORKDIR, SKILLS_DIR
 from src.agent.memory.core import CoreMemoryManager
 
+
+# ==================== Dangerous Command Guard ====================
+# All patterns are anchored at word boundaries so that legitimate names like
+# `mytaskkill.exe` or `shutdown_check.ps1` are NOT falsely blocked.
+# Matching is case-insensitive (re.IGNORECASE) — Windows built-ins are
+# case-insensitive on the command line.
+_DANGEROUS_PATTERNS = [
+    # ---- Linux / Unix recursive delete & permission ----
+    r"\brm\s+(-[rR][fF]|-r[fF])\s+/",       # rm -rf /  / rm -rf *
+    r"\b(sudo|shutdown|reboot|halt|poweroff)\b",
+    # ---- Windows force-delete / disk destruction ----
+    r"\bdel\s+/[fFsS]\s+/[sSqQ]\b",          # del /F /S /Q
+    r"\brd\s+/[sS]\s+/[qQ]\b",              # rd /S /Q  (rmdir)
+    r"\b(format|diskpart)\b",               # Windows format / diskpart
+    r"\bbcdedit\b",                          # boot config editor
+    # ---- Process termination (agent 常见误用) ----
+    r"\btaskkill\b",                          # 任意 taskkill（含 /F）都拦
+    r"\bkill\s+-[9]\b",                      # kill -9 / SIGKILL
+    r"\bkillall\b",
+    # ---- Windows service control & registry ----
+    r"\bnet\s+(stop|start)\b",
+    r"\bsc\s+(stop|delete)\b",
+    r"\breg\s+delete\b",
+    # ---- Generic output sink ----
+    r">\s*/dev/",
+]
+
+_DANGEROUS_REGEX = re.compile("|".join(_DANGEROUS_PATTERNS), re.IGNORECASE)
+
+
+def _is_dangerous_command(command: str) -> bool:
+    """Return True if `command` matches a known destructive pattern.
+
+    Called by the ``bash`` tool before subprocess execution.
+    Word-boundary anchored and case-insensitive.
+    """
+    if not command:
+        return False
+    return bool(_DANGEROUS_REGEX.search(command))
+
+
+def _dangerous_match(command: str) -> str:
+    """Return the substring that triggered the dangerous guard (for error reporting).
+
+    If no pattern matches, returns "".
+    """
+    if not command:
+        return ""
+    m = _DANGEROUS_REGEX.search(command)
+    return m.group(0) if m else ""
+
+
 # ==================== Error Type Conventions ====================
 
 ERROR_PREFIXES = [
@@ -25,6 +77,7 @@ ERROR_PREFIXES = [
     "追加失败",
     "替换失败",
     "搜索失败",
+    "危险行为拒绝执行",
 ]
 
 
@@ -75,9 +128,10 @@ def bash(command: str, background: bool = False) -> str:
         The combined stdout and stderr output, truncated to 50,000 chars.
         For background processes, returns confirmation message.
     """
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return err("Error", "Dangerous command blocked")
+    if _is_dangerous_command(command):
+        # 把命中的模式名带回去,让 Agent 能把规则记进 Core Memory
+        matched = _dangerous_match(command)
+        return err("Error", f"危险行为拒绝执行: {matched}")
     try:
         if background:
             # Windows: hide console window for background process
