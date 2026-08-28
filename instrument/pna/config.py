@@ -17,7 +17,7 @@ PNA_DATA_DIR = Path(os.getenv("PNA_DATA_DIR", "data/PNA_data"))
 
 # Default measurement parameters
 PNA_DEFAULT_START_FREQ = int(os.getenv("PNA_DEFAULT_START_FREQ", "1"))
-PNA_DEFAULT_STOP_FREQ = int(os.getenv("PNA_DEFAULT_STOP_FREQ", "100000"))
+PNA_DEFAULT_STOP_FREQ = int(os.getenv("PNA_DEFAULT_STOP_FREQ", "1000000"))
 PNA_DEFAULT_FILENAME = os.getenv("PNA_DEFAULT_FILENAME", "trace_{timestamp}.csv")
 
 # Service port

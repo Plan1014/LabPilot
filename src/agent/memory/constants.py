@@ -17,5 +17,5 @@ CORE_MEMORY_BLOCK_CHAR_LIMIT = 4000
 # 数据库路径（运行时由 CoreMemoryManager 设置）
 BLOCKS_DB_PATH = None
 
-# Silent Summary 触发间隔（每N轮触发一次）
-SILENT_SUMMARY_INTERVAL = 5
+# Pending Cache 触发阈值 (Trigger A): 同 session 的 pending 累积条数达到此值时异步 drain
+PENDING_THRESHOLD = 30

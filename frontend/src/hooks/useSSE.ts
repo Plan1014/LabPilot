@@ -21,7 +21,16 @@ export function useSSE(
 
   const sendQuery = useCallback(
     async (query: string, sessionId?: string | null): Promise<string | null> => {
+      // [LABPILOT-DEBUG] 入口：记录本次 sendQuery 的所有入参和是否有旧流
+      console.log("[LABPILOT-DEBUG] sendQuery ENTRY", {
+        query: query.slice(0, 100),
+        sessionId,
+        hasExistingController: !!abortControllerRef.current,
+      });
+
       if (abortControllerRef.current) {
+        // [LABPILOT-DEBUG] abort 旧流 — 这会打断原 SSE 流，可能丢失 done 事件
+        console.log("[LABPILOT-DEBUG] sendQuery ABORT previous stream");
         abortControllerRef.current.abort();
       }
 
@@ -38,11 +47,20 @@ export function useSSE(
           body.session_id = sessionId;
         }
 
+        // [LABPILOT-DEBUG] 实际 fetch 前记录 request body
+        console.log("[LABPILOT-DEBUG] sendQuery FETCH start", { body });
+
         const response = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
           signal: abortControllerRef.current.signal,
+        });
+
+        // [LABPILOT-DEBUG] fetch 响应状态
+        console.log("[LABPILOT-DEBUG] sendQuery FETCH response", {
+          status: response.status,
+          ok: response.ok,
         });
 
         if (!response.ok) {
@@ -70,6 +88,13 @@ export function useSSE(
               try {
                 const event = JSON.parse(data) as SSEEvent;
 
+                // [LABPILOT-DEBUG] 每个 SSE 事件都打（type + session_id），用来追踪 done 何时到达
+                console.log("[LABPILOT-DEBUG] SSE EVENT", {
+                  type: event.type,
+                  hasSessionId: !!(event as { session_id?: string }).session_id,
+                  sessionId: (event as { session_id?: string }).session_id,
+                });
+
                 let key: string;
                 if (event.type === "thinking") {
                   key = `thinking:${event.content}`;
@@ -91,7 +116,11 @@ export function useSSE(
                   // Extract session_id from done event or X-Session-Id header
                   if (event.session_id) {
                     returnedSessionId = event.session_id;
+                    // [LABPILOT-DEBUG] 关键：done 事件触发的 session_id 持久化
+                    console.log("[LABPILOT-DEBUG] SSE DONE persistSessionId", event.session_id);
                     persistSessionId(event.session_id);
+                  } else {
+                    console.log("[LABPILOT-DEBUG] SSE DONE but NO session_id in event!");
                   }
                 }
               } catch (e) {

@@ -367,7 +367,6 @@ Output: fix(upload): handle large file uploads without crash
 | **load_skill** | 只在用户明确选择某个技能作为参考时才调用 |
 | **SKILLS.descriptions()** | 默认只读取简要列表，供用户浏览 |
 | **write_file** | 将生成的 SKILL.md 写入文件 |
-| **spawn_subagent** | 复杂技能创建可派生子代理协助 |
 
 ---
 
