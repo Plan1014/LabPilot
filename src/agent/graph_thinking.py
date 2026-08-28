@@ -15,6 +15,7 @@ Pending / drain 设计 (fix/pending-session-id):
   - Trigger B (websocket_server.py session_query 入口): 异步 process_pending_others(current)
 """
 
+import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional, Sequence, Callable
