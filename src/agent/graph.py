@@ -16,7 +16,7 @@ from src.agent.tools import TOOLS, SKILLS
 
 # System prompt used by the server agent
 system_prompt = f"""You are a lab agent at {WORKDIR}. Use tools to solve tasks.
-Use spawn_subagent for multi-step or isolated work.
+# Use spawn_subagent for multi-step or isolated work.  # 临时禁用 2026-08-28
 Use load_skill for specialized knowledge.
 Skills: {SKILLS.descriptions()}"""
 

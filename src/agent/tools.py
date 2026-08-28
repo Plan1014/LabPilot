@@ -581,7 +581,7 @@ TOOLS: List[Callable] = [
     write_file,
     edit_file,
     load_skill,
-    spawn_subagent,
+    # spawn_subagent,  # 临时禁用 2026-08-28 — 重新启用请取消注释
     remember_fact,
     search_memory,
     search_sessions,
