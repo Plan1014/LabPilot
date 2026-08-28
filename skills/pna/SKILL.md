@@ -9,7 +9,6 @@ description: >
   "PNR", or asks about "carrier suppression", "SSB phase noise".
   Do NOT use for general network requests unrelated to PNA instruments.
 ---
-
 # PNA Service Skill
 
 Use this skill when working with PNA (Phase Noise Analyzer) measurements.
@@ -52,12 +51,25 @@ bash(command="python -m instrument.pna.main", background=True)
 
 ## API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/measure` | Start a new measurement |
-| GET | `/measure/{task_id}` | Get task status |
-| POST | `/measure/{task_id}/cancel` | Cancel a running measurement |
-| GET | `/health` | Health check — `pna_connected` reflects actual PNA connection |
+
+| Method | Endpoint                    | Description                                                                                                       |
+| -------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| POST   | `/measure`                  | Start a new measurement                                                                                           |
+| GET    | `/measure/{task_id}`        | Get task status                                                                                                   |
+| POST   | `/measure/{task_id}/cancel` | Cancel a running measurement                                                                                      |
+| GET    | `/health`                   | Health check —`pna_connected` reflects actual PNA connection                                                     |
+| POST   | `/read_pna`                 | Extract key frequency points from a completed measurement CSV. Body:`{csv_path, target_freqs, tolerance_factor?}` |
+
+## Naming Convention
+
+- **Default**: omit `csv_filename`. The server stores files as
+  `trace_{YYYYMMDD_HHMMSS}.csv`, unique per second.
+- **User-named**: only include `csv_filename` when the user explicitly says
+  "save as ..." (e.g., "save as run_42").
+- **NEVER invent** names like `"phase_noise.csv"` or `"my_trace.csv"` — this
+  caused file overwrite when the same invented name was reused. Examples in
+  this skill that omit `csv_filename` show the **default**; examples that
+  include it show the **user-named exception**.
 
 ## Connection Behavior
 
@@ -80,16 +92,30 @@ Response: `{"status": "ok", "pna_connected": true}`
 
 ### Start a measurement
 
+**Default — omit `csv_filename`** (server picks a timestamp-based name; do not invent names):
+
 ```
 POST http://127.0.0.1:8002/measure
 {
   "start_freq": 1,
-  "stop_freq": 100000,
-  "csv_filename": "my_trace.csv"
+  "stop_freq": 1000000
 }
 ```
 
 Response: `{"task_id": "abc123", "status": "pending"}`
+
+Then end immediately. The result arrives as a NotificationHub push.
+
+**User-specified name** (only when user explicitly says "save as xxx"):
+
+```
+POST http://127.0.0.1:8002/measure
+{
+  "start_freq": 1,
+  "stop_freq": 1000000,
+  "csv_filename": "the_name_user_gave.csv"
+}
+```
 
 ### Check status (only if user explicitly requests)
 
@@ -98,6 +124,7 @@ GET http://127.0.0.1:8002/measure/abc123
 ```
 
 Response:
+
 ```
 {
   "task_id": "abc123",
@@ -117,24 +144,64 @@ Response:
 - **NEVER** start the PNA service with `background=False` — it will block the agent indefinitely
 - **ALWAYS** set `background=True` when calling `bash` to start the PNA service
 
-## Data Reading
+## Reading Measurement Data
 
-Measurement data is saved as CSV to `data/PNA_data/`. To read specific frequency points:
+Use the dedicated reader endpoint after the NotificationHub push delivers
+the result. Do not parse CSVs by hand — call `POST /read_pna`.
 
-```python
-import csv
+### Locating the saved file
 
-csv_path = "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\my_trace.csv"
-target_freqs = [1, 10, 100, 1000]  # Hz — read these points
+The WebSocket push payload includes `result.csv_path` (absolute path). Read
+it directly:
 
-with open(csv_path) as f:
-    reader = csv.DictReader(f)
-    for row in reader:
-        if float(row["Frequency_Hz"]) in target_freqs:
-            print(f"{row['Frequency_Hz']} Hz: {row['Power_dBm']} dBm")
+```
+[WebSocket] [2026-08-28T14:32:00Z] [pna] task_completed:
+  result={"status": "success",
+          "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+          ...}
 ```
 
-Output format: CSV with columns `Frequency_Hz`, `Power_dBm`. Frequencies are in Hz, power in dBm.
+- ✅ Use `result.csv_path` as the file location.
+- ❌ Do NOT call `GET /measure/{task_id}` to look up the file — the push
+  already has the path; that call is wasteful.
+- ❌ Do NOT reconstruct the path from a timestamp guess.
+- ❌ If `result.csv_path` is missing — the measurement failed; report the
+  error to the user instead of trying to read data.
+
+### Reading key points
+
+```
+POST http://127.0.0.1:8002/read_pna
+{
+  "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+  "target_freqs": [1, 10, 100, 1000, 10000, 100000],
+  "tolerance_factor": 0.05
+}
+```
+
+Defaults: `target_freqs` defaults to per-decade points
+`[1, 10, 100, 1000, 10000, 100000, 1000000]` Hz; `tolerance_factor` defaults
+to `0.05` (5%, matching the legacy reader heuristic).
+
+Response `200`:
+
+```json
+{
+  "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+  "points": [
+    {"frequency_hz": 1.0, "power_dbm": -45.32},
+    {"frequency_hz": 10.0, "power_dbm": -55.18}
+  ],
+  "missing": []
+}
+```
+
+If `missing` is non-empty, the CSV did not cover those frequencies (e.g.,
+the measurement only ran 1 Hz–100 kHz and you asked for 1 MHz). Report which
+frequencies are missing to the user.
+
+`csv_path` may also be relative — it is resolved against `PNA_DATA_DIR`
+(`data/PNA_data/`) automatically.
 
 ## Notification Format
 
@@ -145,21 +212,23 @@ When measurement completes, result is pushed to NotificationHub (port 8000):
 ```
 
 Failed measurement:
+
 ```
 [WebSocket] task_failed: error=...
 ```
 
 ## Configuration
 
-| Env Variable | Default | Description |
-|--------------|---------|-------------|
-| PNA_RESOURCE | USB::0xAAD::0x290::101334::INSTR | VISA resource string |
-| PNA_VISA_TIMEOUT | 1500000 | VISA timeout in ms |
-| PNA_OPC_TIMEOUT | 800000 | OPC timeout in ms |
-| PNA_DATA_DIR | data/PNA_data | Output directory |
-| PNA_PORT | 8002 | Service port |
-| PNA_DEFAULT_START_FREQ | 1 | Default start freq (Hz) |
-| PNA_DEFAULT_STOP_FREQ | 100000 | Default stop freq (Hz) |
+
+| Env Variable           | Default                          | Description             |
+| ------------------------ | ---------------------------------- | ------------------------- |
+| PNA_RESOURCE           | USB::0xAAD::0x290::101334::INSTR | VISA resource string    |
+| PNA_VISA_TIMEOUT       | 1500000                          | VISA timeout in ms      |
+| PNA_OPC_TIMEOUT        | 800000                           | OPC timeout in ms       |
+| PNA_DATA_DIR           | data/PNA_data                    | Output directory        |
+| PNA_PORT               | 8002                             | Service port            |
+| PNA_DEFAULT_START_FREQ | 1                                | Default start freq (Hz) |
+| PNA_DEFAULT_STOP_FREQ  | 1000000                          | Default stop freq (Hz)  |
 
 ## Implementation Notes
 
@@ -183,4 +252,4 @@ Failed measurement:
 5. Get `task_id`, tell user "measurement started"
 6. **End immediately** — do NOT poll or wait
 7. When NotificationHub pushes result → Agent receives via WebSocket on port 8000 → report to user
-8. User asks to read data → read CSV at requested frequency points (e.g., 1Hz, 10Hz, 100Hz)
+8. User asks to read data → take `result.csv_path` from the WebSocket push and call `POST /read_pna` with the requested target frequencies (see *Reading Measurement Data*)

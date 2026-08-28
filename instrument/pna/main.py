@@ -16,6 +16,9 @@ from instrument.pna.schemas import (
     MeasureResponse,
     TaskStatus,
     HealthResponse,
+    ReadPnaRequest,
+    ReadPnaResponse,
+    KeyPoint,
 )
 from instrument.pna.task_manager import task_manager
 from instrument.pna.pna_instrument import PNAInstrument
@@ -161,6 +164,31 @@ async def cancel_measurement(task_id: str):
             detail="Cannot cancel task (not found or already completed)",
         )
     return {"status": "cancelled", "task_id": task_id}
+
+
+@app.post("/read_pna", response_model=ReadPnaResponse)
+async def read_pna_endpoint(req: ReadPnaRequest):
+    """Extract key frequency points from a completed measurement CSV.
+
+    The CSV path is usually obtained from the NotificationHub push
+    ``result.csv_path`` after the measurement completes (see SKILL).
+    """
+    from instrument.pna.read_pna import read_key_points
+
+    try:
+        points, missing, resolved = read_key_points(
+            req.csv_path, req.target_freqs, tolerance_factor=req.tolerance_factor
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    return ReadPnaResponse(
+        csv_path=resolved,
+        points=[KeyPoint(frequency_hz=f, power_dbm=p) for f, p in points],
+        missing=missing,
+    )
 
 
 if __name__ == "__main__":
