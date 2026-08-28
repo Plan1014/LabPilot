@@ -139,8 +139,15 @@ export default function ChatWindow() {
 
   // Show notification as system prompt and notify REPL
   useEffect(() => {
+    // [LABPILOT-DEBUG] 通知 useEffect 触发入口
+    console.log("[LABPILOT-DEBUG] notification useEffect FIRED", {
+      notificationsCount: notifications.length,
+      currentStreamingId: streamingMessageId,
+      currentIsStreaming: isStreaming,
+    });
     if (notifications.length === 0) return;
     const last = notifications[notifications.length - 1];
+    console.log("[LABPILOT-DEBUG] notification PAYLOAD", last);
     const formatted = formatNotification(last);
 
     // Add system prompt message (this is the query sent to REPL)
@@ -174,6 +181,11 @@ export default function ChatWindow() {
     ]);
 
     const storedId = getStoredSessionId();
+    // [LABPILOT-DEBUG] 关键：调用 sendQuery 前的 storedId 和 formatted
+    console.log("[LABPILOT-DEBUG] notification ABOUT TO sendQuery", {
+      storedId,
+      formatted,
+    });
     sendQuery(formatted, storedId);
   }, [notifications]);
 

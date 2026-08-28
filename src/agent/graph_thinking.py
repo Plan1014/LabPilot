@@ -15,7 +15,7 @@ Pending / drain 设计 (fix/pending-session-id):
   - Trigger B (websocket_server.py session_query 入口): 异步 process_pending_others(current)
 """
 
-import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional, Sequence, Callable
 
@@ -30,19 +30,21 @@ from src.agent.memory.constants import PENDING_THRESHOLD
 
 # ==================== Event Emitter for SSE Streaming ====================
 
-_event_emitter: Optional[Callable[[dict], None]] = None
-_emitter_lock = threading.RLock()
+# [Fix #concurrent-emitter] 用 ContextVar 替代模块级全局变量
+# asyncio 每个 Task 有独立 context,并发 SSE 请求不会互相覆盖 emitter
+_event_emitter: ContextVar[Optional[Callable[[dict], None]]] = ContextVar(
+    "_event_emitter", default=None
+)
 
 
 def set_event_emitter(emitter: Optional[Callable[[dict], None]]):
-    """Set the global event emitter for SSE streaming.
+    """Set the per-task event emitter for SSE streaming.
 
-    When set, print_* functions will also call emitter(event_dict).
+    When set in an async task, print_* functions in that task will call
+    emitter(event_dict). Other concurrent tasks have independent emitters.
     When None (default), print_* functions only print to stdout.
     """
-    global _event_emitter
-    with _emitter_lock:
-        _event_emitter = emitter
+    _event_emitter.set(emitter)
 
 
 # ==================== State ====================
@@ -108,10 +110,10 @@ def print_thinking(thinking: str, step: int) -> None:
     """Print thinking block in gray color."""
     if not thinking.strip():
         return
-    # Emit via callback if registered
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "thinking", "content": thinking, "step": step})
+    # [Fix #concurrent-emitter] 读当前 task 的 emitter(每个 asyncio Task 独立 context)
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "thinking", "content": thinking, "step": step})
     # Fallback to stdout
     print(f"\033[90m[Thinking]\033[0m", flush=True)
     for line in thinking.split("\n"):
@@ -121,23 +123,23 @@ def print_thinking(thinking: str, step: int) -> None:
 
 def print_tool_call(tool_name: str, tool_input: dict, step: int) -> None:
     """Print tool call header with input details."""
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({
-                "type": "tool_call",
-                "name": tool_name,
-                "input": tool_input,
-                "step": step,
-            })
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({
+            "type": "tool_call",
+            "name": tool_name,
+            "input": tool_input,
+            "step": step,
+        })
     print(f"\n\033[33m[Step {step}] Calling tool: {tool_name}\033[0m", flush=True)
     print(f"  Input: {tool_input}", flush=True)
 
 
 def print_tool_result(result: str, step: int) -> None:
     """Print tool result in green."""
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "tool_result", "result": result, "step": step})
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "tool_result", "result": result, "step": step})
     display = result[:500] + "..." if len(result) > 500 else result
     print(f"\033[32m[Step {step}] Result\033[0m: {display}", flush=True)
 
@@ -146,9 +148,9 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     """Print final response in green."""
     if not text_blocks:
         return
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "text", "content": text_blocks, "step": step})
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "text", "content": text_blocks, "step": step})
     print(f"\n\033[92m[Response]\033[0m", flush=True)
     for text in text_blocks:
         print(text, flush=True)
