@@ -351,3 +351,7 @@ def main() -> None:
             continue
 
         run_agent_query(query)
+
+
+if __name__ == "__main__":
+    main()
