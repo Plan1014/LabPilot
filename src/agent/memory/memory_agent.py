@@ -1,8 +1,14 @@
 """记忆子Agent - 处理silent summary的独立Agent
 
 使用LangGraph的create_react_agent构造，不手动处理tool解析
+
+Drain 触发机制 (fix/pending-session-id):
+  - process_pending_self(session_id): Trigger A, drain WHERE session_id = current
+  - process_pending_others(session_id): Trigger B, drain WHERE session_id IS NOT NULL AND != current
+  - 两者共享 _drain_lock (single-flight), 并发时只有一个跑,其余放弃
 """
 
+import threading
 from typing import Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -191,22 +197,104 @@ def _build_summary_prompt(messages: list) -> str:
 
 
 def process_pending_cache() -> Optional[str]:
-    """处理pending cache中的内容
+    """Legacy API: 处理全量 pending (按创建时间, 不分 session).
+
+    新代码应使用 process_pending_self / process_pending_others.
+    保留仅供向后兼容。
+    """
+    return _drain_all_pending()
+
+
+# Single-flight 锁: 同一时刻最多一个 drain 在跑,避免并发 drain 重复消耗 LLM token.
+_drain_lock = threading.Lock()
+
+
+def process_pending_self(session_id: str) -> Optional[str]:
+    """Trigger A: 消化当前 session 的 pending (阈值触发).
+
+    调用方: graph_thinking.generate() 末尾,当 count_by_session(session_id) >= 阈值时.
 
     Returns:
-        总结结果字符串，如果无pending或不足3条消息返回None
+        summary 字符串, 或 None (已有 drain 在跑 / 不足 3 条)
     """
-    from src.agent.memory.pending import PendingCache
+    if not _drain_lock.acquire(blocking=False):
+        return None  # 已有 drain,本次放弃 (下次再试)
 
-    cache = PendingCache()
-    pending = cache.get_pending()
+    try:
+        from src.agent.memory.pending import PendingCache
 
-    if not pending or len(pending) < 3:
-        cache.close()
+        cache = PendingCache()
+        try:
+            pending = cache.get_pending_by_session(session_id)
+            if not pending or len(pending) < 3:
+                return None
+
+            result = memory_agent_summarize(pending)
+            cache.clear_pending_by_session(session_id)
+            return result
+        finally:
+            cache.close()
+    finally:
+        _drain_lock.release()
+
+
+def process_pending_others(current_session_id: str) -> Optional[str]:
+    """Trigger B: 消化所有其他 WebSocket session 的 pending.
+
+    调用方: websocket_server.session_query 入口.
+    显式排除 IS NULL (legacy) 和 == current_session_id (本 session 由 Trigger A 处理).
+
+    Returns:
+        summary 字符串, 或 None (已有 drain 在跑 / 无其它 pending)
+    """
+    if not _drain_lock.acquire(blocking=False):
+        return None  # 已有 drain,本次放弃
+
+    try:
+        from src.agent.memory.pending import PendingCache
+
+        cache = PendingCache()
+        try:
+            other_sids = cache.list_other_session_ids(exclude=current_session_id)
+            if not other_sids:
+                return None
+
+            results = []
+            for sid in other_sids:
+                pending = cache.get_pending_by_session(sid)
+                if len(pending) < 3:
+                    # 太少不浪费 LLM token,但仍清掉避免遗留
+                    cache.clear_pending_by_session(sid)
+                    continue
+                result = memory_agent_summarize(pending)
+                cache.clear_pending_by_session(sid)
+                results.append(f"{sid[:8]}: {result[:60] if result else '(empty)'}")
+
+            return "\n".join(results) if results else None
+        finally:
+            cache.close()
+    finally:
+        _drain_lock.release()
+
+
+def _drain_all_pending() -> Optional[str]:
+    """Legacy 全量 drain (按 row id 顺序). 供 process_pending_cache 兼容使用."""
+    if not _drain_lock.acquire(blocking=False):
         return None
 
-    result = memory_agent_summarize(pending)
-    cache.clear_pending()
-    cache.close()
+    try:
+        from src.agent.memory.pending import PendingCache
 
-    return result
+        cache = PendingCache()
+        try:
+            pending = cache.get_pending()
+            if not pending or len(pending) < 3:
+                return None
+
+            result = memory_agent_summarize(pending)
+            cache.clear_pending()
+            return result
+        finally:
+            cache.close()
+    finally:
+        _drain_lock.release()

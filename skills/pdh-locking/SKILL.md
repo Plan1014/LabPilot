@@ -145,6 +145,39 @@ curl.exe -X POST http://127.0.0.1:8001/lock/stop
 
 Returns: `{"status": "stopped", "message": "Lock successfully stopped"}`
 
+**Re-lock (idempotent operation):**
+
+When the user asks to lock the system without specifying the current state,
+handle the already-locked branch. Calling `/lock/manual` on an already-locked
+system can leave stale integrator state and produce a partial lock that reads
+as `locked` without fully clamping the cavity.
+
+1. Check current status:
+
+```
+curl.exe http://127.0.0.1:8001/lock/status
+```
+
+Parse the `locked` field.
+
+2. **If `locked == true`** — unlock first to reset integrator state:
+
+```
+curl.exe -X POST http://127.0.0.1:8001/lock/stop
+```
+
+Wait ~1–2 s for unlock to settle.
+
+3. Lock (in both branches):
+
+```
+curl.exe -X POST http://127.0.0.1:8001/lock/manual
+```
+
+4. **Always verify** with the power-comparison procedure described at the top
+   of this section — record `power_before` before step 1, capture
+   `power_after` 2–3 s after step 3, and confirm `power_after < power_before`.
+
 ---
 
 ### 3. PID Parameter Configuration
@@ -240,6 +273,12 @@ For async tasks (`/pi/calculate`):
 **"Lock the system"**
 → GET /power/monitor → store power_before → POST /lock/manual →
 → GET /power/monitor → compare → report success/failure
+
+**"Re-lock the system"**
+→ GET /lock/status → if `locked == true`: POST /lock/stop + wait 1–2 s →
+→ GET /power/monitor (power_before) → POST /lock/manual →
+→ wait 2–3 s → GET /power/monitor (power_after) →
+→ confirm power_after < power_before
 
 **"Set kp=200, ki=75, kd=15"**
 → POST /pid/set with those values → confirm update

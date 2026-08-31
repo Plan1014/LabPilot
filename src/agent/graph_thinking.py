@@ -6,9 +6,17 @@ Graph structure:
            └──(无 tool_use)──► END
 
 All output (thinking, tool_result, text) happens inside the graph.
+
+Pending / drain 设计 (fix/pending-session-id):
+  - state.session_id = None → REPL 模式, _save_to_pending 早返回,不写 pending
+  - state.session_id = uuid → WebSocket 模式,pending 全程带 session_id
+  - Trigger A (本文件 generate 内): count_by_session(current) >= PENDING_THRESHOLD
+    → 后台异步 process_pending_self(current_session_id)
+  - Trigger B (websocket_server.py session_query 入口): 异步 process_pending_others(current)
 """
 
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional, Sequence, Callable
 
@@ -17,25 +25,27 @@ from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
 from src.agent.tools import TOOLS, is_failure_result
-from src.agent.memory import memory_agent_summarize, process_pending_cache, PendingCache
-from src.agent.memory.constants import SILENT_SUMMARY_INTERVAL
+from src.agent.memory import process_pending_self, PendingCache
+from src.agent.memory.constants import PENDING_THRESHOLD
 
 
 # ==================== Event Emitter for SSE Streaming ====================
 
-_event_emitter: Optional[Callable[[dict], None]] = None
-_emitter_lock = threading.RLock()
+# [Fix #concurrent-emitter] 用 ContextVar 替代模块级全局变量
+# asyncio 每个 Task 有独立 context,并发 SSE 请求不会互相覆盖 emitter
+_event_emitter: ContextVar[Optional[Callable[[dict], None]]] = ContextVar(
+    "_event_emitter", default=None
+)
 
 
 def set_event_emitter(emitter: Optional[Callable[[dict], None]]):
-    """Set the global event emitter for SSE streaming.
+    """Set the per-task event emitter for SSE streaming.
 
-    When set, print_* functions will also call emitter(event_dict).
+    When set in an async task, print_* functions in that task will call
+    emitter(event_dict). Other concurrent tasks have independent emitters.
     When None (default), print_* functions only print to stdout.
     """
-    global _event_emitter
-    with _emitter_lock:
-        _event_emitter = emitter
+    _event_emitter.set(emitter)
 
 
 # ==================== State ====================
@@ -46,6 +56,7 @@ class InterleavedState:
     messages: Annotated[Sequence[AnyMessage], add_messages] = field(default_factory=list)
     pending_tool_calls: list = field(default_factory=list)  # 临时存储待执行的工具调用
     step_count: int = 0
+    session_id: Optional[str] = None  # None = REPL (不写 pending);WebSocket 注入 uuid
 
 
 # ==================== Content Block Parsing ====================
@@ -94,32 +105,16 @@ def parse_content_blocks(content: any) -> tuple:
     return thinking_blocks, tool_use_blocks, text_blocks
 
 
-# ==================== Silent Summary Trigger ====================
-
-def should_trigger_silent_summary(state: InterleavedState) -> bool:
-    """判断是否应该触发silent summary
-
-    条件：
-    1. step_count > 0 且能被SILENT_SUMMARY_INTERVAL整除
-    2. 没有待执行的tool calls（对话自然结束）
-    """
-    return (
-        state.step_count > 0
-        and state.step_count % SILENT_SUMMARY_INTERVAL == 0
-        and len(state.pending_tool_calls) == 0
-    )
-
-
 # ==================== Output Helpers ====================
 
 def print_thinking(thinking: str, step: int) -> None:
     """Print thinking block in gray color."""
     if not thinking.strip():
         return
-    # Emit via callback if registered
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "thinking", "content": thinking, "step": step})
+    # [Fix #concurrent-emitter] 读当前 task 的 emitter(每个 asyncio Task 独立 context)
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "thinking", "content": thinking, "step": step})
     # Fallback to stdout
     print(f"\033[90m[Thinking]\033[0m", flush=True)
     for line in thinking.split("\n"):
@@ -129,23 +124,23 @@ def print_thinking(thinking: str, step: int) -> None:
 
 def print_tool_call(tool_name: str, tool_input: dict, step: int) -> None:
     """Print tool call header with input details."""
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({
-                "type": "tool_call",
-                "name": tool_name,
-                "input": tool_input,
-                "step": step,
-            })
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({
+            "type": "tool_call",
+            "name": tool_name,
+            "input": tool_input,
+            "step": step,
+        })
     print(f"\n\033[33m[Step {step}] Calling tool: {tool_name}\033[0m", flush=True)
     print(f"  Input: {tool_input}", flush=True)
 
 
 def print_tool_result(result: str, step: int) -> None:
     """Print tool result in green."""
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "tool_result", "result": result, "step": step})
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "tool_result", "result": result, "step": step})
     display = result[:500] + "..." if len(result) > 500 else result
     print(f"\033[32m[Step {step}] Result\033[0m: {display}", flush=True)
 
@@ -154,9 +149,9 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     """Print final response in green."""
     if not text_blocks:
         return
-    with _emitter_lock:
-        if _event_emitter:
-            _event_emitter({"type": "text", "content": text_blocks, "step": step})
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({"type": "text", "content": text_blocks, "step": step})
     print(f"\n\033[92m[Response]\033[0m", flush=True)
     for text in text_blocks:
         print(text, flush=True)
@@ -166,7 +161,6 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
 # ==================== Helper Functions ====================
 
 _pending_cache: Optional[PendingCache] = None
-_pending_processed: bool = False  # 确保每个对话只处理一次pending
 
 
 def _get_pending_cache() -> PendingCache:
@@ -177,14 +171,16 @@ def _get_pending_cache() -> PendingCache:
     return _pending_cache
 
 
-def _reset_pending_flag():
-    """重置pending处理标志（新对话开始时调用）"""
-    global _pending_processed
-    _pending_processed = False
+def _save_to_pending(messages: list, session_id: Optional[str]) -> None:
+    """Save messages to pending cache (session_id is REQUIRED for WebSocket).
 
+    REPL 模式: session_id=None,本函数早返回,不写 pending。
+    WebSocket 模式: session_id=uuid,正常写入 pending_cache.db。
+    """
+    # REPL 旁路: 无 session_id 不写 pending
+    if session_id is None:
+        return
 
-def _save_to_pending(messages: list) -> None:
-    """Save messages to pending cache for later processing"""
     # 转换为dict格式以便JSON序列化
     dict_messages = []
     for msg in messages:
@@ -197,7 +193,7 @@ def _save_to_pending(messages: list) -> None:
             dict_messages.append(msg)
     if dict_messages:
         cache = _get_pending_cache()
-        cache.save_pending(dict_messages)
+        cache.save_pending(dict_messages, session_id=session_id)
 
 
 # ==================== Graph Nodes ====================
@@ -207,30 +203,22 @@ def generate(state: InterleavedState) -> dict:
 
     Uses llm.bind_tools(TOOLS) for proper tool format handling.
     Prints thinking blocks immediately upon receipt.
-    Persists messages to pending cache and processes pending on new session.
+    Persists messages to pending cache (WebSocket only).
+    Triggers Trigger A when same-session pending count exceeds threshold.
     """
     step = state.step_count + 1
+    session_id = getattr(state, "session_id", None)
 
     # 每次保存消息到pending cache（跨会话持久化）
     # 注意：state.messages 是累积列表，每个 step 都在增长
     # 为避免重复保存，只取该 step 新增的最后一条消息
+    # REPL (session_id=None) 时 _save_to_pending 早返回,不写 pending
     if state.messages:
         try:
             last_msg = state.messages[-1]
-            _save_to_pending([last_msg])
+            _save_to_pending([last_msg], session_id=session_id)
         except Exception as e:
             print(f"\033[94m[Memory Agent]\033[0m Failed to save pending: {e}")
-
-    # 检查并处理之前的pending内容（新对话开始时，只处理一次）
-    global _pending_processed
-    if not _pending_processed:
-        _pending_processed = True
-        try:
-            result = process_pending_cache()
-            if result:
-                print(f"\033[94m[Memory Agent]\033[0m Processed pending: {result[:100]}")
-        except Exception:
-            pass
 
     # Bind tools to the LLM - LangChain handles format conversion
     llm_with_tools = llm.bind_tools(TOOLS)
@@ -256,11 +244,24 @@ def generate(state: InterleavedState) -> dict:
     if not tool_use_blocks:
         print_final_text(text_blocks, step)
 
-    # 如果满足触发条件，进行silent summary（后台执行，不阻塞）
-    if should_trigger_silent_summary(state):
-        print(f"\033[94m[Memory Agent]\033[0m Silent summary triggered at step {state.step_count}")
-        thread = threading.Thread(target=memory_agent_summarize, args=(state.messages,))
-        thread.start()  # 非阻塞，立即返回
+    # Trigger A: 同 session 阈值检查 (仅 WebSocket, REPL session_id=None 跳过)
+    # 阈值触发时,后台异步 drain 本 session 的 pending (single-flight 锁保证并发安全)
+    # 注意: 这里用的是 singleton _pending_cache,绝对不能 close (否则后续 _save_to_pending 全失败)
+    # drain 线程内部 process_pending_self 自己 new PendingCache() 用完 close,与 singleton 解耦
+    if session_id is not None and not tool_use_blocks:
+        try:
+            cache = _get_pending_cache()
+            count = cache.count_by_session(session_id)
+            if count >= PENDING_THRESHOLD:
+                print(f"\033[94m[Memory Agent]\033[0m Trigger A: pending={count} >= {PENDING_THRESHOLD}, spawn drain for session={session_id[:8]}")
+                thread = threading.Thread(
+                    target=process_pending_self,
+                    args=(session_id,),
+                    daemon=True,
+                )
+                thread.start()
+        except Exception as e:
+            print(f"\033[94m[Memory Agent]\033[0m Trigger A check failed: {e}")
 
     return {
         "messages": [response],  # LangChain AIMessage already properly formatted
