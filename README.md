@@ -2,6 +2,42 @@
 
 光学实验 agent 助手 —— 基于 LangGraph 的 ReAct 智能体。通过 FastAPI 的 SSE 流式输出和 Skill 技能系统，实现对实验的智能控制。
 
+## 新设备部署（5 步上手）
+
+适用于在新机器上一键拉起 LabPilot Dev 环境（`start-dev.ps1` 路径，**不含 Tauri**）。
+
+### 前置一次性安装
+
+1. 装 [uv](https://docs.astral.sh/uv/) 0.4+（管理 Python 依赖）
+2. 装 Node.js 18+（Vite 前端需要）
+3. Windows 装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)（sentence-transformers → torch 需要）
+   ```powershell
+   winget install --id Microsoft.VCRedist.2015+.x64 -e --source winget
+   ```
+
+### 每次拉新代码后
+
+4. 装依赖：
+   ```powershell
+   uv sync
+   cd frontend; npm install; cd ..
+   ```
+5. 复制 `.env` 并填 API Key：
+   ```powershell
+   cp .env.example .env
+   # 编辑 .env,填入 ANTHROPIC_API_KEY
+   ```
+6. 启动：
+   ```powershell
+   .\start-dev.ps1
+   ```
+
+> 💡 `start-dev.ps1` 内置了 Pre-flight 自检，忘了跑第 4、5 步也不会翻车：
+> - `.env` 缺失 → 黄字警告并提示 `cp .env.example .env`
+> - `frontend/node_modules` 缺失 → 询问是否 `npm install`（默认 Y）
+
+---
+
 ## 核心功能
 
 - **三层对话压缩**：micro_compact（工具结果占位符）→ auto_compact（LLM 总结摘要）→ compact（手动压缩）
@@ -14,17 +50,21 @@
 
 ### 环境要求
 
-- Python 3.11+
-- Node.js 18+（用于 Tauri 前端）
-- Rust 1.70+（用于 Tauri 桌面应用）
+- [uv](https://docs.astral.sh/uv/) 0.4+（推荐，用它管理 Python 环境与依赖）
+- Python 3.11+（uv 会按需自动下载）
+- Node.js 18+（用于 Tauri 前端；纯 `start-dev` 模式下也需要）
+- Rust 1.70+（**仅 Tauri 桌面应用需要**，`start-dev` 模式不需要）
 - Anthropic API Key 或兼容 API
+- Windows 下还需安装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)（sentence-transformers → torch 运行需要，`winget install Microsoft.VCRedist.2015+.x64` 一行搞定）
 
 ### 1. Python 环境
 
 ```bash
-pip install -r requirements.txt
+uv sync
 # 首次启动会自动下载 sentence-transformers 模型（约 60MB）
 ```
+
+如果没用 uv，也可以走传统 `venv` + `pip install -r requirements.txt`，但 `start-dev.ps1` 默认会优先用 uv 创建的 `.venv/`。
 
 ### 2. 配置
 
@@ -42,7 +82,8 @@ MODEL_ID=claude-sonnet-4-20250514
 
 **方式一：REPL 交互（纯终端）**
 ```bash
-venv\Scripts\python.exe -m src.agent.repl
+uv run python -m src.agent.repl
+# 或传统方式：.venv\Scripts\python.exe -m src.agent.repl
 ```
 直接进入命令行 REPL，支持 `/compact` 手动压缩、`/history` 查看历史。
 
@@ -58,7 +99,8 @@ venv\Scripts\python.exe -m src.agent.repl
 ```
 启动 Python 后端 + Tauri 桌面应用，需配置 MSVC Build Tools 和 Rust 环境。
 
-> 手动启动后端：`venv\Scripts\python.exe -m uvicorn src.agent.websocket_server:create_notification_hub_app --factory --host 127.0.0.1 --port 8000`
+> 手动启动后端：`uv run uvicorn src.agent.websocket_server:create_notification_hub_app --factory --host 127.0.0.1 --port 8000`
+> （传统方式：`.venv\Scripts\python.exe -m uvicorn ...`）
 
 ---
 
