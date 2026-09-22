@@ -143,7 +143,8 @@ class NotificationQueue:
             content = self._format_result(result)
             ts_str = f"[{timestamp}] " if timestamp else ""
             source_str = f"[{source}] " if source else ""
-            return f"[WebSocket] {ts_str}{source_str}{msg_type}: {content}"
+            boot_suffix = self._format_pdh_boot_suffix(source, result)
+            return f"[WebSocket] {ts_str}{source_str}{msg_type}: {content}{boot_suffix}"
         lines = [f"[WebSocket] {len(messages)} notifications:"]
         for msg in messages:
             msg_type = msg.get("type", "unknown")
@@ -153,19 +154,67 @@ class NotificationQueue:
             content = self._format_result(result)
             ts_str = f"[{timestamp}] " if timestamp else ""
             source_str = f"[{source}] " if source else ""
-            lines.append(f"  - {ts_str}{source_str}{msg_type}: {content}")
+            boot_suffix = self._format_pdh_boot_suffix(source, result)
+            lines.append(f"  - {ts_str}{source_str}{msg_type}: {content}{boot_suffix}")
         return "\n".join(lines)
 
+    # ---- PDH-Locking 事件格式化 (参看 skills/pdh-locking/SKILL.md) ----
+
+    @staticmethod
+    def _format_pdh_boot_suffix(source: str, result) -> str:
+        """对 source='pdh-locking' 事件追加 linien 端开机锚点信息。
+
+        返回 '' 表示不是 pdh-locking 或 result 不含 since_boot_seconds。
+        """
+        if source != "pdh-locking" or not isinstance(result, dict):
+            return ""
+        since = result.get("since_boot_seconds")
+        if since is None:
+            return ""
+        anchor = result.get("boot_anchor", "")
+        suffix = f" (linien 开机后 {since}s"
+        if anchor:
+            suffix += f", anchor={anchor}"
+        suffix += ")"
+        return suffix
+
     def _format_result(self, result) -> str:
-        if isinstance(result, dict):
-            if result.get("status") == "success":
-                p = result.get("P")
-                i = result.get("I")
-                if p is not None and i is not None:
-                    return f"P={p}, I={i}"
-                return str(result)
+        if not isinstance(result, dict):
+            return str(result)
+        # 兼容旧 PI 计算任务 (source='pdh-locking' 但 event_type 不存在)
+        if result.get("status") == "success":
+            p = result.get("P")
+            i = result.get("I")
+            if p is not None and i is not None:
+                return f"P={p}, I={i}"
             return result.get("message", str(result))
-        return str(result)
+        # PDH-Locking 新事件类型 (event_type 由 linien 端 notifier 写入)
+        event_type = result.get("event_type")
+        if event_type == "lock_anomaly":
+            return self._format_lock_anomaly(result)
+        if event_type == "relock_failed":
+            return result.get("message", str(result))
+        if event_type == "log_errors":
+            return self._format_log_errors(result)
+        # 兜底: 取 message 字段
+        return result.get("message", str(result))
+
+    @staticmethod
+    def _format_lock_anomaly(result: dict) -> str:
+        count = result.get("count", "?")
+        window = result.get("window_seconds", "?")
+        acq = result.get("lock_acquired", 0)
+        lst = result.get("lock_lost", 0)
+        suggestion = result.get("suggestion", "")
+        stats = f"{count} events in {window}s, {acq} acquired, {lst} lost"
+        return f"{suggestion} ({stats})" if suggestion else stats
+
+    @staticmethod
+    def _format_log_errors(result: dict) -> str:
+        n = result.get("new_count", 0)
+        truncated = result.get("truncated", False)
+        suffix = " (truncated)" if truncated else ""
+        return f"{n} new WARNING/ERROR entries{suffix}"
 
     def is_empty(self) -> bool:
         return self._queue.empty()
