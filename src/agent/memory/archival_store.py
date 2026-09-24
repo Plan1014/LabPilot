@@ -5,9 +5,17 @@
 """
 
 import time
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+# Force HF offline BEFORE importing sentence_transformers / huggingface_hub.
+# Without these, the cached BAAI/bge-small-zh-v1.5 model still triggers a HEAD
+# request to huggingface.co to check for revisions on every import.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import chromadb
 from chromadb import Documents, EmbeddingFunction, Embeddings
 from sentence_transformers import SentenceTransformer

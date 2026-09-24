@@ -3,6 +3,7 @@
 All tools are @tool-decorated functions exposed to the LangGraph agent.
 """
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -358,13 +359,19 @@ def create_subagent(agent_type: str = "Explore") -> Callable:
     from langgraph.prebuilt import create_react_agent
 
     from src.agent.config import MODEL_ID
-    from src.agent.llm import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
+    from src.agent.llm import _openai_mode, _openai_config
 
-    sub_llm = ChatAnthropic(
-        model=MODEL_ID,
-        anthropic_api_key=ANTHROPIC_API_KEY,
-        base_url=ANTHROPIC_BASE_URL or None,
-    )
+    if _openai_mode():
+        from langchain_openai import ChatOpenAI
+        api_key, api_base, model = _openai_config()
+        sub_llm = ChatOpenAI(api_key=api_key, base_url=api_base, model=model)
+    else:
+        from langchain_anthropic import ChatAnthropic
+        sub_llm = ChatAnthropic(
+            model=MODEL_ID,
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or "sk-placeholder",
+            base_url=os.getenv("ANTHROPIC_BASE_URL", "").strip() or None,
+        )
     sub_tools = create_subagent_tools(agent_type)
 
     sub_graph = create_react_agent(

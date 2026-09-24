@@ -264,11 +264,14 @@ PRESERVE_RESULT_TOOLS = {"read_file"}
 
 
 def _build_tool_name_map(messages: list) -> dict:
-    """Build tool_use_id -> tool_name mapping from assistant messages."""
+    """Build tool_call_id -> tool_name mapping from assistant messages."""
     tool_name_map = {}
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
+        # OpenAI mode: tool_calls is a top-level field on the assistant dict.
+        for tc in msg.get("tool_calls") or []:
+            tool_name_map[tc.get("id", "")] = tc.get("name", "unknown")
         content = msg.get("content", [])
         if not isinstance(content, list):
             continue
@@ -338,35 +341,14 @@ def session_auto_compact(session_id: str) -> str:
             f.write(json.dumps(msg, default=str) + "\n")
 
     # LLM summarize
-    from src.agent.llm import client
+    from src.agent.llm import summarize_text
     conv_text = json.dumps(history, default=str)[-80000:]
-    resp = client.messages.create(
-        model=MODEL_ID,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Summarize this conversation for continuity. Include: "
-                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-                "Be concise but preserve critical details.\n\n" + conv_text
-            )
-        }],
+    summary = summarize_text(
+        "Summarize this conversation for continuity. Include: "
+        "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+        "Be concise but preserve critical details.\n\n" + conv_text,
         max_tokens=2000,
     )
-    # Extract text block
-    summary = ""
-    if isinstance(resp.content, list):
-        for block in resp.content:
-            if hasattr(block, "type") and block.type == "text":
-                summary = block.text
-                break
-            elif isinstance(block, dict) and block.get("type") == "text":
-                summary = block.get("text", "")
-                break
-        if not summary and resp.content:
-            last_block = resp.content[-1]
-            summary = getattr(last_block, "text", str(last_block))
-    else:
-        summary = str(resp.content)
 
     # Save to ChromaDB
     from src.agent.memory import memory_system

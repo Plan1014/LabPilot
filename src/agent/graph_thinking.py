@@ -226,15 +226,33 @@ def generate(state: InterleavedState) -> dict:
     # Invoke the LLM with tools bound
     # LangChain will automatically:
     # 1. Convert messages to API format
-    # 2. Convert tools to Anthropic format
-    # 3. Parse response and extract tool_use blocks
+    # 2. Convert tools to provider format (Anthropic tool_use or OpenAI function)
+    # 3. Parse response and extract tool calls
     response = llm_with_tools.invoke(state.messages)
 
-    # response is an AIMessage with content containing blocks
-    content = response.content
-
-    # Parse content blocks
-    thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(content)
+    # OpenAI mode: tool_calls is an attribute on AIMessage, not a content block.
+    # Anthropic mode: tool_use blocks live inside response.content (handled by parse_content_blocks).
+    openai_tool_calls = getattr(response, "tool_calls", None) or []
+    if openai_tool_calls:
+        tool_use_blocks = []
+        for tc in openai_tool_calls:
+            tc_id = tc.get("id") if isinstance(tc, dict) else tc.id
+            tc_name = tc.get("name") if isinstance(tc, dict) else tc.name
+            tc_args = tc.get("args") if isinstance(tc, dict) else tc.args
+            if isinstance(tc_args, str):
+                import json as _json
+                try:
+                    tc_args = _json.loads(tc_args)
+                except Exception:
+                    tc_args = {}
+            tool_use_blocks.append({"id": tc_id, "name": tc_name, "input": tc_args or {}})
+        content = response.content
+        text_blocks = [content] if isinstance(content, str) and content else []
+        thinking_blocks = []
+    else:
+        # Parse content blocks
+        content = response.content
+        thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(content)
 
     # Print thinking immediately
     for thinking in thinking_blocks:

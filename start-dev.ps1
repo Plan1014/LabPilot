@@ -16,15 +16,15 @@ if (-not (Test-Path "$projectRoot\.env")) {
     Write-Host "    Run:  cp .env.example .env   then fill ANTHROPIC_API_KEY" -ForegroundColor Yellow
     Write-Host "    Continuing anyway (backend will start but may 401 without API key)..." -ForegroundColor DarkYellow
 } else {
-    # 如果用户填的是 OPENAI_API_KEY，提示会自动起 LiteLLM Proxy
+    # 如果用户填的是 OPENAI_API_KEY，提示会用 ChatOpenAI 直连上游
     $envContent = Get-Content "$projectRoot\.env" -Raw
     if ($envContent -match '(?m)^OPENAI_API_KEY\s*=\s*\S+') {
         $hasAnthropic = $envContent -match '(?m)^ANTHROPIC_API_KEY\s*=\s*\S+'
         $hasLiteLLM = $envContent -match '(?m)^LITELLM_MODEL\s*=\s*\S+'
         if (-not $hasAnthropic) {
-            Write-Host "  ℹ  OPENAI_API_KEY detected. Will auto-spawn LiteLLM Proxy on startup." -ForegroundColor Cyan
+            Write-Host "  ℹ  OPENAI_API_KEY detected. Will connect via ChatOpenAI directly (no LiteLLM Proxy)." -ForegroundColor Cyan
             if (-not $hasLiteLLM) {
-                Write-Host "    ! LITELLM_MODEL is empty — set it (e.g. openai/qwen2.5-14b-instruct)" -ForegroundColor Yellow
+                Write-Host "    ! LITELLM_MODEL is empty — set it (e.g. qwen2.5-14b-instruct or gpt-4o)" -ForegroundColor Yellow
             }
         }
     }
@@ -65,6 +65,11 @@ Write-Host "  Port 8000 is free" -ForegroundColor Green
 
 # 2. Start Python backend in new window
 Write-Host "`n[2/3] Starting Python backend on port 8000..." -ForegroundColor Yellow
+
+# Keep sentence_transformers from phoning home on every startup.
+# archival_store.py also setdefaults these; this is for direct invocations.
+$env:HF_HUB_OFFLINE = "1"
+$env:TRANSFORMERS_OFFLINE = "1"
 
 # Prefer uv-managed .venv; fall back to legacy venv for backwards compat
 $venvPython = "$projectRoot\.venv\Scripts\python.exe"
