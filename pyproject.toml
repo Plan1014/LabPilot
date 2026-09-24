@@ -25,6 +25,13 @@ dependencies = [
     # ===== Anthropic =====
     "anthropic>=0.40.0",
 
+    # ===== OpenAI-compatible provider bridge =====
+    # 仅在 OPENAI_API_KEY 设置时被 llm.py 启用，自动起 LiteLLM Proxy
+    # 把 Anthropic 协议翻译成任意 OpenAI 兼容后端
+    # (DeepSeek/Qwen/GLM/Ollama/vLLM/OpenAI)。本地推理时填
+    # LITELLM_MODEL=ollama/llama3.1 之类即可。
+    "litellm[proxy]>=1.50.0",
+
     # ===== Utilities =====
     "python-dotenv>=1.0.0",
     "pydantic>=2.0",

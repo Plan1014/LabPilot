@@ -26,6 +26,7 @@
    ```powershell
    cp .env.example .env
    # 编辑 .env,填入 ANTHROPIC_API_KEY
+   # 或走 OpenAI 兼容：填 OPENAI_API_KEY + LITELLM_MODEL（见下方"切换模型后端"）
    ```
 6. 启动：
    ```powershell
@@ -54,7 +55,7 @@
 - Python 3.11+（uv 会按需自动下载）
 - Node.js 18+（用于 Tauri 前端；纯 `start-dev` 模式下也需要）
 - Rust 1.70+（**仅 Tauri 桌面应用需要**，`start-dev` 模式不需要）
-- Anthropic API Key 或兼容 API
+- Anthropic API Key 或兼容 API（也可走 OpenAI 兼容模型，见下文"切换模型后端"）
 - Windows 下还需安装 [VC++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)（sentence-transformers → torch 运行需要，`winget install Microsoft.VCRedist.2015+.x64` 一行搞定）
 
 ### 1. Python 环境
@@ -75,6 +76,8 @@ ANTHROPIC_API_KEY=sk-ant-xxxxx
 ANTHROPIC_BASE_URL=https://api.anthropic.com
 MODEL_ID=claude-sonnet-4-20250514
 ```
+
+> 想换 DeepSeek/Qwen/GLM/Ollama/vLLM 等 OpenAI 兼容模型？见 [切换模型后端](#切换模型后端-litellm-proxy)。
 
 ### 3. 启动方式
 
@@ -102,6 +105,38 @@ uv run python -m src.agent.repl
 > 手动启动后端：`uv run uvicorn src.agent.websocket_server:create_notification_hub_app --factory --host 127.0.0.1 --port 8000`
 > （传统方式：`.venv\Scripts\python.exe -m uvicorn ...`）
 
+### 切换模型后端（LiteLLM Proxy）
+
+`src/agent/llm.py` 默认走 Anthropic 协议。**只要在 `.env` 里填 `OPENAI_API_KEY` 而不填 `ANTHROPIC_API_KEY`，LabPilot 会在启动时自动 spawn 一个本地 LiteLLM Proxy（默认 `127.0.0.1:4000`），把 Anthropic 协议翻译成 OpenAI 兼容协议**，然后继续用 `ChatAnthropic` 连过去——业务代码（ReAct、tool_use 解析、auto_compact）一行不动。
+
+适用场景：
+
+- 用 DeepSeek / Qwen / GLM / 硅基流动 / OpenRouter 等云端模型
+- 本地 Ollama / vLLM / LMDeploy 跑开源模型做能力对比
+
+`.env` 示例（硅基流动上的 Qwen2.5-14B）：
+
+```env
+OPENAI_API_KEY=sk-xxxxxxxx
+LITELLM_MODEL=openai/qwen2.5-14b-instruct
+LITELLM_MODEL_API_BASE=https://api.siliconflow.cn/v1
+LITELLM_MODEL_API_KEY=sk-xxxxxxxx     # 留空复用 OPENAI_API_KEY
+# LITELLM_PROXY_PORT=4000
+# LITELLM_AUTOSTART=true               # 设 false = 假设你已经外部起了 proxy
+```
+
+`.env` 示例（本地 Ollama 跑 Llama3.1）：
+
+```env
+OPENAI_API_KEY=sk-local
+LITELLM_MODEL=ollama_chat/llama3.1
+LITELLM_MODEL_API_BASE=http://127.0.0.1:11434
+```
+
+> 💡 `MODEL_ID` 是**对外呈现**的模型名（LabPilot 把它传给 Anthropic 客户端）。LiteLLM Proxy 收到 `MODEL_ID` 后按自己的路由表查实际上游。改 `LITELLM_MODEL` 才是真正切模型。
+>
+> ⚠️ 想做 7B / 14B / 32B 横向对比时，注意：LabPilot 是 tool-heavy ReAct agent，**7B 几乎肯定跑不通 tool calling**；14B 单步勉强、多步仍掉链；32B 通常是甜点。
+
 ---
 
 ## 项目结构
@@ -113,7 +148,7 @@ LabPilot/
 │   ├── config.py            # 配置（模型、工作目录、阈值）
 │   ├── graph.py             # Server 模式图定义
 │   ├── graph_thinking.py     # ReAct 图定义（SSE 事件发射）
-│   ├── llm.py               # LLM 初始化（ChatAnthropic）
+│   ├── llm.py               # LLM 初始化（ChatAnthropic；OpenAI key 时自动起 LiteLLM Proxy）
 │   ├── memory.py            # 长期记忆系统（ChromaDB + SQLite）
 │   ├── repl.py              # REPL 交互入口
 │   ├── session_manager.py   # 会话存储（SQLite，三层压缩）
@@ -352,7 +387,17 @@ Agent 可通过以下工具访问长期记忆：
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL_ID` | `claude-sonnet-4-20250514` | 模型 ID |
+| `MODEL_ID` | `claude-sonnet-4-20250514` | 模型 ID（Anthropic 客户端看到的名字） |
+| `ANTHROPIC_API_KEY` | — | Anthropic API Key |
+| `ANTHROPIC_BASE_URL` | 官方 API | 自托管兼容网关 / LiteLLM Proxy URL |
+| `OPENAI_API_KEY` | — | 设置后启用 LiteLLM Proxy 模式 |
+| `LITELLM_MODEL` | — | 上游模型，如 `openai/qwen2.5-14b-instruct` |
+| `LITELLM_MODEL_API_BASE` | — | 上游 API base（可选） |
+| `LITELLM_MODEL_API_KEY` | 复用 OPENAI_API_KEY | 上游 API key（可选） |
+| `LITELLM_PROXY_PORT` | `4000` | 本地 LiteLLM 监听端口 |
+| `LITELLM_AUTOSTART` | `true` | `false` = 假设外部已起 proxy |
+| `LITELLM_HOST` | `127.0.0.1` | LiteLLM 绑定地址 |
+| `LITELLM_STARTUP_TIMEOUT` | `30` | 等待 proxy 就绪秒数 |
 | `NOTIFICATION_HUB_PORT` | `8000` | API 监听端口 |
 | `NOTIFICATION_HUB_ENABLED` | `true` | 是否启用 NotificationHub |
 | `SESSION_TTL_DAYS` | `30` | 会话保留天数 |

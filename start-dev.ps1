@@ -15,6 +15,19 @@ if (-not (Test-Path "$projectRoot\.env")) {
     Write-Host "  ! .env not found." -ForegroundColor Yellow
     Write-Host "    Run:  cp .env.example .env   then fill ANTHROPIC_API_KEY" -ForegroundColor Yellow
     Write-Host "    Continuing anyway (backend will start but may 401 without API key)..." -ForegroundColor DarkYellow
+} else {
+    # 如果用户填的是 OPENAI_API_KEY，提示会自动起 LiteLLM Proxy
+    $envContent = Get-Content "$projectRoot\.env" -Raw
+    if ($envContent -match '(?m)^OPENAI_API_KEY\s*=\s*\S+') {
+        $hasAnthropic = $envContent -match '(?m)^ANTHROPIC_API_KEY\s*=\s*\S+'
+        $hasLiteLLM = $envContent -match '(?m)^LITELLM_MODEL\s*=\s*\S+'
+        if (-not $hasAnthropic) {
+            Write-Host "  ℹ  OPENAI_API_KEY detected. Will auto-spawn LiteLLM Proxy on startup." -ForegroundColor Cyan
+            if (-not $hasLiteLLM) {
+                Write-Host "    ! LITELLM_MODEL is empty — set it (e.g. openai/qwen2.5-14b-instruct)" -ForegroundColor Yellow
+            }
+        }
+    }
 }
 
 # frontend/node_modules
