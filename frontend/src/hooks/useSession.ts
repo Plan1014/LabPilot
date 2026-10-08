@@ -115,13 +115,18 @@ interface RawHistoryMessage {
  * frontend's `Message[]` shape. Handles both Anthropic-style structured
  * content arrays and OpenAI-style plain-string content.
  *
- * - Anthropic 模式：assistant.content = [{type: "thinking"|"tool_use"|"text", ...}]
- *   → 把 thinking / text 块转成对应 SSEEvent；tool_use 块跳过，由紧随其后的
- *     role="tool" 消息补充为 tool_result 事件。
- * - OpenAI 模式：assistant.content = "string"
- *   → 字符串非空时包成单个 text 事件，避免 events=[] 渲染成空白色方框。
+ * 后端 session_manager.message_to_dict 现在把两种模式统一为
+ * `assistant.content` 始终是块数组，块类型包括：
+ *   - { type: "thinking", thinking: string, index: number }
+ *   - { type: "text",     text: string[], index: number }
+ *   - { type: "tool_use", id?: string, name: string, input: object, index: number }
  *
- * tool 消息始终被合并到紧邻的 assistant 消息的 events 中。
+ * - 数组形态：依次把 thinking / text / tool_use 块转成对应 SSEEvent
+ *   （tool_use 生成 tool_call 事件，与 streaming 路径一致）
+ * - 字符串形态：兼容老数据，包成单个 text 块（OpenAI 模式 reload 时
+ *   如果有 tool_use 块缺失 tool_call UI 的回退）
+ *
+ * tool 消息始终被合并到紧邻的 assistant 消息的 events 中作为 tool_result。
  */
 export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[] {
   const msgs: Message[] = [];
@@ -143,7 +148,7 @@ export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[
     } else if (msg.role === "assistant") {
       const events: SSEEvent[] = [];
 
-      // 1) 数组形态：Anthropic 模式（thinking / text 块；tool_use 块跳过）
+      // 1) 数组形态：Anthropic 与 OpenAI（统一后）都走这里
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
           if (!block || typeof block !== "object") continue;
@@ -160,11 +165,19 @@ export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[
               content: (block as { text?: string[] }).text || [],
               step: (block as { index?: number }).index ?? 0,
             });
+          } else if (block.type === "tool_use") {
+            // tool_use 块 → tool_call 事件（与 streaming 路径一致）。
+            // tool_result 由紧随其后的 role="tool" 消息补充。
+            events.push({
+              type: "tool_call" as const,
+              name: (block as { name?: string }).name || "tool",
+              input: (block as { input?: Record<string, unknown> }).input || {},
+              step: (block as { index?: number }).index ?? 0,
+            });
           }
-          // Note: tool_use 块不转换，由紧随其后的 tool 消息接管
         }
       } else if (typeof msg.content === "string" && msg.content.trim()) {
-        // 2) [OpenAI 兼容] 字符串形态：作为单一 text 块，避免空白色方框
+        // 2) [兼容老数据] 字符串形态：作为单一 text 块
         events.push({
           type: "text" as const,
           content: [msg.content],

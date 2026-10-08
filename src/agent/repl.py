@@ -13,53 +13,11 @@ from langgraph.graph import END
 
 from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
 from src.agent.llm import summarize_text
+from src.agent.session_manager import message_to_dict
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
 
 from src.agent.memory import memory_system
-
-# ==================== Message Serialization ====================
-
-def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> dict:
-    """Convert a message to a JSON-serializable dict.
-
-    Handles potential Pydantic models or other non-serializable objects.
-    """
-    if isinstance(msg, dict):
-        return msg
-    elif isinstance(msg, HumanMessage):
-        return {"role": "user", "content": msg.content}
-    elif isinstance(msg, AIMessage):
-        content = msg.content
-        out = {"role": "assistant"}
-        # OpenAI mode: tool_calls is on the AIMessage attribute, not in content.
-        if getattr(msg, "tool_calls", None):
-            out["tool_calls"] = [
-                {"id": tc.get("id") if isinstance(tc, dict) else tc.id,
-                 "name": tc.get("name") if isinstance(tc, dict) else tc.name,
-                 "args": tc.get("args") if isinstance(tc, dict) else tc.args}
-                for tc in msg.tool_calls
-            ]
-        if isinstance(content, str):
-            out["content"] = content
-            return out
-        # content is a list of blocks (Anthropic thinking, tool_use, text, etc.)
-        try:
-            json.dumps(content)
-            out["content"] = content
-        except (TypeError, ValueError):
-            out["content"] = str(content)
-        return out
-    elif isinstance(msg, ToolMessage):
-        return {
-            "role": "tool",
-            "name": msg.name,
-            "content": msg.content,
-            "tool_call_id": msg.tool_call_id,
-        }
-    else:
-        return {"role": "unknown", "content": str(msg)}
-
 
 # ==================== Loop Detection ====================
 

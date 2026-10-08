@@ -67,22 +67,88 @@ def _init_schema(conn: sqlite3.Connection):
 
 # ==================== Message Serialization ====================
 
+def _coerce_tool_args(args) -> dict:
+    """Best-effort coerce a tool call's `args` to a dict.
+
+    LangChain's `ToolCall` TypedDict declares `args: dict[str, Any]`, but older
+    adapters or streaming snapshots sometimes hand us a JSON-encoded string.
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {"_raw": parsed}
+        except Exception:
+            return {"_raw": args}
+    return {}
+
+
+def _coerce_tool_calls_attr(msg: AIMessage) -> list:
+    """Read tool_calls from AIMessage, accepting dict or object entries."""
+    raw = getattr(msg, "tool_calls", None) or []
+    out = []
+    for tc in raw:
+        if isinstance(tc, dict):
+            out.append(tc)
+        else:
+            out.append({
+                "id": getattr(tc, "id", None),
+                "name": getattr(tc, "name", ""),
+                "args": getattr(tc, "args", {}),
+            })
+    return out
+
+
 def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> dict:
-    """Convert a message to a JSON-serializable dict."""
+    """Convert a message to a JSON-serializable dict.
+
+    Single source of truth used by both the WebSocket persistence path
+    (`websocket_server.py`) and the REPL in-memory path (`repl.py`).
+
+    Assistant content is always normalized to a list of typed blocks, so the
+    frontend can iterate ``content[].type`` uniformly:
+
+    - Anthropic mode: ``msg.content`` is already a list of
+      ``thinking`` / ``tool_use`` / ``text`` blocks; pass through.
+    - OpenAI mode: ``msg.content`` is a plain string; wrap as a single ``text``
+      block. Tool calls live on the ``msg.tool_calls`` attribute — synthesize
+      ``tool_use`` blocks and append.
+    """
     if isinstance(msg, dict):
         return msg
     elif isinstance(msg, HumanMessage):
         return {"role": "user", "content": msg.content}
     elif isinstance(msg, AIMessage):
         content = msg.content
+        tool_calls = _coerce_tool_calls_attr(msg)
+
+        # 1) Normalize existing content to a block list.
         if isinstance(content, str):
-            return {"role": "assistant", "content": content}
+            blocks: list[dict] = []
+            if content.strip():
+                blocks.append({"type": "text", "text": [content], "index": 0})
+        elif isinstance(content, list):
+            blocks = [b for b in content if isinstance(b, dict)]
         else:
             try:
                 json.dumps(content)
-                return {"role": "assistant", "content": content}
+                blocks = [{"type": "_raw", "value": content, "index": 0}]
             except (TypeError, ValueError):
-                return {"role": "assistant", "content": str(content)}
+                blocks = [{"type": "text", "text": [str(content)], "index": 0}]
+
+        # 2) Synthesize tool_use blocks from msg.tool_calls (OpenAI mode).
+        #    Anthropic mode generally already has tool_use blocks inside content.
+        for i, tc in enumerate(tool_calls):
+            blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id"),
+                "name": tc.get("name", "") or "",
+                "input": _coerce_tool_args(tc.get("args")),
+                "index": i,
+            })
+
+        return {"role": "assistant", "content": blocks}
     elif isinstance(msg, ToolMessage):
         return {
             "role": "tool",
