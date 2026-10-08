@@ -86,7 +86,13 @@ def parse_content_blocks(content: any) -> tuple:
             elif block_type == "tool_use":
                 tool_use_blocks.append(block)
             elif block_type == "text":
-                text_blocks.append(block.get("text", ""))
+                # `text` may be a string (langchain_anthropic convention) or
+                # a list of strings (some OpenAI-mode captures). Flatten both.
+                txt = block.get("text", "")
+                if isinstance(txt, list):
+                    text_blocks.extend(t for t in txt if isinstance(t, str))
+                elif txt:
+                    text_blocks.append(str(txt))
             else:
                 text_blocks.append(str(block))
         elif hasattr(block, "type"):
@@ -96,7 +102,12 @@ def parse_content_blocks(content: any) -> tuple:
             elif block_type == "tool_use":
                 tool_use_blocks.append(block.model_dump() if hasattr(block, "model_dump") else {})
             elif block_type == "text":
-                text_blocks.append(getattr(block, "text", ""))
+                # Same as the dict branch: handle text as string or list[str].
+                txt = getattr(block, "text", "")
+                if isinstance(txt, list):
+                    text_blocks.extend(t for t in txt if isinstance(t, str))
+                elif txt:
+                    text_blocks.append(str(txt))
             else:
                 text_blocks.append(str(block))
         else:
@@ -234,6 +245,7 @@ def generate(state: InterleavedState) -> dict:
     # Anthropic mode: tool_use blocks live inside response.content (handled by parse_content_blocks).
     openai_tool_calls = getattr(response, "tool_calls", None) or []
     if openai_tool_calls:
+        # Authoritative source: response.tool_calls (OpenAI mode contract).
         tool_use_blocks = []
         for tc in openai_tool_calls:
             tc_id = tc.get("id") if isinstance(tc, dict) else tc.id
@@ -246,9 +258,16 @@ def generate(state: InterleavedState) -> dict:
                 except Exception:
                     tc_args = {}
             tool_use_blocks.append({"id": tc_id, "name": tc_name, "input": tc_args or {}})
+        # If upstream returned thinking (e.g. Qwen3 / DeepSeek-R1 with
+        # extra_body={"enable_thinking": True}), ChatOpenAIWithThinking injects
+        # `{"type":"thinking"}` blocks into response.content as a list. We
+        # extract them here while still trusting tool_calls above.
         content = response.content
-        text_blocks = [content] if isinstance(content, str) and content else []
-        thinking_blocks = []
+        if isinstance(content, list):
+            thinking_blocks, _content_tool_use_ignored, text_blocks = parse_content_blocks(content)
+        else:
+            text_blocks = [content] if isinstance(content, str) and content else []
+            thinking_blocks = []
     else:
         # Parse content blocks
         content = response.content

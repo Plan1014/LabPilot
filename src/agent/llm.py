@@ -28,8 +28,8 @@ def _openai_mode() -> bool:
     return bool(openai_key and _truthy(os.getenv("LITELLM_AUTOSTART")))
 
 
-def _openai_config() -> tuple[str, str | None, str]:
-    """Return (api_key, api_base, model) for OpenAI mode."""
+def _openai_config() -> tuple[str, str | None, str, bool]:
+    """Return (api_key, api_base, model, enable_thinking) for OpenAI mode."""
     api_base = os.getenv("LITELLM_MODEL_API_BASE", "").strip() or None
     placeholders = {"", "sk-...", "sk-xxxx", "your_api_key_here", "sk-placeholder"}
     explicit_key = os.getenv("LITELLM_MODEL_API_KEY", "").strip()
@@ -47,7 +47,8 @@ def _openai_config() -> tuple[str, str | None, str]:
         if model.startswith(prefix):
             model = model[len(prefix):]
             break
-    return api_key, api_base, model
+    enable_thinking = _truthy(os.getenv("OPENAI_ENABLE_THINKING"))
+    return api_key, api_base, model, enable_thinking
 
 
 def summarize_text(prompt: str, max_tokens: int = 2000) -> str:
@@ -83,8 +84,103 @@ def summarize_text(prompt: str, max_tokens: int = 2000) -> str:
 
 if _openai_mode():
     from langchain_openai import ChatOpenAI
-    api_key, api_base, model = _openai_config()
-    llm = ChatOpenAI(api_key=api_key, base_url=api_base, model=model)
+    from langchain_core.outputs import ChatResult
+
+    class ChatOpenAIWithThinking(ChatOpenAI):
+        """ChatOpenAI that surfaces upstream `reasoning_content` as a thinking block.
+
+        langchain_openai drops the non-standard `reasoning_content` field returned
+        by Qwen3 / DeepSeek-R1 servers when ``extra_body={"enable_thinking": True}``
+        is set (its module docstring explicitly warns about this). We intercept
+        at the result-assembly step and inject the reasoning into the resulting
+        ``AIMessage.content`` as a ``{"type": "thinking"}`` content block —
+        mirroring langchain_anthropic's pattern — so the existing
+        ``parse_content_blocks`` / ``print_thinking`` / ``message_to_dict`` chain
+        can consume it uniformly.
+
+        Only the non-streaming path is patched; this codebase calls the LLM via
+        ``invoke()`` (see ``graph_thinking.py``) and streams thinking to the UI
+        via ``print_thinking`` SSE events, not via LLM stream chunks.
+        """
+
+        capture_thinking: bool = True
+
+        def _create_chat_result(self, response, generation_info=None) -> ChatResult:
+            result = super()._create_chat_result(response, generation_info=generation_info)
+            if not self.capture_thinking:
+                return result
+            try:
+                choices = getattr(response, "choices", None) or []
+            except Exception:
+                return result
+            # `result.generations` is `list[ChatGeneration]` (flat). Pair each
+            # generation with its source choice (by index) for reasoning lookup.
+            for idx, gen in enumerate(result.generations):
+                if idx >= len(choices):
+                    break
+                reasoning = self._extract_reasoning(choices[idx])
+                if not reasoning:
+                    continue
+                new_msg = self._inject_thinking(gen.message, reasoning)
+                if new_msg is not None:
+                    gen.message = new_msg
+            return result
+
+        @staticmethod
+        def _extract_reasoning(choice) -> str | None:
+            """Read `reasoning_content` from a Pydantic Choice (with extra='allow')."""
+            try:
+                msg = getattr(choice, "message", None)
+                if msg is None:
+                    return None
+                # 1) Direct attribute (Pydantic exposes extras this way)
+                reasoning = getattr(msg, "reasoning_content", None)
+                if reasoning:
+                    return reasoning
+                # 2) Fallback via model_extra dict
+                extra = getattr(msg, "model_extra", None)
+                if isinstance(extra, dict):
+                    reasoning = extra.get("reasoning_content")
+                    if reasoning:
+                        return reasoning
+                # 3) Last resort: model_dump
+                try:
+                    dumped = msg.model_dump()
+                    return dumped.get("reasoning_content")
+                except Exception:
+                    return None
+            except Exception:
+                return None
+
+        @staticmethod
+        def _inject_thinking(message, reasoning: str):
+            """Return a copy of `message` with reasoning injected as a thinking block."""
+            if not reasoning:
+                return None
+            content = getattr(message, "content", None)
+            if isinstance(content, str):
+                new_content = [{"type": "thinking", "thinking": reasoning, "index": 0}]
+                if content:
+                    new_content.append({"type": "text", "text": [content], "index": 1})
+            elif isinstance(content, list):
+                new_content = list(content) + [
+                    {"type": "thinking", "thinking": reasoning, "index": 0}
+                ]
+            else:
+                new_content = [{"type": "thinking", "thinking": reasoning, "index": 0}]
+            try:
+                return message.model_copy(update={"content": new_content})
+            except Exception:
+                return None
+
+    api_key, api_base, model, enable_thinking = _openai_config()
+    llm = ChatOpenAIWithThinking(
+        api_key=api_key,
+        base_url=api_base,
+        model=model,
+        extra_body={"enable_thinking": True} if enable_thinking else None,
+        capture_thinking=enable_thinking,
+    )
     # Kept for symmetry with Anthropic mode; legacy callers should use
     # summarize_text() instead of poking client.messages directly.
     client = None
