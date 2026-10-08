@@ -5,8 +5,8 @@ import HistoryModal from "./HistoryModal";
 import MemoryModal from "./MemoryModal";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
-import { getStoredSessionId, persistSessionId } from "../hooks/useSession";
-import type { Message as MessageType, SessionMeta, SSEEvent } from "../types/events";
+import { getStoredSessionId, persistSessionId, parseHistoryMessages } from "../hooks/useSession";
+import type { Message as MessageType, SessionMeta } from "../types/events";
 import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
 const API_BASE = "http://127.0.0.1:8000";
@@ -35,67 +35,7 @@ export default function ChatWindow() {
             return res.json();
           })
           .then((data) => {
-            // Merge tool messages with their preceding assistant message
-            const msgs: MessageType[] = [];
-            const messages = data.messages;
-
-            for (let i = 0; i < messages.length; i++) {
-              const msg = messages[i];
-
-              if (msg.role === "user") {
-                const isSystemPrompt = typeof msg.content === "string" && msg.content.startsWith("[WebSocket]");
-                msgs.push({
-                  id: crypto.randomUUID(),
-                  role: "user" as const,
-                  content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
-                  events: [],
-                  isComplete: true,
-                  isSystemPrompt,
-                });
-              } else if (msg.role === "assistant") {
-                const events: SSEEvent[] = [];
-                const contentArray = Array.isArray(msg.content) ? msg.content : [];
-
-                for (const block of contentArray) {
-                  if (!block || typeof block !== "object") continue;
-
-                  if (block.type === "thinking") {
-                    events.push({
-                      type: "thinking" as const,
-                      content: block.thinking || "",
-                      step: block.index ?? 0,
-                    });
-                  } else if (block.type === "text") {
-                    events.push({
-                      type: "text" as const,
-                      content: block.text || [],
-                      step: block.index ?? 0,
-                    });
-                  }
-                }
-
-                // Check if next messages are tool results
-                let j = i + 1;
-                while (j < messages.length && messages[j].role === "tool") {
-                  events.push({
-                    type: "tool_result" as const,
-                    result: messages[j].content || "",
-                    step: events.length > 0 ? (events[events.length - 1].step ?? 0) : 0,
-                  });
-                  j++;
-                }
-
-                msgs.push({
-                  id: crypto.randomUUID(),
-                  role: "assistant" as const,
-                  content: "",
-                  events,
-                  isComplete: true,
-                });
-                i = j - 1;
-              }
-            }
-            setMessages(msgs);
+            setMessages(parseHistoryMessages(data.messages));
           })
           .catch(() => {
             // Session not found in Redis, clear storage
@@ -282,70 +222,7 @@ export default function ChatWindow() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       persistSessionId(id);
-      // Merge tool messages with their preceding assistant message
-      const msgs: MessageType[] = [];
-      const messages = data.messages;
-
-      for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-
-        if (msg.role === "user") {
-          const isSystemPrompt = typeof msg.content === "string" && msg.content.startsWith("[WebSocket]");
-          msgs.push({
-            id: crypto.randomUUID(),
-            role: "user" as const,
-            content: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
-            events: [],
-            isComplete: true,
-            isSystemPrompt,
-          });
-        } else if (msg.role === "assistant") {
-          const events: SSEEvent[] = [];
-          const contentArray = Array.isArray(msg.content) ? msg.content : [];
-
-          for (const block of contentArray) {
-            if (!block || typeof block !== "object") continue;
-
-            if (block.type === "thinking") {
-              events.push({
-                type: "thinking" as const,
-                content: block.thinking || "",
-                step: block.index ?? 0,
-              });
-            } else if (block.type === "text") {
-              events.push({
-                type: "text" as const,
-                content: block.text || [],
-                step: block.index ?? 0,
-              });
-            }
-            // Note: tool_use blocks are NOT converted here
-            // Actual tool results come from following "tool" messages
-          }
-
-          // Check if next messages are tool results
-          let j = i + 1;
-          while (j < messages.length && messages[j].role === "tool") {
-            events.push({
-              type: "tool_result" as const,
-              result: messages[j].content || "",
-              step: events.length > 0 ? (events[events.length - 1].step ?? 0) : 0,
-            });
-            j++;
-          }
-
-          msgs.push({
-            id: crypto.randomUUID(),
-            role: "assistant" as const,
-            content: "",
-            events,
-            isComplete: true,
-          });
-          i = j - 1; // Skip processed tool messages
-        }
-        // Skip tool messages (already merged)
-      }
-      setMessages(msgs);
+      setMessages(parseHistoryMessages(data.messages));
       setShowHistory(false);
     },
     []
