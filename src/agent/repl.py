@@ -13,7 +13,7 @@ from langgraph.graph import END
 
 from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
 from src.agent.llm import summarize_text
-from src.agent.session_manager import message_to_dict
+from src.agent.session_manager import message_to_dict, dict_to_ai_message
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
 
@@ -215,12 +215,7 @@ def main() -> None:
                 if msg.get("role") == "user":
                     langchain_messages.append(HumanMessage(content=msg.get("content", "")))
                 elif msg.get("role") == "assistant":
-                    # 构建带 content 的 AIMessage
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        langchain_messages.append(AIMessage(content=content))
-                    else:
-                        langchain_messages.append(AIMessage(content=content))
+                    langchain_messages.append(dict_to_ai_message(msg))
                 elif msg.get("role") == "tool":
                     langchain_messages.append(ToolMessage(
                         content=msg.get("content", ""),

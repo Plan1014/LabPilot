@@ -160,6 +160,56 @@ def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> d
         return {"role": "unknown", "content": str(msg)}
 
 
+def dict_to_ai_message(msg: dict) -> AIMessage:
+    """Reconstruct an AIMessage from a persisted dict for the next LLM call.
+
+    Inverse of :func:`message_to_dict`. The persisted shape is a content block
+    list (e.g. ``[{"type": "text", ...}, {"type": "tool_use", ...}]``), but
+    many OpenAI-compatible upstreams only accept ``content: str`` — they
+    reject list-typed content with a 500 ``ValidationError``.
+
+    This helper flattens the list back into the standard LangChain shape:
+    - text blocks → joined into ``content`` (plain string)
+    - tool_use blocks → ``tool_calls`` attribute (OpenAI-compatible dicts)
+    - thinking / other non-text blocks → dropped (LLM doesn't need them)
+
+    Plain-string content (old data) passes through unchanged.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return AIMessage(content=content)
+
+    # content is a list of blocks — flatten.
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in (content or []):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            txt = block.get("text", "")
+            if isinstance(txt, list):
+                txt = "".join(str(x) for x in txt)
+            if txt:
+                text_parts.append(txt)
+        elif btype == "tool_use":
+            tc_args = block.get("input") or {}
+            if not isinstance(tc_args, dict):
+                tc_args = {"_raw": tc_args}
+            tool_calls.append({
+                "id": block.get("id"),
+                "name": block.get("name", "") or "",
+                "args": tc_args,
+                "type": "tool_call",
+            })
+        # thinking / _raw blocks are dropped — not needed for next LLM turn
+
+    ai = AIMessage(content="\n".join(text_parts) if text_parts else "")
+    if tool_calls:
+        ai.tool_calls = tool_calls
+    return ai
+
+
 # ==================== TTL Check ====================
 
 def _is_expired(session_id: str) -> bool:

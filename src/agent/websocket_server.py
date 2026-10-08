@@ -297,7 +297,7 @@ def create_session_router():
     from src.agent.session_manager import (
         create_session, get_session_meta, get_session_history,
         append_to_session, update_session_title, delete_session,
-        list_sessions, archive_session,
+        list_sessions, archive_session, dict_to_ai_message,
     )
 
     router = APIRouter()
@@ -435,7 +435,7 @@ def create_session_router():
                     if role == "user":
                         langchain_messages.append(HumanMessage(content=content))
                     elif role == "assistant":
-                        langchain_messages.append(AIMessage(content=content))
+                        langchain_messages.append(dict_to_ai_message(msg))
                     elif role == "tool":
                         langchain_messages.append(ToolMessage(
                             content=content,
