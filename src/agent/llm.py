@@ -92,16 +92,21 @@ if _openai_mode():
 
         langchain_openai drops the non-standard `reasoning_content` field returned
         by Qwen3 / DeepSeek-R1 servers when ``extra_body={"enable_thinking": True}``
-        is set (its module docstring explicitly warns about this). We intercept
-        at the result-assembly step and inject the reasoning into the resulting
-        ``AIMessage.content`` as a ``{"type": "thinking"}`` content block —
-        mirroring langchain_anthropic's pattern — so the existing
+        is set. We intercept at both result-assembly paths:
+
+        - **Non-streaming** (``_create_chat_result``): read reasoning off the
+          full ``ChatCompletion`` and inject into the resulting ``AIMessage.content``.
+        - **Streaming** (``_stream`` / ``_astream``): accumulate reasoning from
+          raw ``delta.reasoning_content`` across chunks, then inject into the
+          last chunk's message. Required because ``graph.astream_events`` forces
+          streaming via a v1 callback handler (``_should_stream``), bypassing
+          the non-streaming path entirely.
+
+        In both cases the reasoning is materialized as a
+        ``{"type": "thinking", "thinking": "...", "index": 0}`` content block —
+        mirroring langchain_anthropic — so the existing
         ``parse_content_blocks`` / ``print_thinking`` / ``message_to_dict`` chain
         can consume it uniformly.
-
-        Only the non-streaming path is patched; this codebase calls the LLM via
-        ``invoke()`` (see ``graph_thinking.py``) and streams thinking to the UI
-        via ``print_thinking`` SSE events, not via LLM stream chunks.
         """
 
         capture_thinking: bool = True
@@ -130,7 +135,7 @@ if _openai_mode():
         def _stream(self, *args, **kwargs):
             """Override to capture reasoning_content from raw OpenAI SDK stream.
 
-            `graph.astream_events` forces streaming via a v1 callback handler
+            ``graph.astream_events`` forces streaming via a v1 callback handler
             (see ``ChatOpenAI._should_stream``), bypassing ``_create_chat_result``
             entirely. LangChain's ``_convert_delta_to_message_chunk`` drops the
             non-standard ``reasoning_content`` field — we must read it from the
@@ -151,162 +156,76 @@ if _openai_mode():
             async for chunk in self._astream_with_thinking(*args, **kwargs):
                 yield chunk
 
+        @staticmethod
+        def _extract_reasoning_from_chunk(raw_chunk) -> str:
+            """Pull `reasoning_content` from a raw OpenAI SDK chunk's delta."""
+            for ch in getattr(raw_chunk, "choices", None) or []:
+                rc = getattr(getattr(ch, "delta", None), "reasoning_content", None)
+                if rc:
+                    return rc
+            return ""
+
         def _stream_with_thinking(self, messages, stop=None, run_manager=None, **kwargs):
-            """Yield streaming chunks; on the last chunk, inject reasoning as a
-            thinking block in the final accumulated message."""
+            """Sync streaming that intercepts reasoning_content from raw deltas."""
             self._ensure_sync_client_available()
             kwargs["stream"] = True
             payload = self._get_request_payload(messages, stop=stop, **kwargs)
-            default_chunk_class: type = AIMessageChunk
-            base_generation_info: dict = {}
-
-            # Collect chunks + accumulate reasoning from raw deltas
-            collected: list[ChatGenerationChunk] = []
-            reasoning_buf: list[str] = []
-
-            try:
-                if "response_format" in payload:
-                    payload.pop("stream")
-                    response_stream = self.root_client.beta.chat.completions.stream(**payload)
-                    context_manager = response_stream
-                else:
-                    if self.include_response_headers or self._uses_gateway:
-                        raw_response = self.client.with_raw_response.create(**payload)
-                        response = raw_response.parse()
-                        if self.include_response_headers:
-                            base_generation_info = {"headers": dict(raw_response.headers)}
-                        _add_gateway_metadata(base_generation_info, raw_response)
-                    else:
-                        response = self.client.create(**payload)
-                    context_manager = response
-                with context_manager as response:
-                    is_first_chunk = True
-                    for raw_chunk in response:
-                        # Pull reasoning from the raw delta (LangChain drops it
-                        # in _convert_delta_to_message_chunk).
-                        try:
-                            for ch in (raw_chunk.choices or []):
-                                rc = getattr(getattr(ch, "delta", None), "reasoning_content", None)
-                                if rc:
-                                    reasoning_buf.append(rc)
-                        except Exception:
-                            pass
-
-                        if not isinstance(raw_chunk, dict):
-                            raw_chunk = raw_chunk.model_dump()
-                        generation_chunk = self._convert_chunk_to_generation_chunk(
-                            raw_chunk,
-                            default_chunk_class,
-                            base_generation_info if is_first_chunk else {},
-                        )
-                        if generation_chunk is None:
-                            continue
-                        default_chunk_class = generation_chunk.message.__class__
-                        collected.append(generation_chunk)
-                        is_first_chunk = False
-            except openai.BadRequestError as e:
-                _handle_openai_bad_request(e)
-            except openai.APIError as e:
-                _handle_openai_api_error(e)
-            except Exception:
-                # Fall back to plain streaming if anything goes wrong in our
-                # reasoning interception. The user still gets a response.
-                if collected:
-                    for c in collected:
-                        yield c
-                raise
-
-            # Inject thinking block into the last chunk's message BEFORE yielding,
-            # so downstream consumers (`generate_from_stream`, `on_chat_model_end`)
-            # see the assembled content + thinking in the final accumulated message.
-            full_reasoning = "".join(reasoning_buf)
-            if full_reasoning and collected:
-                last = collected[-1]
-                injected = self._inject_thinking(last.message, full_reasoning)
-                if injected is not None:
-                    new_chunk = ChatGenerationChunk(
-                        message=injected,
-                        generation_info=last.generation_info,
-                    )
-                    collected[-1] = new_chunk
-
-            for chunk in collected:
-                if run_manager:
-                    logprobs = (chunk.generation_info or {}).get("logprobs")
-                    run_manager.on_llm_new_token(
-                        chunk.text, chunk=chunk, logprobs=logprobs
-                    )
-                yield chunk
+            collected, reasoning = self._collect_thinking_stream(
+                self.client.create(**payload)
+            )
+            yield from self._emit_with_thinking(collected, reasoning, run_manager)
 
         async def _astream_with_thinking(self, messages, stop=None, run_manager=None, **kwargs):
             """Async mirror of :meth:`_stream_with_thinking`."""
             kwargs["stream"] = True
             payload = self._get_request_payload(messages, stop=stop, **kwargs)
-            default_chunk_class: type = AIMessageChunk
-            base_generation_info: dict = {}
+            stream = await self.async_client.create(**payload)
+            collected, reasoning = await self._acollect_thinking_stream(stream)
+            for chunk in self._emit_with_thinking(collected, reasoning, run_manager):
+                yield chunk
 
+        def _collect_thinking_stream(self, response):
+            """Drive a sync OpenAI SDK stream; return (chunks, reasoning_str)."""
             collected: list[ChatGenerationChunk] = []
             reasoning_buf: list[str] = []
+            default_chunk_class: type = AIMessageChunk
+            for raw_chunk in response:
+                rc = self._extract_reasoning_from_chunk(raw_chunk)
+                if rc:
+                    reasoning_buf.append(rc)
+                dumped = raw_chunk if isinstance(raw_chunk, dict) else raw_chunk.model_dump()
+                gc = self._convert_chunk_to_generation_chunk(dumped, default_chunk_class, {})
+                if gc is not None:
+                    default_chunk_class = gc.message.__class__
+                    collected.append(gc)
+            return collected, "".join(reasoning_buf)
 
-            try:
-                if "response_format" in payload:
-                    payload.pop("stream")
-                    response_stream = self.root_async_client.beta.chat.completions.stream(**payload)
-                    context_manager = response_stream
-                else:
-                    if self.include_response_headers or self._uses_gateway:
-                        raw_response = await self.async_client.with_raw_response.create(**payload)
-                        response = raw_response.parse()
-                        if self.include_response_headers:
-                            base_generation_info = {"headers": dict(raw_response.headers)}
-                        _add_gateway_metadata(base_generation_info, raw_response)
-                    else:
-                        response = await self.async_client.create(**payload)
-                    context_manager = response
-                async with context_manager as response:
-                    is_first_chunk = True
-                    async for raw_chunk in response:
-                        try:
-                            for ch in (raw_chunk.choices or []):
-                                rc = getattr(getattr(ch, "delta", None), "reasoning_content", None)
-                                if rc:
-                                    reasoning_buf.append(rc)
-                        except Exception:
-                            pass
+        async def _acollect_thinking_stream(self, response):
+            """Async mirror of :meth:`_collect_thinking_stream`."""
+            collected: list[ChatGenerationChunk] = []
+            reasoning_buf: list[str] = []
+            default_chunk_class: type = AIMessageChunk
+            async for raw_chunk in response:
+                rc = self._extract_reasoning_from_chunk(raw_chunk)
+                if rc:
+                    reasoning_buf.append(rc)
+                dumped = raw_chunk if isinstance(raw_chunk, dict) else raw_chunk.model_dump()
+                gc = self._convert_chunk_to_generation_chunk(dumped, default_chunk_class, {})
+                if gc is not None:
+                    default_chunk_class = gc.message.__class__
+                    collected.append(gc)
+            return collected, "".join(reasoning_buf)
 
-                        if not isinstance(raw_chunk, dict):
-                            raw_chunk = raw_chunk.model_dump()
-                        generation_chunk = self._convert_chunk_to_generation_chunk(
-                            raw_chunk,
-                            default_chunk_class,
-                            base_generation_info if is_first_chunk else {},
-                        )
-                        if generation_chunk is None:
-                            continue
-                        default_chunk_class = generation_chunk.message.__class__
-                        collected.append(generation_chunk)
-                        is_first_chunk = False
-            except openai.BadRequestError as e:
-                _handle_openai_bad_request(e)
-            except openai.APIError as e:
-                _handle_openai_api_error(e)
-            except Exception:
-                if collected:
-                    for c in collected:
-                        yield c
-                raise
-
-            full_reasoning = "".join(reasoning_buf)
+        def _emit_with_thinking(self, collected, full_reasoning, run_manager):
+            """Yield collected chunks; inject thinking into the last chunk's message."""
             if full_reasoning and collected:
                 last = collected[-1]
                 injected = self._inject_thinking(last.message, full_reasoning)
                 if injected is not None:
-                    new_chunk = ChatGenerationChunk(
+                    collected[-1] = ChatGenerationChunk(
                         message=injected,
                         generation_info=last.generation_info,
                     )
-                    collected[-1] = new_chunk
-
             for chunk in collected:
                 if run_manager:
                     logprobs = (chunk.generation_info or {}).get("logprobs")
