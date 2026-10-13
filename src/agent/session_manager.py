@@ -122,6 +122,7 @@ def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> d
     elif isinstance(msg, AIMessage):
         content = msg.content
         tool_calls = _coerce_tool_calls_attr(msg)
+        additional_kwargs = getattr(msg, "additional_kwargs", None) or {}
 
         # 1) Normalize existing content to a block list.
         if isinstance(content, str):
@@ -137,16 +138,28 @@ def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> d
             except (TypeError, ValueError):
                 blocks = [{"type": "text", "text": [str(content)], "index": 0}]
 
+        # 1.5) Synthesize a thinking block from additional_kwargs.thinking.
+        #      In OpenAI mode the wrapper parks reasoning in additional_kwargs
+        #      (NOT in the content list — content stays a string so the next
+        #      LLM call doesn't get rejected by upstream). The persisted block
+        #      list is what the frontend renders, so we re-surface thinking
+        #      here for display parity with Anthropic mode.
+        thinking = additional_kwargs.get("thinking")
+        if thinking and not any(b.get("type") == "thinking" for b in blocks):
+            blocks.insert(0, {"type": "thinking", "thinking": thinking, "index": 0})
+
         # 2) Synthesize tool_use blocks from msg.tool_calls (OpenAI mode).
         #    Anthropic mode generally already has tool_use blocks inside content.
-        for i, tc in enumerate(tool_calls):
+        next_index = max((b.get("index", -1) for b in blocks), default=-1) + 1
+        for tc in tool_calls:
             blocks.append({
                 "type": "tool_use",
                 "id": tc.get("id"),
                 "name": tc.get("name", "") or "",
                 "input": _coerce_tool_args(tc.get("args")),
-                "index": i,
+                "index": next_index,
             })
+            next_index += 1
 
         return {"role": "assistant", "content": blocks}
     elif isinstance(msg, ToolMessage):
@@ -182,6 +195,7 @@ def dict_to_ai_message(msg: dict) -> AIMessage:
     # content is a list of blocks — flatten.
     text_parts: list[str] = []
     tool_calls: list[dict] = []
+    thinking_parts: list[str] = []
     for block in (content or []):
         if not isinstance(block, dict):
             continue
@@ -202,11 +216,24 @@ def dict_to_ai_message(msg: dict) -> AIMessage:
                 "args": tc_args,
                 "type": "tool_call",
             })
-        # thinking / _raw blocks are dropped — not needed for next LLM turn
+        elif btype == "thinking":
+            # Persisted thinking block (originally lifted from
+            # additional_kwargs.thinking by message_to_dict) — restore it
+            # so parse_content_blocks can surface it after a session reload.
+            t = block.get("thinking", "")
+            if t:
+                thinking_parts.append(t)
+        # _raw blocks are dropped — not needed for next LLM turn
 
     ai = AIMessage(content="\n".join(text_parts) if text_parts else "")
     if tool_calls:
         ai.tool_calls = tool_calls
+    if thinking_parts:
+        # Concatenate in case there are multiple thinking blocks (defensive —
+        # message_to_dict emits at most one)
+        existing_kwargs = dict(getattr(ai, "additional_kwargs", None) or {})
+        existing_kwargs["thinking"] = "\n".join(thinking_parts)
+        ai.additional_kwargs = existing_kwargs
     return ai
 
 

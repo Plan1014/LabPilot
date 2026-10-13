@@ -61,17 +61,33 @@ class InterleavedState:
 
 # ==================== Content Block Parsing ====================
 
-def parse_content_blocks(content: any) -> tuple:
-    """Parse AIMessage.content into thinking, tool_use, and text blocks."""
+def parse_content_blocks(content: any, additional_kwargs: dict | None = None) -> tuple:
+    """Parse AIMessage.content into thinking, tool_use, and text blocks.
+
+    Optional ``additional_kwargs`` is consulted for a ``"thinking"`` key — the
+    OpenAI-mode wrapper parks reasoning there (instead of polluting
+    ``content`` with langchain_anthropic-style blocks, which the OpenAI
+    upstream rejects). Anthropic mode leaves ``additional_kwargs`` empty and
+    the thinking blocks are read from ``content`` directly.
+    """
     thinking_blocks = []
     tool_use_blocks = []
     text_blocks = []
+
+    # OpenAI mode: reasoning was injected into additional_kwargs.thinking by
+    # ChatOpenAIWithThinking._inject_thinking. Surface it as a thinking block
+    # so the SSE stream and persistence layer see a uniform shape.
+    if additional_kwargs:
+        t = additional_kwargs.get("thinking")
+        if t:
+            thinking_blocks.append(t)
 
     if content is None:
         return thinking_blocks, tool_use_blocks, text_blocks
 
     if isinstance(content, str):
-        text_blocks.append(content)
+        if content:
+            text_blocks.append(content)
         return thinking_blocks, tool_use_blocks, text_blocks
 
     if not isinstance(content, list):
@@ -244,6 +260,7 @@ def generate(state: InterleavedState) -> dict:
     # OpenAI mode: tool_calls is an attribute on AIMessage, not a content block.
     # Anthropic mode: tool_use blocks live inside response.content (handled by parse_content_blocks).
     openai_tool_calls = getattr(response, "tool_calls", None) or []
+    response_kwargs = getattr(response, "additional_kwargs", None) or {}
     if openai_tool_calls:
         # Authoritative source: response.tool_calls (OpenAI mode contract).
         tool_use_blocks = []
@@ -258,20 +275,18 @@ def generate(state: InterleavedState) -> dict:
                 except Exception:
                     tc_args = {}
             tool_use_blocks.append({"id": tc_id, "name": tc_name, "input": tc_args or {}})
-        # If upstream returned thinking (e.g. Qwen3 / DeepSeek-R1 with
-        # extra_body={"enable_thinking": True}), ChatOpenAIWithThinking injects
-        # `{"type":"thinking"}` blocks into response.content as a list. We
-        # extract them here while still trusting tool_calls above.
-        content = response.content
-        if isinstance(content, list):
-            thinking_blocks, _content_tool_use_ignored, text_blocks = parse_content_blocks(content)
-        else:
-            text_blocks = [content] if isinstance(content, str) and content else []
-            thinking_blocks = []
+        # OpenAI mode: response.content is a plain string (post-fix), with
+        # reasoning parked in additional_kwargs.thinking. Anthropic mode
+        # (langchain_anthropic) returns content as a list of blocks. parse_content_blocks
+        # handles both shapes.
+        thinking_blocks, _content_tool_use_ignored, text_blocks = parse_content_blocks(
+            response.content, response_kwargs
+        )
     else:
-        # Parse content blocks
-        content = response.content
-        thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(content)
+        # Parse content blocks (Anthropic mode primary path)
+        thinking_blocks, tool_use_blocks, text_blocks = parse_content_blocks(
+            response.content, response_kwargs
+        )
 
     # Print thinking immediately
     for thinking in thinking_blocks:

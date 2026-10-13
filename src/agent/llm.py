@@ -262,22 +262,33 @@ if _openai_mode():
 
         @staticmethod
         def _inject_thinking(message, reasoning: str):
-            """Return a copy of `message` with reasoning injected as a thinking block."""
+            """Return a copy of `message` with reasoning attached as additional_kwargs.
+
+            The previous implementation wrapped ``content`` in a list of
+            ``{"type":"thinking",...}`` blocks to mirror langchain_anthropic —
+            but the OpenAI upstream (MiniMax proxy used in LabPilot) only
+            accepts ``content: str`` for assistant messages. A list-of-blocks
+            content was silently dropped by langchain_openai's
+            ``_convert_message_to_dict`` (text block kept, thinking lost) and
+            the surviving ``{"type":"text","text":[...]}`` shape was rejected
+            by the proxy with ``MMGPT3Item.text Input should be a valid
+            string``, breaking the next turn of conversation.
+
+            Keeping ``content`` as a string and parking the reasoning in
+            ``additional_kwargs["thinking"]`` is safe because:
+              - langchain_openai drops ``additional_kwargs`` when serializing
+                for upstream, so reasoning never leaks into the request.
+              - downstream consumers (``parse_content_blocks`` /
+                ``message_to_dict``) can read from ``additional_kwargs`` to
+                surface the reasoning for the frontend without breaking the
+                upstream protocol.
+            """
             if not reasoning:
                 return None
-            content = getattr(message, "content", None)
-            if isinstance(content, str):
-                new_content = [{"type": "thinking", "thinking": reasoning, "index": 0}]
-                if content:
-                    new_content.append({"type": "text", "text": [content], "index": 1})
-            elif isinstance(content, list):
-                new_content = list(content) + [
-                    {"type": "thinking", "thinking": reasoning, "index": 0}
-                ]
-            else:
-                new_content = [{"type": "thinking", "thinking": reasoning, "index": 0}]
+            new_kwargs = dict(getattr(message, "additional_kwargs", None) or {})
+            new_kwargs["thinking"] = reasoning
             try:
-                return message.model_copy(update={"content": new_content})
+                return message.model_copy(update={"additional_kwargs": new_kwargs})
             except Exception:
                 return None
 
