@@ -29,6 +29,96 @@ from src.agent.memory import process_pending_self, PendingCache
 from src.agent.memory.constants import PENDING_THRESHOLD
 
 
+def _ensure_unique_tool_use_ids(messages: list) -> None:
+    """保证整个 messages 列表里所有 tool_use id 跨 message 唯一.
+
+    langchain_anthropic 的去重是 per-message (chat_models.py:774-797):
+    同一个 AIMessage 的 content 和 tool_calls 内部去重, 但 **不会跨 message 去重**.
+    如果两条不同的 AIMessage 共享同一 tool_use id, 序列化给上游 Anthropic
+    API 时会收到 400 `duplicate tool_call id`.
+
+    触发场景 (按概率排序):
+    1. 模型罕见地给两个不同 tool_use 分配了同一 id
+    2. OpenAI/Anthropic 模式混用时, 一边返回的 `call_xxx` id 和另一边返回的
+       `toolu_xxx` 都被 normalize 后巧合冲突
+    3. session reload 路径 (message_to_dict 未去重) 把同 id 写入多块
+
+    关键不变量: langchain_anthropic 在最终输出里, 每个 AIMessage 最多贡献
+    *一个* tool_use 块 per id (content 命中 tool_calls 时替换, 不重复).
+    所以跨 message 去重的判据 = "本 message 的 (content tool_use ids ∪ tool_calls
+    ids) 与之前已加入 seen 的 ids 是否有交集".
+
+    策略: 先 in-place 修本 message 的 content (per-msg 内去重, 重复的改名);
+    再修本 message 的 tool_calls (不去重, 允许 content+tool_calls 共存 ——
+    langchain 会内部消解); 最后把本 message 实际产出的 id 集合 (content 的
+    最终 id ∪ tool_calls 的最终 id) 加入 seen, 供后续 message 比对.
+
+    rename 时同步更新紧随其后的 ToolMessage.tool_call_id 以及 Anthropic 风格
+    content 里的 tool_result.tool_use_id, 保持 tool_use/tool_result 配对.
+    """
+    seen: set = set()
+    pending_renames: dict = {}  # old_id -> new_id, 用完即清
+    for msg in messages:
+        # 同步 ToolMessage
+        if isinstance(msg, ToolMessage):
+            if msg.tool_call_id in pending_renames:
+                msg.tool_call_id = pending_renames[msg.tool_call_id]
+            if isinstance(msg.content, list):
+                for block in msg.content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        if block.get("tool_use_id") in pending_renames:
+                            block["tool_use_id"] = pending_renames[block["tool_use_id"]]
+            continue
+
+        if not isinstance(msg, AIMessage):
+            continue
+
+        # 1) 处理本 message 的 content (per-msg 内去重, 跨 msg 靠 seen)
+        own_ids: set = set()  # 本 message 实际产出的 id
+        if isinstance(msg.content, list):
+            new_content = []
+            for block in msg.content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    new_content.append(block)
+                    continue
+                old_id = block.get("id")
+                if old_id is None or old_id in seen or old_id in own_ids:
+                    base = old_id or "tool_use"
+                    n = 1
+                    new_id = f"{base}_dup{n}"
+                    while new_id in seen or new_id in own_ids:
+                        n += 1
+                        new_id = f"{base}_dup{n}"
+                    block["id"] = new_id
+                    if old_id is not None:
+                        pending_renames[old_id] = new_id
+                own_ids.add(block["id"])
+                new_content.append(block)
+            msg.content = new_content
+
+        # 2) 处理本 message 的 tool_calls (不去重 — 允许 content+tool_calls 同 id,
+        #    langchain 内部会消解; 只在跨 message 冲突时改名)
+        if getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                old_id = tc.get("id")
+                if old_id is None or old_id in seen:
+                    base = old_id or "tool_use"
+                    n = 1
+                    new_id = f"{base}_dup{n}"
+                    while new_id in seen or new_id in own_ids:
+                        n += 1
+                        new_id = f"{base}_dup{n}"
+                    tc["id"] = new_id
+                    if old_id is not None:
+                        pending_renames[old_id] = new_id
+                own_ids.add(tc["id"])
+
+        # 3) 把本 message 实际产出的 id 加入 seen, 供后续 message 校验
+        seen.update(own_ids)
+
+
 # ==================== Event Emitter for SSE Streaming ====================
 
 # [Fix #concurrent-emitter] 用 ContextVar 替代模块级全局变量
@@ -249,6 +339,12 @@ def generate(state: InterleavedState) -> dict:
 
     # Bind tools to the LLM - LangChain handles format conversion
     llm_with_tools = llm.bind_tools(TOOLS)
+
+    # Defensive: ensure all tool_use ids in conversation are unique.
+    # langchain_anthropic dedupes per-message but NOT cross-message, so a
+    # shared id across two AIMessages would trigger upstream 400
+    # `duplicate tool_call id`. In-place mutation of state.messages list.
+    _ensure_unique_tool_use_ids(list(state.messages))
 
     # Invoke the LLM with tools bound
     # LangChain will automatically:

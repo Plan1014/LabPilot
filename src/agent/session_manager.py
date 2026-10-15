@@ -150,8 +150,18 @@ def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> d
 
         # 2) Synthesize tool_use blocks from msg.tool_calls (OpenAI mode).
         #    Anthropic mode generally already has tool_use blocks inside content.
+        #    IMPORTANT: skip any tc whose id is already in the content blocks —
+        #    otherwise round-tripping through dict_to_ai_message would produce
+        #    duplicate tool_use ids and trigger upstream 400 `duplicate tool_call
+        #    id` on the *next* session_query that loads this message from DB.
+        existing_tool_use_ids = {
+            b.get("id") for b in blocks
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        }
         next_index = max((b.get("index", -1) for b in blocks), default=-1) + 1
         for tc in tool_calls:
+            if tc.get("id") in existing_tool_use_ids:
+                continue
             blocks.append({
                 "type": "tool_use",
                 "id": tc.get("id"),
@@ -196,6 +206,7 @@ def dict_to_ai_message(msg: dict) -> AIMessage:
     text_parts: list[str] = []
     tool_calls: list[dict] = []
     thinking_parts: list[str] = []
+    seen_tool_call_ids: set = set()
     for block in (content or []):
         if not isinstance(block, dict):
             continue
@@ -210,8 +221,16 @@ def dict_to_ai_message(msg: dict) -> AIMessage:
             tc_args = block.get("input") or {}
             if not isinstance(tc_args, dict):
                 tc_args = {"_raw": tc_args}
+            # Defensive: skip tool_use blocks whose id we already have. Older
+            # session rows (pre-fix) may contain duplicates from a previous
+            # message_to_dict bug. Without this dedup, the next LLM call would
+            # 400 `duplicate tool_call id`.
+            tc_id = block.get("id")
+            if tc_id in seen_tool_call_ids:
+                continue
+            seen_tool_call_ids.add(tc_id)
             tool_calls.append({
-                "id": block.get("id"),
+                "id": tc_id,
                 "name": block.get("name", "") or "",
                 "args": tc_args,
                 "type": "tool_call",
