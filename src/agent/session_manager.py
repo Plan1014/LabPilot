@@ -218,7 +218,18 @@ def dict_to_ai_message(msg: dict) -> AIMessage:
             if txt:
                 text_parts.append(txt)
         elif btype == "tool_use":
-            tc_args = block.get("input") or {}
+            # Prefer `input` (final args). Fall back to `partial_json` — that's
+            # where the streaming Anthropic client parked the args when the
+            # message was captured mid-stream before the LLM closed the block.
+            # Without this fallback, all tool calls look like `input: {}` in
+            # the reloaded history and the agent has no idea what was actually
+            # invoked.
+            tc_args = block.get("input")
+            if not tc_args and block.get("partial_json"):
+                try:
+                    tc_args = json.loads(block["partial_json"])
+                except (json.JSONDecodeError, TypeError):
+                    tc_args = {}
             if not isinstance(tc_args, dict):
                 tc_args = {"_raw": tc_args}
             # Defensive: skip tool_use blocks whose id we already have. Older

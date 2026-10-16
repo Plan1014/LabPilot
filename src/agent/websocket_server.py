@@ -396,7 +396,22 @@ def create_session_router():
             update_session_title(session_id, first_title)
 
         def emitter(event: dict):
-            key = f"{event.get('type')}:{event.get('content', '')}:{event.get('name', '')}:{event.get('result', '')}"
+            # Dedup key includes `step` so distinct LLM iterations of the same
+            # tool (e.g. agent calls `bash` three times in a row) are NOT
+            # collapsed — each one carries a unique `step` from
+            # graph_thinking.generate's state.step_count, which is the natural
+            # collision boundary. Without `step` here, three bash events
+            # stringify to the same key and only the first ever reaches the
+            # frontend; the user sees a single "Step 1" tool card and the loop
+            # appears to hang.
+            #
+            # For 'done' events we use a fixed key — only the first one
+            # matters, later ones would carry a stale session_id.
+            step = event.get("step", -1)
+            if event.get("type") == "done":
+                key = "done"
+            else:
+                key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
             if key not in seen_keys:
                 seen_keys.add(key)
                 event_queue.put(event)
@@ -657,7 +672,22 @@ def create_sse_router():
         seen_keys: set[str] = set()
 
         def emitter(event: dict):
-            key = f"{event.get('type')}:{event.get('content', '')}:{event.get('name', '')}:{event.get('result', '')}"
+            # Dedup key includes `step` so distinct LLM iterations of the same
+            # tool (e.g. agent calls `bash` three times in a row) are NOT
+            # collapsed — each one carries a unique `step` from
+            # graph_thinking.generate's state.step_count, which is the natural
+            # collision boundary. Without `step` here, three bash events
+            # stringify to the same key and only the first ever reaches the
+            # frontend; the user sees a single "Step 1" tool card and the loop
+            # appears to hang.
+            #
+            # For 'done' events we use a fixed key — only the first one
+            # matters, later ones would carry a stale session_id.
+            step = event.get("step", -1)
+            if event.get("type") == "done":
+                key = "done"
+            else:
+                key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
             if key not in seen_keys:
                 seen_keys.add(key)
                 event_queue.put(event)

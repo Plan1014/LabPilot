@@ -95,13 +95,34 @@ export function useSSE(
                   sessionId: (event as { session_id?: string }).session_id,
                 });
 
+                // Dedup key. Per-step + content fingerprint, NOT whole-event
+                // JSON.stringify. The OLD key was `tool_call:${JSON.stringify(event)}` —
+                // if the agent calls the same tool (e.g. bash) three times in a
+                // row with the same input, all three events stringify to the
+                // same key and only the first ever renders. The user sees a
+                // single "Step 1" tool card and concludes the loop hung.
+                //
+                // The streaming backend emits distinct `step` values (from
+                // graph_thinking.generate's state.step_count) for each LLM
+                // iteration, so `step` is the natural collision boundary.
+                // Within the same step + same content, the chunk is a resend
+                // and we drop it.
                 let key: string;
+                const step = event.step ?? -1;
                 if (event.type === "thinking") {
-                  key = `thinking:${event.content}`;
+                  key = `thinking:${step}:${event.content ?? ""}`;
                 } else if (event.type === "text") {
-                  key = `text:${JSON.stringify(event.content)}`;
+                  key = `text:${step}:${JSON.stringify(event.content)}`;
+                } else if (event.type === "tool_call") {
+                  key = `tool_call:${step}:${event.name ?? ""}:${JSON.stringify(event.input)}`;
+                } else if (event.type === "tool_result") {
+                  key = `tool_result:${step}:${event.name ?? ""}:${event.result ?? ""}`;
+                } else if (event.type === "done") {
+                  // `done` is terminal — only the first one matters; later ones
+                  // (if any) would carry a stale session_id and clobber state.
+                  key = `done`;
                 } else {
-                  key = `${event.type}:${JSON.stringify(event)}`;
+                  key = `${event.type}:${step}:${JSON.stringify(event)}`;
                 }
 
                 if (seenKeys.has(key)) {

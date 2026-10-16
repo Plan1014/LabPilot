@@ -129,7 +129,7 @@ Response:
 {
   "task_id": "abc123",
   "status": "completed",
-  "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\my_trace.csv",
+  "csv_path": "<workdir>/data/PNA_data/my_trace.csv",
   "result": {"trace_points": 801}
 }
 ```
@@ -157,7 +157,7 @@ it directly:
 ```
 [WebSocket] [2026-08-28T14:32:00Z] [pna] task_completed:
   result={"status": "success",
-          "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+          "csv_path": "<workdir>/data/PNA_data/trace_20260828_143200.csv",
           ...}
 ```
 
@@ -173,7 +173,7 @@ it directly:
 ```
 POST http://127.0.0.1:8002/read_pna
 {
-  "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+  "csv_path": "<workdir>/data/PNA_data/trace_20260828_143200.csv",
   "target_freqs": [1, 10, 100, 1000, 10000, 100000],
   "tolerance_factor": 0.05
 }
@@ -187,7 +187,7 @@ Response `200`:
 
 ```json
 {
-  "csv_path": "D:\\PDHlocking\\LabPilot\\data\\PNA_data\\trace_20260828_143200.csv",
+  "csv_path": "<workdir>/data/PNA_data/trace_20260828_143200.csv",
   "points": [
     {"frequency_hz": 1.0, "power_dbm": -45.32},
     {"frequency_hz": 10.0, "power_dbm": -55.18}

@@ -1,5 +1,5 @@
 import { useState, useCallback } from "react";
-import type { SessionMeta, Message, SSEEvent } from "../types/events";
+import type { SessionMeta, Message } from "../types/events";
 
 const API_BASE = "http://127.0.0.1:8000";
 const SESSION_ID_KEY = "labpilot_session_id";
@@ -131,6 +131,91 @@ interface RawHistoryMessage {
 export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[] {
   const msgs: Message[] = [];
 
+  // One user query triggers a full agent loop. The loop produces N AIMessages
+  // (thinking → tool_call → tool_call → ... → text) plus M ToolMessages in
+  // LangChain's storage, all persisted as separate rows. From the user's
+  // perspective, those N+M rows are ONE answer to their question and should
+  // render as ONE message card, not N+M tiny cards.
+  //
+  // Strategy: walk the rows in order. Push a user row as its own card. For
+  // assistant+tool rows, APPEND events to the last in-progress assistant
+  // card (creating one if needed). Move on to the next user row only when we
+  // actually see one — that user's question is the natural boundary.
+  let currentAssistant: Message | null = null;
+  let lastStep = 0; // monotonic step counter across the whole agent loop
+
+  const startAssistant = (): Message => {
+    const m: Message = {
+      id: crypto.randomUUID(),
+      role: "assistant" as const,
+      content: "",
+      events: [],
+      isComplete: true,
+    };
+    msgs.push(m);
+    return m;
+  };
+
+  const appendBlockToAssistant = (block: { type?: string; [k: string]: unknown }) => {
+    if (!currentAssistant) currentAssistant = startAssistant();
+
+    if (block.type === "thinking") {
+      currentAssistant.events.push({
+        type: "thinking" as const,
+        content: (block as { thinking?: string }).thinking || "",
+        step: lastStep++,
+      });
+    } else if (block.type === "text") {
+      currentAssistant.events.push({
+        type: "text" as const,
+        content: (block as { text?: string[] }).text || [],
+        step: lastStep++,
+      });
+    } else if (block.type === "tool_use") {
+      // tool_use 块 → tool_call 事件（与 streaming 路径一致）。
+      //
+      // `input` may be empty `{}` when the assistant message was captured
+      // mid-stream: the langchain_anthropic client parks the live JSON in
+      // `partial_json` until the tool_use block closes, then `input` is filled
+      // in. Our DB snapshot can land in either state, so prefer `input` and
+      // fall back to a JSON.parse(partial_json). Without this fallback the
+      // reload view shows every tool call as `Input: {}`.
+      let toolInput: Record<string, unknown> =
+        (block as { input?: Record<string, unknown> }).input || {};
+      if (
+        Object.keys(toolInput).length === 0 &&
+        typeof (block as { partial_json?: unknown }).partial_json === "string"
+      ) {
+        try {
+          const parsed = JSON.parse(
+            (block as { partial_json: string }).partial_json
+          );
+          if (parsed && typeof parsed === "object") {
+            toolInput = parsed as Record<string, unknown>;
+          }
+        } catch {
+          // partial_json was truncated mid-write — leave input empty.
+        }
+      }
+      // Record the step we hand to tool_call so the matching tool_result
+      // (arrives later as a role="tool" row) can reuse it. The user reads
+      // "[Step 1] bash" + "[Step 1] Result" as ONE call, not two — sharing
+      // the step number makes that pairing visually obvious.
+      currentAssistant.events.push({
+        type: "tool_call" as const,
+        name: (block as { name?: string }).name || "tool",
+        input: toolInput,
+        step: lastStep,
+        tool_call_id: (block as { id?: string }).id,
+      });
+      // Bump AFTER the tool_call lands. This way a single iteration that
+      // emits two parallel tool_uses (e.g. head + tail in one response)
+      // gets distinct steps 3 and 4, and their respective tool_results
+      // (matched by tool_call_id) also display at 3 and 4.
+      lastStep++;
+    }
+  };
+
   for (let i = 0; i < rawMessages.length; i++) {
     const msg = rawMessages[i];
 
@@ -145,67 +230,69 @@ export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[
         isComplete: true,
         isSystemPrompt,
       });
-    } else if (msg.role === "assistant") {
-      const events: SSEEvent[] = [];
+      // Next assistant/tool rows belong to this user — reset the per-loop
+      // step counter so the card's [Step N] labels restart at 1.
+      currentAssistant = null;
+      lastStep = 0;
+      continue;
+    }
 
-      // 1) 数组形态：Anthropic 与 OpenAI（统一后）都走这里
+    if (msg.role === "assistant") {
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
           if (!block || typeof block !== "object") continue;
-
-          if (block.type === "thinking") {
-            events.push({
-              type: "thinking" as const,
-              content: (block as { thinking?: string }).thinking || "",
-              step: (block as { index?: number }).index ?? 0,
-            });
-          } else if (block.type === "text") {
-            events.push({
-              type: "text" as const,
-              content: (block as { text?: string[] }).text || [],
-              step: (block as { index?: number }).index ?? 0,
-            });
-          } else if (block.type === "tool_use") {
-            // tool_use 块 → tool_call 事件（与 streaming 路径一致）。
-            // tool_result 由紧随其后的 role="tool" 消息补充。
-            events.push({
-              type: "tool_call" as const,
-              name: (block as { name?: string }).name || "tool",
-              input: (block as { input?: Record<string, unknown> }).input || {},
-              step: (block as { index?: number }).index ?? 0,
-            });
-          }
+          appendBlockToAssistant(block);
         }
       } else if (typeof msg.content === "string" && msg.content.trim()) {
-        // 2) [兼容老数据] 字符串形态：作为单一 text 块
-        events.push({
+        // 兼容老数据：字符串形态 → 单一 text 块
+        if (!currentAssistant) currentAssistant = startAssistant();
+        currentAssistant.events.push({
           type: "text" as const,
           content: [msg.content],
-          step: events.length > 0 ? (events[events.length - 1].step ?? 0) + 1 : 0,
+          step: lastStep++,
         });
       }
-
-      // 3) 合并紧随其后的 tool 消息为 tool_result 事件
-      let j = i + 1;
-      while (j < rawMessages.length && rawMessages[j].role === "tool") {
-        events.push({
-          type: "tool_result" as const,
-          result: (rawMessages[j].content as string) || "",
-          step: events.length > 0 ? (events[events.length - 1].step ?? 0) : 0,
-        });
-        j++;
-      }
-
-      msgs.push({
-        id: crypto.randomUUID(),
-        role: "assistant" as const,
-        content: "",
-        events,
-        isComplete: true,
-      });
-      i = j - 1; // 跳过已合并的 tool 消息
+      continue;
     }
-    // tool 消息已被合并到前一条 assistant，跳过
+
+    if (msg.role === "tool") {
+      if (!currentAssistant) currentAssistant = startAssistant();
+      // Pair with the tool_call that has the matching tool_call_id. Without
+      // the id, the safe fallback is "the most recent tool_call" — but that
+      // breaks when a single agent iteration emits multiple parallel calls
+      // (e.g. head + tail in one response), since the LAST call's step
+      // would steal the earlier result.
+      const toolCallId = (msg as { tool_call_id?: string }).tool_call_id;
+      let matchedStep: number | null = null;
+      if (toolCallId) {
+        for (const ev of currentAssistant.events) {
+          if (ev.type === "tool_call" && ev.tool_call_id === toolCallId) {
+            matchedStep = ev.step ?? null;
+            break;
+          }
+        }
+      }
+      if (matchedStep === null) {
+        // Fallback for legacy rows that pre-date the id-tracking fix: pick
+        // the last tool_call in the card. Better than no match.
+        for (let k = currentAssistant.events.length - 1; k >= 0; k--) {
+          const ev = currentAssistant.events[k];
+          if (ev.type === "tool_call") {
+            matchedStep = ev.step ?? null;
+            break;
+          }
+        }
+      }
+      currentAssistant.events.push({
+        type: "tool_result" as const,
+        result: (msg.content as string) || "",
+        step: matchedStep ?? lastStep,
+      });
+      // Do NOT advance lastStep here — the next event is either the
+      // matching tool_result's pair (already at this step) or the next
+      // tool_call/text which tool_call already advanced.
+      continue;
+    }
   }
 
   return msgs;
