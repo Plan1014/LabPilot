@@ -21,6 +21,10 @@ dependencies = [
     # ===== LangChain =====
     "langchain-core>=0.3.0",
     "langchain-anthropic>=0.3.0",
+    # langchain_openai.ChatOpenAI 在 OPENAI 模式 (LiteLLM proxy) 启用时被 llm.py / tools.py 引用;
+    # OpenAI 包本身由 litellm[proxy] 传递带入, 但 langchain-openai 这个 wrapper 必须显式声明,
+    # 否则 uv sync --frozen 在干净环境上 ImportError。
+    "langchain-openai>=0.2.0",
 
     # ===== Anthropic =====
     "anthropic>=0.40.0",
