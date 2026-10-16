@@ -47,18 +47,20 @@ Read academic papers from PDF files, extract structured information, and save as
 
 ## Workflow
 
+Paths below are relative to the project workdir injected in your system prompt. Substitute `{workdir}` with that absolute path.
+
 ### Step 1: Setup Directories
-- Scripts directory: `.\LabPilot\tmp`
-- Papers directory: `.\LabPilot\docs\papers`
+- Scripts directory: `{workdir}/tmp`
+- Papers directory: `{workdir}/docs/papers`
 - Create directories if not exist
 
 ### Step 2: Copy PDF
-- Copy original PDF to `.\LabPilot\docs\papers`
+- Copy original PDF to `{workdir}/docs/papers`
 - Use original filename or generate based on paper title
 
 ### Step 3: Extract Content
 - Use pypdf to read PDF text
-- Save extracted text to `.\LabPilot\tmp` for analysis
+- Save extracted text to `{workdir}/tmp` for analysis
 
 ### Step 4: Generate JSON
 - Parse extracted text to extract structured information
@@ -70,18 +72,18 @@ Read academic papers from PDF files, extract structured information, and save as
 - Do NOT use core_block functions (save_core_block, append_core_block, etc.)
 
 ### Step 6: Save JSON File
-- Save JSON to `.\LabPilot\docs\papers`
-- Clean up temp files in `.\LabPilot\tmp`
+- Save JSON to `{workdir}/docs/papers`
+- Clean up temp files in `{workdir}/tmp`
 
 ## Directory Structure
 
 ```
-.\LabPilot\
-├── tmp\                    # Python scripts and temp files
+{workdir}/
+├── tmp/                    # Python scripts and temp files
 │   ├── extract_pdf.py
 │   └── page_*.txt
-└── docs\
-    └── papers\             # Original PDFs and JSON summaries
+└── docs/
+    └── papers/             # Original PDFs and JSON summaries
         ├── paper1.pdf
         ├── paper1.json
         └── paper2.json
@@ -91,10 +93,10 @@ Read academic papers from PDF files, extract structured information, and save as
 
 | # | Constraint | Description |
 |---|------------|-------------|
-| 1 | **Python Interpreter** | Use `D:\PDHlocking\LabPilot\venv\Scripts\python.exe` |
-| 2 | **Working Directory** | All operations within `D:\PDHlocking\LabPilot` |
-| 3 | **Script Location** | Scripts run from `.\LabPilot\tmp` |
-| 4 | **Paper Location** | Save to `.\LabPilot\docs\papers` |
+| 1 | **Python Interpreter** | Use the project venv: `{workdir}/.venv/Scripts/python.exe` (Windows) or `{workdir}/.venv/bin/python` (Linux/Mac). The runtime workdir is injected in the system prompt. |
+| 2 | **Working Directory** | All operations within the project root (`{workdir}`). Use the `{workdir}` placeholder from the system prompt, never hardcode an absolute path. |
+| 3 | **Script Location** | Scripts run from `{workdir}/tmp` |
+| 4 | **Paper Location** | Save to `{workdir}/docs/papers` |
 | 5 | **Output Format** | JSON only |
 | 6 | **Fact Library** | Use `remember_fact()` for long-term storage |
 | 7 | **No Core Blocks** | Do NOT use core_block functions (save_core_block, append_core_block, etc.) |
@@ -110,7 +112,7 @@ import sys
 import os
 
 pdf_path = sys.argv[1] if len(sys.argv) > 1 else r"PATH_TO_PDF"
-output_dir = r"D:\PDHlocking\LabPilot\tmp"
+output_dir = r"{workdir}/tmp"
 
 reader = PdfReader(pdf_path)
 print(f"Total pages: {len(reader.pages)}")
@@ -125,7 +127,7 @@ for i, page in enumerate(reader.pages):
 
 ### File Path Handling
 - Use raw strings (r"...") for paths with spaces
-- Always use absolute paths starting from D:\PDHlocking
+- Always use the `{workdir}` placeholder from your system prompt; never hardcode an absolute path like `D:\...`
 
 ## Response Handling
 

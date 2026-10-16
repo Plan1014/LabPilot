@@ -3,6 +3,7 @@
 All tools are @tool-decorated functions exposed to the LangGraph agent.
 """
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -20,19 +21,22 @@ from src.agent.memory.core import CoreMemoryManager
 # Matching is case-insensitive (re.IGNORECASE) — Windows built-ins are
 # case-insensitive on the command line.
 _DANGEROUS_PATTERNS = [
-    # ---- Linux / Unix recursive delete & permission ----
-    r"\brm\s+(-[rR][fF]|-r[fF])\s+/",       # rm -rf /  / rm -rf *
+    # ---- Linux / Unix file deletion (any form) ----
+    r"\brm\s+",                              # rm / rm -rf / rm file
+    r"\brmdir\s+",                           # rmdir (POSIX)
     r"\b(sudo|shutdown|reboot|halt|poweroff)\b",
-    # ---- Windows force-delete / disk destruction ----
-    r"\bdel\s+/[fFsS]\s+/[sSqQ]\b",          # del /F /S /Q
-    r"\brd\s+/[sS]\s+/[qQ]\b",              # rd /S /Q  (rmdir)
+    # ---- Windows file deletion (any form) ----
+    r"\bdel\s+",                             # del / del /F /S /Q / del file
+    r"\berase\s+",                           # DOS legacy
+    r"\b(rd|Remove-Item|ri)\s+",             # rd / rmdir / PowerShell alias + 短名
+    # ---- Windows disk / boot / privilege ----
     r"\b(format|diskpart)\b",               # Windows format / diskpart
     r"\bbcdedit\b",                          # boot config editor
     # ---- Process termination (agent 常见误用) ----
     r"\btaskkill\b",                          # 任意 taskkill（含 /F）都拦
     r"\bkill\s+-[9]\b",                      # kill -9 / SIGKILL
     r"\bkillall\b",
-    # ---- Windows service control & registry ----
+    # ---- Windows service / registry ----
     r"\bnet\s+(stop|start)\b",
     r"\bsc\s+(stop|delete)\b",
     r"\breg\s+delete\b",
@@ -82,10 +86,16 @@ ERROR_PREFIXES = [
 
 
 def is_failure_result(result: str) -> bool:
-    """检测工具返回是否表示失败."""
+    """检测工具返回是否表示失败.
+
+    仅当返回串的**开头**（lstrip 后）匹配已知错误前缀才视为失败。
+    子串匹配会把成功搜索结果里碰巧包含的 "Error:" / "检索失败" / "搜索失败"
+    / "替换失败" 等文本误判为失败，触发无意义的 [System note]。
+    """
     if not result or not result.strip():
         return True
-    return any(prefix in result for prefix in ERROR_PREFIXES)
+    head = result.lstrip()
+    return any(head.startswith(prefix) for prefix in ERROR_PREFIXES)
 
 
 def err(prefix: str, detail: str = "") -> str:
@@ -158,19 +168,24 @@ def bash(command: str, background: bool = False) -> str:
                 text=True,
                 timeout=120,
             )
-            out = r.stdout.strip()
+            out = (r.stdout or "").strip()
             return out[:50000] if out else "(no output)"
     except Exception as e:
         return err("Error", str(e))
 
 
 @tool
-def read_file(path: str, limit: int = None) -> str:
+def read_file(path: str, mode: str = "full", head: int = 100, tail: int = 100) -> str:
     """Read file content with automatic encoding detection.
 
     Args:
         path: Relative path from working directory.
-        limit: Optional line count limit (truncates with marker).
+        mode: Reading mode.
+            - "full" (default): read entire file
+            - "head": read first `head` lines
+            - "tail": read last `tail` lines
+        head: Line count when mode="head" (default 100).
+        tail: Line count when mode="tail" (default 100).
 
     Returns:
         File content as string, or error message.
@@ -179,9 +194,22 @@ def read_file(path: str, limit: int = None) -> str:
     for encoding in ("utf-8", "utf-8-sig", "gbk", "latin-1"):
         try:
             lines = fp.read_text(encoding=encoding, errors="replace").splitlines()
-            if limit and limit < len(lines):
-                lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-            return "\n".join(lines)[:50000]
+            total = len(lines)
+            if mode == "head":
+                n = max(0, min(head, total))
+                out_lines = lines[:n]
+                if n < total:
+                    out_lines.append(f"... ({total - n} more)")
+            elif mode == "tail":
+                n = max(0, min(tail, total))
+                out_lines = lines[-n:] if n else []
+                if n < total:
+                    out_lines.append(f"... ({total - n} more)")
+            elif mode == "full":
+                out_lines = lines
+            else:
+                return f"Error: unknown mode {mode!r} (use head|tail|full)"
+            return "\n".join(out_lines)[:50000]
         except UnicodeDecodeError:
             continue
         except Exception as e:
@@ -358,13 +386,19 @@ def create_subagent(agent_type: str = "Explore") -> Callable:
     from langgraph.prebuilt import create_react_agent
 
     from src.agent.config import MODEL_ID
-    from src.agent.llm import ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL
+    from src.agent.llm import _openai_mode, _openai_config
 
-    sub_llm = ChatAnthropic(
-        model=MODEL_ID,
-        anthropic_api_key=ANTHROPIC_API_KEY,
-        base_url=ANTHROPIC_BASE_URL or None,
-    )
+    if _openai_mode():
+        from langchain_openai import ChatOpenAI
+        api_key, api_base, model = _openai_config()
+        sub_llm = ChatOpenAI(api_key=api_key, base_url=api_base, model=model)
+    else:
+        from langchain_anthropic import ChatAnthropic
+        sub_llm = ChatAnthropic(
+            model=MODEL_ID,
+            anthropic_api_key=os.getenv("ANTHROPIC_API_KEY") or "sk-placeholder",
+            base_url=os.getenv("ANTHROPIC_BASE_URL", "").strip() or None,
+        )
     sub_tools = create_subagent_tools(agent_type)
 
     sub_graph = create_react_agent(

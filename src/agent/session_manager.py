@@ -67,22 +67,111 @@ def _init_schema(conn: sqlite3.Connection):
 
 # ==================== Message Serialization ====================
 
+def _coerce_tool_args(args) -> dict:
+    """Best-effort coerce a tool call's `args` to a dict.
+
+    LangChain's `ToolCall` TypedDict declares `args: dict[str, Any]`, but older
+    adapters or streaming snapshots sometimes hand us a JSON-encoded string.
+    """
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args)
+            return parsed if isinstance(parsed, dict) else {"_raw": parsed}
+        except Exception:
+            return {"_raw": args}
+    return {}
+
+
+def _coerce_tool_calls_attr(msg: AIMessage) -> list:
+    """Read tool_calls from AIMessage, accepting dict or object entries."""
+    raw = getattr(msg, "tool_calls", None) or []
+    out = []
+    for tc in raw:
+        if isinstance(tc, dict):
+            out.append(tc)
+        else:
+            out.append({
+                "id": getattr(tc, "id", None),
+                "name": getattr(tc, "name", ""),
+                "args": getattr(tc, "args", {}),
+            })
+    return out
+
+
 def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> dict:
-    """Convert a message to a JSON-serializable dict."""
+    """Convert a message to a JSON-serializable dict.
+
+    Single source of truth used by both the WebSocket persistence path
+    (`websocket_server.py`) and the REPL in-memory path (`repl.py`).
+
+    Assistant content is always normalized to a list of typed blocks, so the
+    frontend can iterate ``content[].type`` uniformly:
+
+    - Anthropic mode: ``msg.content`` is already a list of
+      ``thinking`` / ``tool_use`` / ``text`` blocks; pass through.
+    - OpenAI mode: ``msg.content`` is a plain string; wrap as a single ``text``
+      block. Tool calls live on the ``msg.tool_calls`` attribute — synthesize
+      ``tool_use`` blocks and append.
+    """
     if isinstance(msg, dict):
         return msg
     elif isinstance(msg, HumanMessage):
         return {"role": "user", "content": msg.content}
     elif isinstance(msg, AIMessage):
         content = msg.content
+        tool_calls = _coerce_tool_calls_attr(msg)
+        additional_kwargs = getattr(msg, "additional_kwargs", None) or {}
+
+        # 1) Normalize existing content to a block list.
         if isinstance(content, str):
-            return {"role": "assistant", "content": content}
+            blocks: list[dict] = []
+            if content.strip():
+                blocks.append({"type": "text", "text": [content], "index": 0})
+        elif isinstance(content, list):
+            blocks = [b for b in content if isinstance(b, dict)]
         else:
             try:
                 json.dumps(content)
-                return {"role": "assistant", "content": content}
+                blocks = [{"type": "_raw", "value": content, "index": 0}]
             except (TypeError, ValueError):
-                return {"role": "assistant", "content": str(content)}
+                blocks = [{"type": "text", "text": [str(content)], "index": 0}]
+
+        # 1.5) Synthesize a thinking block from additional_kwargs.thinking.
+        #      In OpenAI mode the wrapper parks reasoning in additional_kwargs
+        #      (NOT in the content list — content stays a string so the next
+        #      LLM call doesn't get rejected by upstream). The persisted block
+        #      list is what the frontend renders, so we re-surface thinking
+        #      here for display parity with Anthropic mode.
+        thinking = additional_kwargs.get("thinking")
+        if thinking and not any(b.get("type") == "thinking" for b in blocks):
+            blocks.insert(0, {"type": "thinking", "thinking": thinking, "index": 0})
+
+        # 2) Synthesize tool_use blocks from msg.tool_calls (OpenAI mode).
+        #    Anthropic mode generally already has tool_use blocks inside content.
+        #    IMPORTANT: skip any tc whose id is already in the content blocks —
+        #    otherwise round-tripping through dict_to_ai_message would produce
+        #    duplicate tool_use ids and trigger upstream 400 `duplicate tool_call
+        #    id` on the *next* session_query that loads this message from DB.
+        existing_tool_use_ids = {
+            b.get("id") for b in blocks
+            if isinstance(b, dict) and b.get("type") == "tool_use"
+        }
+        next_index = max((b.get("index", -1) for b in blocks), default=-1) + 1
+        for tc in tool_calls:
+            if tc.get("id") in existing_tool_use_ids:
+                continue
+            blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id"),
+                "name": tc.get("name", "") or "",
+                "input": _coerce_tool_args(tc.get("args")),
+                "index": next_index,
+            })
+            next_index += 1
+
+        return {"role": "assistant", "content": blocks}
     elif isinstance(msg, ToolMessage):
         return {
             "role": "tool",
@@ -92,6 +181,90 @@ def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> d
         }
     else:
         return {"role": "unknown", "content": str(msg)}
+
+
+def dict_to_ai_message(msg: dict) -> AIMessage:
+    """Reconstruct an AIMessage from a persisted dict for the next LLM call.
+
+    Inverse of :func:`message_to_dict`. The persisted shape is a content block
+    list (e.g. ``[{"type": "text", ...}, {"type": "tool_use", ...}]``), but
+    many OpenAI-compatible upstreams only accept ``content: str`` — they
+    reject list-typed content with a 500 ``ValidationError``.
+
+    This helper flattens the list back into the standard LangChain shape:
+    - text blocks → joined into ``content`` (plain string)
+    - tool_use blocks → ``tool_calls`` attribute (OpenAI-compatible dicts)
+    - thinking / other non-text blocks → dropped (LLM doesn't need them)
+
+    Plain-string content (old data) passes through unchanged.
+    """
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return AIMessage(content=content)
+
+    # content is a list of blocks — flatten.
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    thinking_parts: list[str] = []
+    seen_tool_call_ids: set = set()
+    for block in (content or []):
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "text":
+            txt = block.get("text", "")
+            if isinstance(txt, list):
+                txt = "".join(str(x) for x in txt)
+            if txt:
+                text_parts.append(txt)
+        elif btype == "tool_use":
+            # Prefer `input` (final args). Fall back to `partial_json` — that's
+            # where the streaming Anthropic client parked the args when the
+            # message was captured mid-stream before the LLM closed the block.
+            # Without this fallback, all tool calls look like `input: {}` in
+            # the reloaded history and the agent has no idea what was actually
+            # invoked.
+            tc_args = block.get("input")
+            if not tc_args and block.get("partial_json"):
+                try:
+                    tc_args = json.loads(block["partial_json"])
+                except (json.JSONDecodeError, TypeError):
+                    tc_args = {}
+            if not isinstance(tc_args, dict):
+                tc_args = {"_raw": tc_args}
+            # Defensive: skip tool_use blocks whose id we already have. Older
+            # session rows (pre-fix) may contain duplicates from a previous
+            # message_to_dict bug. Without this dedup, the next LLM call would
+            # 400 `duplicate tool_call id`.
+            tc_id = block.get("id")
+            if tc_id in seen_tool_call_ids:
+                continue
+            seen_tool_call_ids.add(tc_id)
+            tool_calls.append({
+                "id": tc_id,
+                "name": block.get("name", "") or "",
+                "args": tc_args,
+                "type": "tool_call",
+            })
+        elif btype == "thinking":
+            # Persisted thinking block (originally lifted from
+            # additional_kwargs.thinking by message_to_dict) — restore it
+            # so parse_content_blocks can surface it after a session reload.
+            t = block.get("thinking", "")
+            if t:
+                thinking_parts.append(t)
+        # _raw blocks are dropped — not needed for next LLM turn
+
+    ai = AIMessage(content="\n".join(text_parts) if text_parts else "")
+    if tool_calls:
+        ai.tool_calls = tool_calls
+    if thinking_parts:
+        # Concatenate in case there are multiple thinking blocks (defensive —
+        # message_to_dict emits at most one)
+        existing_kwargs = dict(getattr(ai, "additional_kwargs", None) or {})
+        existing_kwargs["thinking"] = "\n".join(thinking_parts)
+        ai.additional_kwargs = existing_kwargs
+    return ai
 
 
 # ==================== TTL Check ====================
@@ -264,11 +437,14 @@ PRESERVE_RESULT_TOOLS = {"read_file"}
 
 
 def _build_tool_name_map(messages: list) -> dict:
-    """Build tool_use_id -> tool_name mapping from assistant messages."""
+    """Build tool_call_id -> tool_name mapping from assistant messages."""
     tool_name_map = {}
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
+        # OpenAI mode: tool_calls is a top-level field on the assistant dict.
+        for tc in msg.get("tool_calls") or []:
+            tool_name_map[tc.get("id", "")] = tc.get("name", "unknown")
         content = msg.get("content", [])
         if not isinstance(content, list):
             continue
@@ -338,35 +514,14 @@ def session_auto_compact(session_id: str) -> str:
             f.write(json.dumps(msg, default=str) + "\n")
 
     # LLM summarize
-    from src.agent.llm import client
+    from src.agent.llm import summarize_text
     conv_text = json.dumps(history, default=str)[-80000:]
-    resp = client.messages.create(
-        model=MODEL_ID,
-        messages=[{
-            "role": "user",
-            "content": (
-                "Summarize this conversation for continuity. Include: "
-                "1) What was accomplished, 2) Current state, 3) Key decisions made. "
-                "Be concise but preserve critical details.\n\n" + conv_text
-            )
-        }],
+    summary = summarize_text(
+        "Summarize this conversation for continuity. Include: "
+        "1) What was accomplished, 2) Current state, 3) Key decisions made. "
+        "Be concise but preserve critical details.\n\n" + conv_text,
         max_tokens=2000,
     )
-    # Extract text block
-    summary = ""
-    if isinstance(resp.content, list):
-        for block in resp.content:
-            if hasattr(block, "type") and block.type == "text":
-                summary = block.text
-                break
-            elif isinstance(block, dict) and block.get("type") == "text":
-                summary = block.get("text", "")
-                break
-        if not summary and resp.content:
-            last_block = resp.content[-1]
-            summary = getattr(last_block, "text", str(last_block))
-    else:
-        summary = str(resp.content)
 
     # Save to ChromaDB
     from src.agent.memory import memory_system

@@ -13,6 +13,10 @@ export interface SSEEvent {
   result?: string;
   step: number;
   session_id?: string;
+  // Populated only on reload from history — not emitted by the live SSE
+  // stream. Carries the upstream tool_use id so tool_result can be paired
+  // back to the correct tool_call when multiple calls happen in one step.
+  tool_call_id?: string;
 }
 
 export interface SessionMeta {

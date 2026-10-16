@@ -41,6 +41,9 @@ All commands use `curl.exe` on Windows (PowerShell/cmd compatible).
 | 设置调制  | POST   | `/modulation/set` | `{"frequency_mhz":0-99,"amplitude_vpp":0-2}` |
 | 导出波形  | POST   | `/plot/export`    | `{"save_path":"*.png"}`                      |
 | 读取功率  | GET    | `/power/monitor`  | Returns power snapshot                         |
+| 日志查询  | GET    | `/logs/recent`    | `?lines=N&level=ERROR&grep=...`（解析后）       |
+| 功率时序  | GET    | `/power/recent`   | `?window_seconds=N`（环形缓冲，不主动推送）       |
+| 锁定事件  | GET    | `/lock/recent`    | `?window_minutes=N`（当前滑窗）                  |
 
 ---
 
@@ -59,6 +62,49 @@ For example:
 ```
 
 **Important**: When you receive such a WebSocket notification, report the result to the user. Do NOT initiate additional PI calculations unless the user explicitly requests it.
+
+---
+
+## Lock Anomaly Digest (auto-notify)
+
+Linien 端在 `linien-gui-v2/linien_gui_v2/ui/notifier.py` 的
+`LockEventAggregator` 会监控 `parameters.lock.value`，
+**仅在 `parameters.auto_relock_status == "running"` 期间**
+（linen-server `fast_relock.py` 写的标识）且 **60 s 内 lock 翻转 ≥5 次**
+（默认阈值）时，POST 一条 `type=lock_anomaly` 摘要到 `/notify`
+（带 cooldown 60 s，避免噪声）。格式：
+
+```
+[WebSocket] lock_anomaly: Lock is flapping. Run /lock/status,
+             /power/recent?window_seconds=30, consider relaxing PID
+             or widening watch_lock_threshold. (6 events in 47.2s,
+             3 acquired, 3 lost; linien 开机后 123.4s)
+```
+
+**关键细节**：
+
+- **用户主动操作不会触发** `/lock/manual` + `/lock/stop` 触发的翻转会被源头过滤跳过，
+  因为此时 `auto_relock_status` 不是 `"running"`。
+  因此 `lock_anomaly` 只表示 fast_relock 自身在抖动。
+- `parameters.auto_relock_status` 进入 `failed` / `lost_during_settle` 时
+  **立即**（不走阈值）推送一条 `type=relock_failed`：
+
+  ```
+  [WebSocket] relock_failed: Auto-relock entered unrecoverable state: failed.
+               Human intervention recommended. (linien 开机后 234.5s)
+  ```
+
+**反应指引**：
+
+1. **不要立即调用 `/lock/manual` 重锁** — 锁已经在抖动，重锁无意义。
+2. 调用 `curl /lock/status` 确认当前态。
+3. 调用 `curl /power/recent?window_seconds=30` 看功率漂移。
+4. 给出调参建议（PID 减小 / 放宽 `watch_lock_threshold`）。
+5. 收到 `relock_failed` 时建议人工介入，**不要自动重试**。
+
+**时间字段**：所有推送的 `result.local_time` 字段是 linien 端本地时间字符串
+（带时区，如 `+08:00`），与 LabPilot 系统时间一致，可直接读懂。
+`result.since_boot_seconds` 表示距离 linien GUI v2 进程启动多久。
 
 ---
 
@@ -294,3 +340,74 @@ For async tasks (`/pi/calculate`):
 
 **"What's the current power?"**
 → GET /power/monitor → report value
+
+---
+
+## 事件推送格式（自动触发，AI 无需轮询）
+
+Linien 端会自动向 LabPilot NotificationHub (`POST /notify`) 推送以下事件。
+**AI 无需轮询**，收到推送时直接按指引反应即可。
+
+| 事件 `type` | 触发条件 | 严重度 |
+|---|---|---|
+| `task_completed` | PI 异步计算完成（旧路径，兼容 v1） | 中 |
+| `lock_anomaly`  | fast_relock 期间 60s 内 lock 翻转 ≥5 次 | 中 |
+| `relock_failed` | `auto_relock_status` 变为 `failed`/`lost_during_settle` | 高 |
+| `log_errors`   | linien.log 新增 ≥ WARNING 级条目（每 5s 批量） | 低~中 |
+
+### 7. Log Inspection
+
+调试或回答"出了什么问题"：
+
+```
+curl.exe "http://127.0.0.1:8001/logs/recent?lines=200&level=ERROR"
+curl.exe "http://127.0.0.1:8001/logs/recent?lines=200&grep=fast_relock"
+```
+
+返回 JSON：`{lines: [{ts, logger, level, message}, ...], count, log_path, filter_hints, boot_anchor, since_boot_seconds}`。
+
+- `ts` 是 linien 端 `asctime` 本地时间字符串（例 `2026-09-15 14:23:01,234`），不需要做时区换算。
+- `boot_anchor` 是 linien 进程启动锚点；`since_boot_seconds` 是请求时的相对秒数。
+- 不需要每次推送都拉取日志——除非用户在排查问题或请求上下文。
+
+### 8. ERROR 推送反应
+
+Linien 端 `LogWatcher` 每 5s 扫描一次 `linien.log`，把新产生的
+≥ WARNING 级条目批量打包成一条 `type=log_errors` 推送到 `/notify`。
+
+推送消息示例：
+
+```
+[WebSocket] log_errors: 3 new WARNING/ERROR entries
+             [2026-09-15 14:23:01,234] ERROR linien_server.foo: test for pdh push
+             [2026-09-15 14:23:15,012] WARNING linien_server.parameters: ...
+             [2026-09-15 14:24:02,890] ERROR linien_server.fast_relock: ...
+             (linien 开机后 67.8s)
+```
+
+**反应**：
+
+1. 不要对每条 ERROR 都重复拉取 `/logs/recent` —— 推送里已经包含了 entries 列表。
+2. 仅当用户明确要求"完整日志"或上下文不足时，调用 `/logs/recent?lines=200` 取历史。
+3. 如 ERROR 与 `fast_relock` 相关，参考 `lock_anomaly` 反应指引考虑 PID/`watch_lock_threshold` 调整。
+
+### 9. 功率数据访问（不主动推送）
+
+功率本身持续抖动，linien 端**不**主动推送功率变化。
+需要时调用：
+
+```
+curl.exe "http://127.0.0.1:8001/power/recent?window_seconds=30"
+```
+
+返回 JSON 含：
+
+- `status`: `"ok" | "cold_start" | "no_power_meter"`
+- `samples`: `[{t_offset, epoch, local_time, power_dbm}, ...]`
+- `stats`: `{min, max, avg, count}`（仅 `status="ok"` 时）
+- `current_power`: 最近一次功率（dBm 字符串解析或 GUI label）
+- `data_manager_anchor_epoch`: `PowerMeterWindow` 启动 epoch
+- `rate_limit_hz`: 30（PowerDataManager 限速）
+
+**注意**：`power_dbm` 当前是 ADC counts（非校准 dBm）。如果需要 dBm，
+需要在 linien 端做 ADC→dBm 校准转换（目前未实现）。

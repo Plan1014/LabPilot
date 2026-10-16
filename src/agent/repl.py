@@ -12,46 +12,12 @@ from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
 from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
-from src.agent.llm import client
+from src.agent.llm import summarize_text
+from src.agent.session_manager import message_to_dict, dict_to_ai_message
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
 
 from src.agent.memory import memory_system
-
-# ==================== Message Serialization ====================
-
-def message_to_dict(msg: Union[HumanMessage, AIMessage, ToolMessage, dict]) -> dict:
-    """Convert a message to a JSON-serializable dict.
-
-    Handles potential Pydantic models or other non-serializable objects.
-    """
-    if isinstance(msg, dict):
-        return msg
-    elif isinstance(msg, HumanMessage):
-        return {"role": "user", "content": msg.content}
-    elif isinstance(msg, AIMessage):
-        content = msg.content
-        if isinstance(content, str):
-            return {"role": "assistant", "content": content}
-        else:
-            # content is a list of blocks (thinking, tool_use, text, etc.)
-            # Use a safe serializer for complex content
-            try:
-                json.dumps(content)
-                return {"role": "assistant", "content": content}
-            except (TypeError, ValueError):
-                # If content is not JSON serializable, convert to string
-                return {"role": "assistant", "content": str(content)}
-    elif isinstance(msg, ToolMessage):
-        return {
-            "role": "tool",
-            "name": msg.name,
-            "content": msg.content,
-            "tool_call_id": msg.tool_call_id,
-        }
-    else:
-        return {"role": "unknown", "content": str(msg)}
-
 
 # ==================== Loop Detection ====================
 
@@ -83,16 +49,26 @@ def detect_tool_loop(history: list) -> tuple:
     # Collect tool calls with their full parameters
     tool_calls_with_params = []
     for msg in history:
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
-            content = msg.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        # Store (tool_name, input_params) tuple
-                        tool_calls_with_params.append((
-                            block.get("name", ""),
-                            block.get("input", {}),
-                        ))
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        # OpenAI mode: tool_calls is a top-level field on the assistant dict.
+        for tc in msg.get("tool_calls") or []:
+            args = tc.get("args", "")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = args
+            tool_calls_with_params.append((tc.get("name", ""), args))
+        # Anthropic mode: tool_use blocks live inside content.
+        content = msg.get("content", [])
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_calls_with_params.append((
+                        block.get("name", ""),
+                        block.get("input", {}),
+                    ))
 
     if len(tool_calls_with_params) < 3:
         return ("", "")
@@ -134,30 +110,7 @@ def auto_compact(messages: list) -> list:
             f.write(json.dumps(msg, default=str) + "\n")
 
     conv_text = json.dumps(dicts, default=str)[-80000:]
-    resp = client.messages.create(
-        model=MODEL_ID,
-        messages=[{"role": "user", "content": f"Summarize for continuity:\n{conv_text}"}],
-        max_tokens=2000,
-    )
-    # summary = resp.content[0].text if hasattr(resp.content[0], 'text') else str(resp.content[0])
-    # [新增优化]：正确提取真正的文本摘要，跳过 Thinking 块
-    summary = ""
-    if isinstance(resp.content, list):
-        for block in resp.content:
-            # 兼容带有思考块的模型 (Anthropic / MiniMax 等)
-            if hasattr(block, "type") and block.type == "text":
-                summary = block.text
-                break
-            elif isinstance(block, dict) and block.get("type") == "text":
-                summary = block.get("text", "")
-                break
-        
-        # 如果没找到类型为 text 的块，则 fallback 取最后一个块（通常最后才是结论）
-        if not summary and resp.content:
-            last_block = resp.content[-1]
-            summary = getattr(last_block, "text", str(last_block))
-    else:
-        summary = str(resp.content)
+    summary = summarize_text(f"Summarize for continuity:\n{conv_text}", max_tokens=2000)
 
     # [新增]将真正的摘要持久化到 ChromaDB
     memory_system.save_summary(summary, filepath=str(path))
@@ -262,12 +215,7 @@ def main() -> None:
                 if msg.get("role") == "user":
                     langchain_messages.append(HumanMessage(content=msg.get("content", "")))
                 elif msg.get("role") == "assistant":
-                    # 构建带 content 的 AIMessage
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        langchain_messages.append(AIMessage(content=content))
-                    else:
-                        langchain_messages.append(AIMessage(content=content))
+                    langchain_messages.append(dict_to_ai_message(msg))
                 elif msg.get("role") == "tool":
                     langchain_messages.append(ToolMessage(
                         content=msg.get("content", ""),
