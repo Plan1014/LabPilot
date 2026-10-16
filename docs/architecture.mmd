@@ -1,66 +1,106 @@
+%%{init: {
+  'theme': 'base',
+  'themeVariables': {
+    'primaryColor': '#faf6ed',
+    'primaryTextColor': '#0f2c4d',
+    'primaryBorderColor': '#0f2c4d',
+    'lineColor': '#0f2c4d',
+    'secondaryColor': '#ede5d3',
+    'tertiaryColor': '#faf6ed',
+    'background': '#faf6ed',
+    'fontFamily': 'Georgia, "Source Han Serif SC", "Noto Serif CJK SC", "Microsoft YaHei", "SimSun", serif',
+    'fontSize': '14px'
+  },
+  'themeCSS': '
+    svg {
+      background:
+        linear-gradient(#d8cfb8 1px, transparent 1px) 0 0 / 24px 24px,
+        linear-gradient(90deg, #d8cfb8 1px, transparent 1px) 0 0 / 24px 24px,
+        #faf6ed !important;
+    }
+    .edgeLabel, .nodeLabel, .label {
+      font-family: "JetBrains Mono", "Fira Code", Consolas, "Courier New", monospace !important;
+      font-size: 11px !important;
+      letter-spacing: 0.04em;
+    }
+    .cluster-label {
+      font-family: Georgia, "Source Han Serif SC", serif !important;
+      font-size: 15px !important;
+      font-style: italic;
+      letter-spacing: 0.08em;
+      fill: #0f2c4d;
+    }
+    .label text, .nodeLabel, .edgeLabel { fill: #0f2c4d; }
+    .edgePath path { stroke: #0f2c4d; stroke-width: 1.2px; }
+    rect, .cluster rect {
+      fill: #faf6ed !important;
+      stroke: #0f2c4d !important;
+      stroke-width: 1.2px !important;
+    }
+    .cluster rect { stroke-dasharray: 2 3; fill: #ede5d3 !important; }
+  '
+}}%%
 flowchart TB
-    subgraph UI ["前端"]
-        User["用户"]
+    subgraph UI ["一. 前端"]
+        User["USER  用户"]
     end
 
-    subgraph Hub ["NotificationHub :8000"]
+    subgraph Hub ["二. NotificationHub :8000"]
         SSE["/session/query SSE"]
         Notify["/notify"]
         WS["/ws WebSocket"]
         MemAPI["/memory/*"]
     end
 
-    subgraph Agent ["Agent (LangGraph ReAct)"]
+    subgraph Agent ["三. Agent  (LangGraph ReAct)"]
+        direction TB
         Graph["graph_thinking.py"]
-        Tools["工具集"]
+        Tools["TOOLS  工具集"]
         CoreMem["CoreBlock 热记忆"]
         MemAgent["Memory Agent"]
     end
 
-    subgraph HotMem ["热记忆层"]
-        CoreBlock["CoreBlock task/error/conclusion"]
+    subgraph HotMem ["四. 热记忆层  HOT"]
+        CoreBlock["CoreBlock  task · error · conclusion"]
         Pending["PendingCache"]
     end
 
-    subgraph ColdMem ["冷记忆层"]
-        ChromaDB["ChromaDB 事实+摘要"]
-        SQLite["SQLite 会话+任务"]
+    subgraph ColdMem ["五. 冷记忆层  COLD"]
+        ChromaDB["ChromaDB  事实 + 摘要"]
+        SQLite["SQLite  会话 + 任务"]
     end
 
-    subgraph SkillSys ["SKILL 系统"]
+    subgraph SkillSys ["六. SKILL 系统"]
         SkillFiles["skills/*.md"]
     end
 
-    subgraph Devices ["设备服务"]
-        PDH["PDH-Locking :8001"]
-        PNA["PNA :8002"]
+    subgraph Devices ["七. 设备服务"]
+        PDH["PDH-Locking  :8001"]
+        PNA["PNA  :8002"]
     end
 
-    User --> SSE
-    SSE --> Graph
-    Graph --> Tools
+    %% === 主数据流 ===
+    User -->|"SSE"| SSE
+    SSE ==>|"① invoke"| Graph
+    Graph ==>|"② tool_call"| Tools
+    WS ==>|"③ result"| Graph
+
+    %% === 工具 → 存储 ===
     Tools --> CoreMem
     Tools --> ChromaDB
     Tools --> Pending
     Tools --> SkillFiles
 
-    MemAgent -.-> Pending
-    MemAgent -.-> CoreMem
-    MemAgent -.-> ChromaDB
+    %% === Memory Agent drain ===
+    MemAgent -.->|"drain"| Pending
+    MemAgent -.->|"write"| CoreMem
+    MemAgent -.->|"embed"| ChromaDB
 
-    PDH --> Notify
-    PNA --> Notify
+    %% === 设备通知 ===
+    PDH -->|"task_done"| Notify
+    PNA -->|"task_done"| Notify
     Notify --> WS
-    WS --> Graph
 
-    classDef hot fill:#ff6b6b,color:#fff
-    classDef cold fill:#4dabf7,color:#fff
-    classDef api fill:#ffd43b,color:#000
-    classDef agent fill:#69db7c,color:#000
-    classDef device fill:#da77f2,color:#fff
-
-    class CoreBlock,Pending,CoreMem,HotMem hot
-    class ChromaDB,SQLite,ColdMem cold
-    class SSE,Notify,WS,MemAPI,Hub api
-    class Graph,Tools,MemAgent,Agent agent
-    class PDH,PNA,Devices device
+    %% === 视觉强调：主线节点橙边橙字 ===
+    classDef primary fill:#fff7ed,stroke:#c2410c,stroke-width:2.4px,color:#c2410c
+    class User,SSE,Graph,Tools primary
