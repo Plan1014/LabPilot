@@ -93,6 +93,9 @@ credentials.json
 secrets/
 data/
 docs/
+!docs/architecture.mmd       # 架构图源文件 (Mermaid)
+!docs/images/                # 架构图渲染产物
+!docs/images/architecture.png
 skills-lock.json
 
 tests/
