@@ -247,39 +247,39 @@ LabPilot/
 
 ```mermaid
 flow TB
-    subgraph 前端
+    subgraph UI ["前端"]
         User["用户"]
     end
 
-    subgraph NotificationHub_8000
+    subgraph Hub ["NotificationHub :8000"]
         SSE["/session/query SSE"]
         Notify["/notify"]
         WS["/ws WebSocket"]
         MemAPI["/memory/*"]
     end
 
-    subgraph Agent_LangGraph_ReAct
+    subgraph Agent ["Agent (LangGraph ReAct)"]
         Graph["graph_thinking.py"]
         Tools["工具集"]
         CoreMem["CoreBlock 热记忆"]
         MemAgent["Memory Agent"]
     end
 
-    subgraph 热记忆层
+    subgraph HotMem ["热记忆层"]
         CoreBlock["CoreBlock task/error/conclusion"]
         Pending["PendingCache"]
     end
 
-    subgraph 冷记忆层
+    subgraph ColdMem ["冷记忆层"]
         ChromaDB["ChromaDB 事实+摘要"]
         SQLite["SQLite 会话+任务"]
     end
 
-    subgraph SKILL系统
+    subgraph SkillSys ["SKILL 系统"]
         SkillFiles["skills/*.md"]
     end
 
-    subgraph 设备服务
+    subgraph Devices ["设备服务"]
         PDH["PDH-Locking :8001"]
         PNA["PNA :8002"]
     end
@@ -307,11 +307,11 @@ flow TB
     classDef agent fill:#69db7c,color:#000
     classDef device fill:#da77f2,color:#fff
 
-    class CoreBlock,Pending,CoreMem,热记忆层 hot
-    class ChromaDB,SQLite,冷记忆层 cold
-    class SSE,Notify,WS,MemAPI,NotificationHub_8000 api
-    class Graph,Tools,MemAgent,Agent_LangGraph_ReAct agent
-    class PDH,PNA,设备服务 device
+    class CoreBlock,Pending,CoreMem,HotMem hot
+    class ChromaDB,SQLite,ColdMem cold
+    class SSE,Notify,WS,MemAPI,Hub api
+    class Graph,Tools,MemAgent,Agent agent
+    class PDH,PNA,Devices device
 ```
 
 ### 存储层次
