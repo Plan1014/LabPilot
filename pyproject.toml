@@ -3,7 +3,7 @@ name = "labpilot"
 version = "0.1.0"
 description = "光学实验 Agent 助手，基于 LangGraph ReAct 智能体，支持 PDH/PNA 设备控制、长期记忆与 Skill 技能系统"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
 authors = [
     { name = "LabPilot Authors" },
