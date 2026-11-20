@@ -36,6 +36,7 @@ start-tauri.ps1
 
 # ================= Superpowers Design Docs =================
 docs/superpowers/
+.superpowers/
 
 # ================= Node.js / npm =================
 node_modules/
@@ -98,4 +99,3 @@ docs/
 !docs/images/architecture.png
 skills-lock.json
 
-tests/
