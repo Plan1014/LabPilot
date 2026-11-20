@@ -83,15 +83,16 @@ packages = ["src"]
 # 这是一个应用项目，不需要被打包分发
 package = false
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-markers = [
-    "slow: 需要加载本地模型/向量库的慢速测试（用 -m 'not slow' 跳过）",
-]
-
 # 默认自动管理 Python 解释器（已检测到 3.12）
 # 如需固定版本可解开下行：managed = true
 managed = true
 
 # 锁文件即真相；CI/协作者靠 uv.lock 复现一致环境
 # 生成锁文件：uv lock  /  安装：uv sync
+
+# ================= pytest =================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: 需要加载本地模型/向量库的慢速测试（用 -m 'not slow' 跳过）",
+]
