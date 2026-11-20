@@ -4,6 +4,7 @@ import {
   normalizeOptions,
   orderOptions,
   deriveAskState,
+  shouldDeliverNotification,
 } from "./askUser.ts";
 
 test("normalizeOptions 归一化模型给的原始选项", () => {
@@ -167,4 +168,61 @@ test("deriveAskState 没有提问时不报错", () => {
   const state = deriveAskState([]);
   assert.equal(state.pendingAsk, null);
   assert.deepEqual(state.asks, []);
+});
+
+test("shouldDeliverNotification 有待答提问时不投递通知", () => {
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 1,
+      hasPendingAsk: true,
+      isStreaming: false,
+      streamingMessageId: null,
+    }),
+    false,
+  );
+});
+
+test("shouldDeliverNotification 本轮还在跑时不投递通知", () => {
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 1,
+      hasPendingAsk: false,
+      isStreaming: true,
+      streamingMessageId: null,
+    }),
+    false,
+  );
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 1,
+      hasPendingAsk: false,
+      isStreaming: false,
+      streamingMessageId: "a1",
+    }),
+    false,
+  );
+});
+
+test("shouldDeliverNotification 没有未投递通知时不投递", () => {
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 0,
+      hasPendingAsk: false,
+      isStreaming: false,
+      streamingMessageId: null,
+    }),
+    false,
+  );
+});
+
+test("shouldDeliverNotification 一切就绪时投递通知", () => {
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 2,
+      hasPendingAsk: false,
+      isStreaming: false,
+      streamingMessageId: null,
+    }),
+    true,
+  );
 });

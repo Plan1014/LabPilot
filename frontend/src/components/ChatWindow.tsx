@@ -7,7 +7,7 @@ import AskUserCard from "./AskUserCard";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { getStoredSessionId, persistSessionId, parseHistoryMessages } from "../hooks/useSession";
-import { deriveAskState } from "../utils/askUser";
+import { deriveAskState, shouldDeliverNotification } from "../utils/askUser";
 import type { Message as MessageType, SessionMeta } from "../types/events";
 import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
@@ -113,13 +113,17 @@ export default function ChatWindow() {
     const undelivered = notifications.filter(
       (n) => !deliveredNotifications.current.has(notificationKey(n))
     );
-    if (undelivered.length === 0) return;
-    // 有待答提问时暂停通知触发 —— 否则通知文本会被后端当成「对上一问的回答」吞掉。
-    // 通知留在这里，等回答完、pendingAsk 清空后再发。
-    if (askState.pendingAsk) return;
-    // 本轮还在跑时也不发 —— sendQuery 会 abort 掉正在跑的流，
-    // 回答轮会被通知打断。
-    if (isStreaming || streamingMessageId) return;
+    // 有待答提问 / 本轮还在跑时不发 —— 判定逻辑见 utils/askUser.ts（有单测）。
+    if (
+      !shouldDeliverNotification({
+        undeliveredCount: undelivered.length,
+        hasPendingAsk: askState.pendingAsk !== null,
+        isStreaming,
+        streamingMessageId,
+      })
+    ) {
+      return;
+    }
     const last = undelivered[undelivered.length - 1];
     deliveredNotifications.current.add(notificationKey(last));
     console.log("[LABPILOT-DEBUG] notification PAYLOAD", last);
