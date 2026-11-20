@@ -125,6 +125,11 @@ def find_pending_ask(history: list[dict]) -> dict | None:
 
     配对只看 tool_call_id —— 同一个问题被问两次时，两个 id 不同，
     不能靠问题文本配对。
+
+    只有 ``ask_user`` 自己的 tool_result 才算「已回答」：有些 OpenAI 兼容
+    上游每轮都从 ``call_0`` 开始编号，别的工具（bash 等）的 tool_result
+    撞上提问的 id 时，不能把提问当成已回答。历史里没写 name 的旧行按
+    「可能是提问的回答」处理，避免老会话的提问永远待答。
     """
     if not isinstance(history, list):
         return None
@@ -132,7 +137,9 @@ def find_pending_ask(history: list[dict]) -> dict | None:
     answered = {
         row.get("tool_call_id")
         for row in history
-        if isinstance(row, dict) and row.get("role") == "tool"
+        if isinstance(row, dict)
+        and row.get("role") == "tool"
+        and row.get("name") in (ASK_USER_TOOL_NAME, None, "")
     }
 
     pending: dict | None = None
@@ -150,10 +157,13 @@ def find_pending_ask(history: list[dict]) -> dict | None:
             tool_call_id = block.get("id")
             if tool_call_id in answered:
                 continue
+            tool_input = block.get("input")
+            if not isinstance(tool_input, dict):
+                tool_input = {}
             pending = {
                 "tool_call_id": tool_call_id,
-                "question": (block.get("input") or {}).get("question", ""),
-                "options": normalize_options((block.get("input") or {}).get("options")),
+                "question": tool_input.get("question", ""),
+                "options": normalize_options(tool_input.get("options")),
             }
     return pending
 
@@ -190,6 +200,37 @@ def build_answer_event(turn_row: dict) -> dict | None:
         "tool_call_id": turn_row.get("tool_call_id", ""),
         "step": 0,
     }
+
+
+def _sync_tool_calls(response, tool_call_id: str) -> None:
+    """把 ``response.tool_calls`` 收敛成只剩提问那一次调用。
+
+    两种模式都要做：
+    - OpenAI 模式：tool_calls 本来就是消息上的属性，是唯一权威来源。
+    - Anthropic 模式：langchain_anthropic 把 content 里的 tool_use 同步到
+      tool_calls 属性。只清 content 的话，兄弟工具会被 message_to_dict
+      按「content 里没有的 id」重新合成回去，下一轮上游 400。
+
+    同时把补出来的 id 写回 tool_calls —— 否则持久化时会多出一个 id 为空
+    的 tool_use 块，回答配不上提问。
+    """
+    tool_calls = list(getattr(response, "tool_calls", None) or [])
+    if not tool_calls:
+        return
+
+    kept: list[dict] = []
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        if tc.get("name") != ASK_USER_TOOL_NAME:
+            continue  # 兄弟工具 —— 丢掉
+        if not tc.get("id"):
+            tc["id"] = tool_call_id
+        if tc.get("id") != tool_call_id:
+            continue
+        kept.append(tc)
+
+    response.tool_calls = kept
 
 
 def sanitize_ask_message(response, ask: dict):
@@ -239,8 +280,11 @@ def sanitize_ask_message(response, ask: dict):
                 )
             tool_call_id = tc["id"]
             kept_calls.append(tc)
-        if kept_calls:
-            response.tool_calls = kept_calls
+        response.tool_calls = kept_calls
+
+    # 两种模式都要收敛 tool_calls：Anthropic 模式下它是从 content 同步来的，
+    # 不清的话兄弟工具会被 message_to_dict 合成回历史。
+    _sync_tool_calls(response, tool_call_id)
 
     ask["tool_call_id"] = tool_call_id
     return response

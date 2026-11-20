@@ -205,3 +205,94 @@ def test_format_ask_cli_without_options():
     out = format_ask_cli({"tool_call_id": "c1", "question": "Q?", "options": []})
     assert "Q?" in out
     assert "1." not in out
+
+
+# ---------------------------------------------------------------------------
+# 整支评审的修复（Important 1 / 2 / Minor 4）
+# ---------------------------------------------------------------------------
+
+
+def test_find_pending_ask_ignores_other_tools_with_same_id():
+    """别的工具的 tool_result 不能把提问算成「已回答」。
+
+    有些 OpenAI 兼容上游每轮都从 call_0 开始编号；bash 的 tool_result
+    撞上提问的 id 时，提问会被当成已回答 —— 用户根本不会被问到。
+    """
+    history = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "call_0", "name": "ask_user",
+             "input": {"question": "用哪套？"}},
+        ]},
+        {"role": "tool", "name": "bash", "content": "out", "tool_call_id": "call_0"},
+    ]
+    ask = find_pending_ask(history)
+    assert ask is not None
+    assert ask["tool_call_id"] == "call_0"
+
+
+def test_find_pending_ask_tolerates_malformed_input():
+    """历史里出现脏数据不能让整个会话 500。
+
+    input 不是 dict 时，提问仍要被认出来（question 退化成空串即可）。
+    """
+    history = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "c1", "name": "ask_user", "input": "not-a-dict"},
+        ]},
+    ]
+    ask = find_pending_ask(history)
+    assert ask is not None
+    assert ask["tool_call_id"] == "c1"
+
+
+def test_sanitize_filters_sibling_in_anthropic_shape():
+    """Anthropic 模式：tool_calls 属性也要同步过滤。
+
+    langchain_anthropic 会把 content 里的 tool_use 同步到 tool_calls 属性；
+    只清 content 的话，兄弟工具会被 message_to_dict 重新合成回历史，
+    下一轮上游因 tool_use 没有对应 tool_result 而 400。
+    """
+    from src.agent.session_manager import message_to_dict
+
+    response = AIMessage(
+        content=[
+            {"type": "text", "text": "顺便查一下"},
+            {"type": "tool_use", "id": "a1", "name": "bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "id": "a2", "name": "ask_user", "input": {"question": "用哪套？"}},
+        ],
+        tool_calls=[
+            {"id": "a1", "name": "bash", "args": {"command": "ls"}},
+            {"id": "a2", "name": "ask_user", "args": {"question": "用哪套？"}},
+        ],
+    )
+    ask = detect_ask([
+        {"id": "a2", "name": "ask_user", "input": {"question": "用哪套？"}},
+    ])
+    sanitize_ask_message(response, ask)
+
+    assert [tc["name"] for tc in response.tool_calls] == ["ask_user"]
+    persisted = message_to_dict(response)["content"]
+    used = [b for b in persisted if b.get("type") == "tool_use"]
+    assert [(b["name"], b["id"]) for b in used] == [("ask_user", "a2")]
+
+
+def test_sanitize_syncs_synthesized_id_into_tool_calls():
+    """上游没给 id 时，补出来的 id 必须写回 tool_calls 属性。
+
+    否则 message_to_dict 会再合成一个 id 为空的 tool_use 块，
+    回答配不上提问，前端卡片永远停在「等待回答」。
+    """
+    from src.agent.session_manager import message_to_dict
+
+    response = AIMessage(
+        content=[{"type": "tool_use", "name": "ask_user", "input": {"question": "用哪套？"}}],
+        tool_calls=[{"id": "", "name": "ask_user", "args": {"question": "用哪套？"}}],
+    )
+    ask = detect_ask([{"name": "ask_user", "input": {"question": "用哪套？"}}])
+    sanitize_ask_message(response, ask)
+
+    assert response.tool_calls[0]["id"] == ask["tool_call_id"]
+    assert ask["tool_call_id"] != ""
+    persisted = message_to_dict(response)["content"]
+    used = [b for b in persisted if b.get("type") == "tool_use"]
+    assert [b["id"] for b in used] == [ask["tool_call_id"]]
