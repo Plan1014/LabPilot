@@ -285,8 +285,11 @@ export function parseHistoryMessages(rawMessages: RawHistoryMessage[]): Message[
       }
       currentAssistant.events.push({
         type: "tool_result" as const,
+        name: msg.name,
         result: (msg.content as string) || "",
         step: matchedStep ?? lastStep,
+        // 带上 tool_call_id —— 回放时才能按 id 把回答与提问配对。
+        tool_call_id: toolCallId,
       });
       // Do NOT advance lastStep here — the next event is either the
       // matching tool_result's pair (already at this step) or the next

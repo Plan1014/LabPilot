@@ -16,6 +16,7 @@ Pending / drain 设计 (fix/pending-session-id):
 """
 
 import threading
+import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Annotated, Literal, Optional, Sequence, Callable
@@ -25,6 +26,7 @@ from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
 from src.agent.tools import TOOLS, is_failure_result
+from src.agent.ask_user import detect_ask, sanitize_ask_message, format_ask_cli
 from src.agent.memory import process_pending_self, PendingCache
 from src.agent.memory.constants import PENDING_THRESHOLD
 
@@ -147,6 +149,7 @@ class InterleavedState:
     pending_tool_calls: list = field(default_factory=list)  # 临时存储待执行的工具调用
     step_count: int = 0
     session_id: Optional[str] = None  # None = REPL (不写 pending);WebSocket 注入 uuid
+    pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
 
 
 # ==================== Content Block Parsing ====================
@@ -275,6 +278,23 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     print(flush=True)
 
 
+def print_ask(ask: dict, step: int) -> None:
+    """Emit the ask event and print the CLI version.
+
+    提问之后本轮即结束 —— 前端据此弹出选项卡片，等待用户回答。
+    """
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({
+            "type": "ask_user",
+            "question": ask.get("question", ""),
+            "options": ask.get("options", []),
+            "tool_call_id": ask.get("tool_call_id", ""),
+            "step": step,
+        })
+    print(f"\n\033[93m{format_ask_cli(ask)}\033[0m", flush=True)
+
+
 # ==================== Helper Functions ====================
 
 _pending_cache: Optional[PendingCache] = None
@@ -314,6 +334,72 @@ def _save_to_pending(messages: list, session_id: Optional[str]) -> None:
 
 
 # ==================== Graph Nodes ====================
+
+def _collect_used_tool_call_ids(messages: list) -> set:
+    """历史里已经用过的 tool_call id。"""
+    used: set = set()
+    for msg in messages or []:
+        if isinstance(msg, ToolMessage):
+            if msg.tool_call_id:
+                used.add(msg.tool_call_id)
+            continue
+        if not isinstance(msg, AIMessage):
+            continue
+        content = getattr(msg, "content", None)
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    if block.get("id"):
+                        used.add(block["id"])
+        for tc in getattr(msg, "tool_calls", None) or []:
+            tid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+            if tid:
+                used.add(tid)
+    return used
+
+
+def _write_back_tool_call_ids(response, tool_use_blocks: list[dict]) -> None:
+    """把改过的 id 写回响应本身（content 块与 tool_calls 属性）。
+
+    content 与 tool_calls 是同一批调用的两种表示，两边都要改 —— 只改一边，
+    落库时又会按「另一边」的 id 合成出重复块。
+    """
+    content = getattr(response, "content", None)
+    if isinstance(content, list):
+        idx = 0
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                if idx < len(tool_use_blocks):
+                    block["id"] = tool_use_blocks[idx]["id"]
+                idx += 1
+    tool_calls = getattr(response, "tool_calls", None)
+    if isinstance(tool_calls, list):
+        for i, tc in enumerate(tool_calls):
+            if isinstance(tc, dict) and i < len(tool_use_blocks):
+                tc["id"] = tool_use_blocks[i]["id"]
+
+
+def _ensure_unique_response_tool_call_ids(response, tool_use_blocks: list[dict], messages: list) -> list[dict]:
+    """响应里的 tool_use id 不能和历史里用过的重复。
+
+    有些 OpenAI 兼容上游每轮都从 ``call_0`` 开始编号。撞上旧 id 时，
+    用户的回答会配到旧的提问上 —— 当前这个提问既不会弹出，回答也送不到
+    模型那里，提问静默消失。
+    """
+    used = _collect_used_tool_call_ids(messages)
+    changed = False
+    for block in tool_use_blocks:
+        tid = block.get("id")
+        if tid and tid not in used:
+            used.add(tid)
+            continue
+        block["id"] = f"call_{uuid.uuid4().hex[:12]}"
+        used.add(block["id"])
+        changed = True
+    if changed:
+        _write_back_tool_call_ids(response, tool_use_blocks)
+    return tool_use_blocks
+
 
 def generate(state: InterleavedState) -> dict:
     """Call the LLM and parse content blocks into the state.
@@ -387,6 +473,28 @@ def generate(state: InterleavedState) -> dict:
     # Print thinking immediately
     for thinking in thinking_blocks:
         print_thinking(thinking, step)
+
+    # 响应里的 tool_use id 不能撞上历史里用过的 id —— 撞上了用户的回答就
+    # 配不到当前这个提问上。
+    if tool_use_blocks:
+        tool_use_blocks = _ensure_unique_response_tool_call_ids(
+            response, tool_use_blocks, list(state.messages)
+        )
+
+    # 提问即终止本轮：模型调用 ask_user 后，agent loop 必须停下等用户回答，
+    # 不能继续执行其它工具。响应里的兄弟 tool_use 一并丢弃 —— 它们没有对应的
+    # tool_result，留在历史里会让下一轮上游 API 报 400。
+    ask = detect_ask(tool_use_blocks)
+    if ask:
+        response = sanitize_ask_message(response, ask)
+        print_final_text(text_blocks, step)
+        print_ask(ask, step)
+        return {
+            "messages": [response],
+            "pending_tool_calls": [],
+            "step_count": step,
+            "pending_ask": ask,
+        }
 
     # 如果没有工具调用，打印最终文本
     if not tool_use_blocks:

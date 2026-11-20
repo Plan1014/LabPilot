@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, List
 
 from langchain_core.tools import tool
+from pydantic import BaseModel, Field
 
 from src.agent.config import WORKDIR, SKILLS_DIR
 from src.agent.memory.core import CoreMemoryManager
@@ -607,6 +608,55 @@ def search_core_blocks(query: str) -> str:
         return err("搜索失败", str(e))
 
 
+# ==================== Ask User Tool ====================
+
+
+class AskUserArgs(BaseModel):
+    """ask_user 的参数。
+
+    刻意用 ``list[dict]`` 而不是嵌套 pydantic 模型：嵌套模型会在 JSON schema
+    里生成 $defs/$ref，而上游是本地 Ollama，对嵌套 schema 的支持不稳定。
+    每一项的形状写在 options 的 description 里。
+    """
+
+    question: str = Field(description="需要用户决定什么。一句话说清决策点。")
+    options: list[dict] = Field(
+        default_factory=list,
+        description=(
+            "候选项数组，2-4 项，按推荐度从高到低排列。每项形如 "
+            '{"label": "选项文本", "description": "一句话说明为什么选它", '
+            '"recommended": true}。recommended 最多一项为 true，'
+            "应标在你认为最优的选项上（并把它放在第一位）。"
+        ),
+    )
+
+
+@tool(args_schema=AskUserArgs)
+def ask_user(question: str, options: list[dict]) -> str:
+    """向用户提问并等待回答。
+
+    当出现下列情况时调用本工具，而不是自己猜测：
+    - 存在多个合理方案，选择会显著改变后续执行路径
+    - 缺少只有用户才知道的信息（阈值、器件编号、实验偏好）
+    - 不可逆操作需要用户确认
+
+    规则：
+    - 本工具必须是你这一轮唯一的工具调用；调用后本轮即结束，系统会等待用户回答
+    - options 给 2-4 项，把你认为最优的选项放在第一位，并给它 recommended: true
+    - 每个选项的 description 用一句话说明为什么选它
+    - question 一句话说清要用户决定什么
+
+    示例：
+    question: "用哪套标定参数继续？"
+    options:
+      [{"label": "参数集 A", "description": "上次实验验证过，数据可复现", "recommended": true},
+       {"label": "参数集 B", "description": "更新但尚未验证"}]
+    """
+    # 正常路径不会执行到这里：agent loop 在执行工具之前就拦截了 ask_user，
+    # 并把用户的回答作为 tool_result 回填。走到这里说明拦截失效。
+    return "Error: ask_user 必须由 agent loop 拦截，当前轮不应执行。"
+
+
 # ==================== Tool List ====================
 
 TOOLS: List[Callable] = [
@@ -624,4 +674,14 @@ TOOLS: List[Callable] = [
     append_core_block,
     replace_core_block,
     search_core_blocks,
+    ask_user,
+]
+
+# 给「会真的执行工具」的 agent 用的工具表（create_react_agent / server 模式）。
+#
+# ask_user 必须排除：那条路径直接跑工具函数，而 ask_user 的正常路径是由
+# graph_thinking 的 agent loop 在执行前拦截、停下等用户回答的。放进这里，
+# 模型只会拿到一句「必须由 agent loop 拦截」的报错串，提问功能等于不存在。
+TOOLS_FOR_REACT: List[Callable] = [
+    t for t in TOOLS if getattr(t, "name", None) != "ask_user"
 ]
