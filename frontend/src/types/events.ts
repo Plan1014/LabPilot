@@ -3,6 +3,7 @@ export type SSEEventType =
   | "tool_call"
   | "tool_result"
   | "text"
+  | "ask_user"
   | "done";
 
 export interface SSEEvent {
@@ -13,10 +14,28 @@ export interface SSEEvent {
   result?: string;
   step: number;
   session_id?: string;
+  // `ask_user` 事件的问题正文与候选选项。
+  question?: string;
+  options?: AskOption[];
   // Populated only on reload from history — not emitted by the live SSE
   // stream. Carries the upstream tool_use id so tool_result can be paired
   // back to the correct tool_call when multiple calls happen in one step.
   tool_call_id?: string;
+}
+
+// ==================== Ask-user types ====================
+
+export interface AskOption {
+  label: string;
+  description?: string;
+  recommended: boolean;
+}
+
+export interface AskAsk {
+  /** 上游 tool_use id —— 回答按它配对 */
+  toolCallId: string;
+  question: string;
+  options: AskOption[];
 }
 
 export interface SessionMeta {
