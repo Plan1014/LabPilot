@@ -174,6 +174,24 @@ def build_turn_row(pending_ask: dict | None, user_text: str) -> dict:
     return {"role": "user", "content": user_text}
 
 
+def build_answer_event(turn_row: dict) -> dict | None:
+    """把「回答轮」的历史行翻译成一条 SSE 事件。
+
+    普通用户轮返回 None —— 那种情况前端自己就有用户气泡了。
+    回答轮返回一条带 ``tool_call_id`` 的 ``tool_result`` 事件，
+    前端靠它把提问卡片标记成已回答。
+    """
+    if not isinstance(turn_row, dict) or turn_row.get("role") != "tool":
+        return None
+    return {
+        "type": "tool_result",
+        "name": turn_row.get("name", ASK_USER_TOOL_NAME),
+        "result": turn_row.get("content", ""),
+        "tool_call_id": turn_row.get("tool_call_id", ""),
+        "step": 0,
+    }
+
+
 def sanitize_ask_message(response, ask: dict):
     """把响应里多余的 tool_use 丢掉，只留下提问。
 

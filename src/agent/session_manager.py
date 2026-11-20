@@ -433,7 +433,7 @@ def estimate_tokens(messages: list) -> int:
 # ==================== Layer 1: micro_compact ====================
 
 KEEP_RECENT = 30
-PRESERVE_RESULT_TOOLS = {"read_file"}
+PRESERVE_RESULT_TOOLS = {"read_file", "ask_user"}
 
 
 def _build_tool_name_map(messages: list) -> dict:

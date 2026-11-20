@@ -337,6 +337,7 @@ def create_session_router():
         """Stream SSE events with session history management."""
         logger.info("[/session/query] called — session_id=%s query_len=%d", req.session_id, len(req.query))
         from src.agent.graph_thinking import build_graph, set_event_emitter
+        from src.agent.ask_user import find_pending_ask, build_turn_row, build_answer_event
         from src.agent.session_manager import (
             message_to_dict, _compact_tool_results,
             estimate_tokens, session_auto_compact,
@@ -390,11 +391,6 @@ def create_session_router():
         event_queue: queue.Queue = queue.Queue()
         seen_keys: set[str] = set()
 
-        # Generate title from first user message if this is a new session
-        if not history:
-            first_title = req.query[:100] if len(req.query) > 100 else req.query
-            update_session_title(session_id, first_title)
-
         def emitter(event: dict):
             # Dedup key includes `step` so distinct LLM iterations of the same
             # tool (e.g. agent calls `bash` three times in a row) are NOT
@@ -418,9 +414,17 @@ def create_session_router():
 
         # Track new messages added during this stream (for saving to Redis)
         new_messages: list[dict] = []
-        # Start with user message
-        user_msg_dict = {"role": "user", "content": req.query}
-        new_messages.append(user_msg_dict)
+
+        # 有待答提问时，本次 query 是对上一问的回答 —— 作为 tool_result 回填，
+        # 模型从 tool_use 断点继续；否则是普通用户消息。
+        pending_ask = find_pending_ask(history)
+        turn_row = build_turn_row(pending_ask, req.query)
+        new_messages.append(turn_row)
+
+        # 回答轮不覆盖会话标题
+        if not history and turn_row["role"] == "user":
+            first_title = req.query[:100] if len(req.query) > 100 else req.query
+            update_session_title(session_id, first_title)
 
         async def event_generator():
             set_event_emitter(emitter)
@@ -458,8 +462,21 @@ def create_session_router():
                             tool_call_id=msg.get("tool_call_id", ""),
                         ))
 
-                # Append current user message
-                langchain_messages.append(HumanMessage(content=req.query))
+                # Append current user message —— 或作为对上一问的回答（tool_result）
+                if turn_row["role"] == "tool":
+                    langchain_messages.append(ToolMessage(
+                        content=turn_row["content"],
+                        name=turn_row["name"],
+                        tool_call_id=turn_row["tool_call_id"],
+                    ))
+                else:
+                    langchain_messages.append(HumanMessage(content=req.query))
+
+                # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
+                # 标记成已回答。
+                answer_event = build_answer_event(turn_row)
+                if answer_event:
+                    event_queue.put(answer_event)
 
                 # Stream events
                 async for event in graph.astream_events(
@@ -490,6 +507,16 @@ def create_session_router():
                         pending.sort(key=lambda e: e.get("step", 0))
                         for ev in pending:
                             yield f"data: {json.dumps(ev)}\n\n"
+                # 最后再 drain 一次 —— 回答事件是在循环开始前 put 的，
+                # 最后一个 on_chain_end 之后产生的事件也不能丢。
+                pending: list[dict] = []
+                while True:
+                    try:
+                        pending.append(event_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                for ev in pending:
+                    yield f"data: {json.dumps(ev)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'step': 0, 'session_id': session_id})}\n\n"
             finally:
                 set_event_emitter(None)
