@@ -1,8 +1,9 @@
 import { CheckCircle, Lightbulb } from "@phosphor-icons/react";
-import type { AskBlock } from "../types/events";
+import type { AskAsk } from "../types/events";
+import { orderOptions } from "../utils/askUser";
 
 interface Props {
-  ask: AskBlock;
+  ask: AskAsk;
   /** 已作答时显示答案；未作答时为 undefined */
   answer?: string;
   /** 点击选项的回调；未传则为只读态 */
@@ -48,6 +49,10 @@ export default function AskUserCard({
     );
   }
 
+  // 模型标了 recommended 的选项排到第一位；没有标则保持原序。
+  // 徽标统一给第一项 —— 用户看到的第一条就是推荐的那条。
+  const options = orderOptions(ask.options);
+
   return (
     <div className="rounded-lg border border-[#d97757] bg-white px-4 py-3 shadow-sm">
       <div className="flex items-start gap-2">
@@ -59,23 +64,23 @@ export default function AskUserCard({
         <p className="text-sm font-medium text-[#1a1a1a]">{ask.question}</p>
       </div>
 
-      {ask.options.length > 0 ? (
+      {options.length > 0 ? (
         <div className="mt-3 flex flex-col gap-2">
-          {ask.options.map((opt) => (
+          {options.map((opt, idx) => (
             <button
               key={opt.label}
               type="button"
               disabled={disabled || !onSelect}
               onClick={() => onSelect?.(opt.label)}
               className={`rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                opt.recommended
+                idx === 0
                   ? "border-[#d97757] bg-[#fef7f4] hover:bg-[#fbeae4]"
                   : "border-[#e5e5e5] bg-white hover:bg-[#fafafa]"
               }`}
             >
               <div className="flex items-center gap-2">
                 <span className="text-sm text-[#1a1a1a]">{opt.label}</span>
-                {opt.recommended && (
+                {idx === 0 && (
                   <span className="rounded-full bg-[#d97757] px-2 py-0.5 text-[10px] font-medium text-white">
                     推荐
                   </span>
@@ -95,7 +100,7 @@ export default function AskUserCard({
         <p className="mt-2 text-xs text-[#999999]">等待本轮结束…</p>
       )}
 
-      {ask.options.length > 0 && (
+      {options.length > 0 && (
         <p className="mt-2 text-xs text-[#999999]">或直接在下方输入框作答</p>
       )}
     </div>
