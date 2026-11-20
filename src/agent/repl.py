@@ -40,6 +40,19 @@ def can_set_idle(history: list[dict]) -> bool:
     """
     return find_pending_ask(history) is None
 
+
+def should_compact(history: list[dict], turn_row: dict, threshold: int | None = None) -> bool:
+    """这一轮要不要触发自动压缩。
+
+    回答轮不压缩：auto_compact 会把整个 history 换成一行摘要，提问的
+    tool_use 和刚记下的 tool_result 双双消失 —— 模型这一轮根本看不到
+    用户的回答。
+    """
+    if isinstance(turn_row, dict) and turn_row.get("role") == "tool":
+        return False
+    limit = TOKEN_THRESHOLD if threshold is None else threshold
+    return estimate_tokens(history) > limit
+
 # ==================== Loop Detection ====================
 
 LOOP_WARNING_PROMPT = """
@@ -190,7 +203,7 @@ def main() -> None:
         # === Core Memory 注入结束 ===
 
         # 添加用户消息到历史（有待答提问时，这一行就是对上一问的回答）
-        append_user_turn(history, query)
+        turn_row = append_user_turn(history, query)
 
         # 检测工具循环
         loop_warning, loop_block = detect_tool_loop(history)
@@ -205,8 +218,8 @@ def main() -> None:
         if loop_warning:
             history.append({"role": "user", "content": loop_warning})
 
-        # 自动压缩检查
-        if estimate_tokens(history) > TOKEN_THRESHOLD:
+        # 自动压缩检查（回答轮不压缩 —— 会把刚记下的提问与回答一起抹掉）
+        if should_compact(history, turn_row):
             print("[auto-compact triggered]", flush=True)
             history = auto_compact(history)
 

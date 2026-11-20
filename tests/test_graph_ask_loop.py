@@ -77,3 +77,38 @@ def test_sibling_tool_calls_are_dropped(monkeypatch):
         for tc in (getattr(m, "tool_calls", None) or [])
     ]
     assert names == ["ask_user"]
+
+
+def test_response_tool_call_id_collision_is_renamed(monkeypatch):
+    """上游每轮都从 call_0 重新编号时，新提问的 id 不能撞上历史里的旧 id。
+
+    撞上了，回答会配到旧的提问上 —— 用户根本不会被问到，提问静默消失。
+    """
+    from langchain_core.messages import HumanMessage, ToolMessage
+
+    from src.agent import graph_thinking
+
+    fake = _fake_llm({
+        "id": "call_0", "name": "ask_user", "type": "tool_call",
+        "args": {"question": "第二个问题？", "options": []},
+    })
+    monkeypatch.setattr(graph_thinking, "llm", fake)
+
+    history = [
+        HumanMessage(content="先问一次"),
+        AIMessage(content="", tool_calls=[
+            {"id": "call_0", "name": "ask_user", "args": {"question": "旧问题？"}},
+        ]),
+        ToolMessage(content="旧回答", tool_call_id="call_0", name="ask_user"),
+    ]
+
+    graph = graph_thinking.build_graph()
+    result = graph.invoke({
+        "messages": history, "pending_tool_calls": [], "step_count": 0,
+    })
+
+    new_id = result["pending_ask"]["tool_call_id"]
+    assert new_id != "call_0"
+    # 落库的 assistant 消息必须带上同一个新 id，否则回答配不上
+    last = result["messages"][-1]
+    assert [tc["id"] for tc in last.tool_calls] == [new_id]

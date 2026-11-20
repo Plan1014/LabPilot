@@ -55,3 +55,27 @@ def test_notification_idle_allowed_after_answer():
     history.append({"role": "tool", "name": "ask_user", "content": "A",
                     "tool_call_id": "c1"})
     assert can_set_idle(history) is True
+
+
+def test_should_not_compact_on_answer_turn():
+    """回答轮不能压缩 —— 压缩会把刚记下的提问和回答一起抹掉。
+
+    auto_compact 把整个 history 换成一行摘要，提问的 tool_use 与刚记下的
+    tool_result 双双消失，模型这一轮根本看不到用户的回答。
+    """
+    from src.agent.repl import should_compact
+
+    history = _ask_history()
+    history.append({"role": "tool", "name": "ask_user", "content": "用 A",
+                    "tool_call_id": "c1"})
+
+    assert should_compact(history, history[-1], threshold=0) is False
+
+
+def test_should_compact_on_normal_turn():
+    from src.agent.repl import should_compact
+
+    history = [{"role": "user", "content": "继续干活"}]
+    assert should_compact(history, history[-1], threshold=0) is True
+    # 没超阈值就不压缩
+    assert should_compact(history, history[-1], threshold=100000) is False

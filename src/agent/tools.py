@@ -676,3 +676,12 @@ TOOLS: List[Callable] = [
     search_core_blocks,
     ask_user,
 ]
+
+# 给「会真的执行工具」的 agent 用的工具表（create_react_agent / server 模式）。
+#
+# ask_user 必须排除：那条路径直接跑工具函数，而 ask_user 的正常路径是由
+# graph_thinking 的 agent loop 在执行前拦截、停下等用户回答的。放进这里，
+# 模型只会拿到一句「必须由 agent loop 拦截」的报错串，提问功能等于不存在。
+TOOLS_FOR_REACT: List[Callable] = [
+    t for t in TOOLS if getattr(t, "name", None) != "ask_user"
+]
