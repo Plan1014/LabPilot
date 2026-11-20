@@ -7,7 +7,12 @@ import AskUserCard from "./AskUserCard";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { getStoredSessionId, persistSessionId, parseHistoryMessages } from "../hooks/useSession";
-import { deriveAskState, shouldDeliverNotification } from "../utils/askUser";
+import {
+  deriveAskState,
+  shouldDeliverNotification,
+  shouldKeepOnStop,
+  inputPlaceholder,
+} from "../utils/askUser";
 import type { Message as MessageType, SessionMeta } from "../types/events";
 import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
@@ -246,9 +251,21 @@ export default function ChatWindow() {
     // 1. Abort SSE request
     abort();
 
-    // 2. Delete the streaming assistant message
+    // 2. Delete the streaming assistant message —— 除非它里面有一个
+    //    还没被回答的提问：删掉的话提问卡片消失，用户下一句话会被后端
+    //    静默当成那个提问的回答。
     if (streamingMessageId) {
-      setMessages((prev) => prev.filter((msg) => msg.id !== streamingMessageId));
+      setMessages((prev) =>
+        prev
+          .filter(
+            (msg) =>
+              msg.id !== streamingMessageId ||
+              shouldKeepOnStop(msg, askState.answers)
+          )
+          .map((msg) =>
+            msg.id === streamingMessageId ? { ...msg, isComplete: true } : msg
+          )
+      );
     }
 
     // 3. Delete the user message that triggered the request
@@ -260,7 +277,7 @@ export default function ChatWindow() {
     // 4. Reset streaming state
     setIsStreaming(false);
     setStreamingMessageId(null);
-  }, [abort, streamingMessageId]);
+  }, [abort, streamingMessageId, askState.answers]);
 
   const loadSession = useCallback(
     async (id: string) => {
@@ -368,7 +385,12 @@ export default function ChatWindow() {
       )}
 
       {/* Input */}
-      <InputArea onSubmit={handleSubmit} isStreaming={isStreaming} onStop={handleStop} />
+      <InputArea
+        onSubmit={handleSubmit}
+        isStreaming={isStreaming}
+        onStop={handleStop}
+        placeholder={inputPlaceholder(askState.pendingAsk !== null)}
+      />
 
       {/* History Modal */}
       {showHistory && (

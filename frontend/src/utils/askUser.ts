@@ -112,3 +112,25 @@ export function shouldDeliverNotification(state: {
   if (state.isStreaming || state.streamingMessageId) return false;
   return true;
 }
+
+/**
+ * 停止本轮时，这条消息要不要留在对话里。
+ *
+ * 消息里若有一个还没被回答的提问，就得留着 —— 删掉的话前端不再提示「在等
+ * 回答」，而后端那边提问还挂着，用户下一句话会被静默当成回答。
+ */
+export function shouldKeepOnStop(
+  message: Message,
+  answers: Map<string, string>
+): boolean {
+  for (const ev of message.events ?? []) {
+    const ask = askFromEvent(ev);
+    if (ask && !answers.has(ask.toolCallId)) return true;
+  }
+  return false;
+}
+
+/** 输入框的占位文案 —— 有待答提问时要让用户知道下一句是「回答」。 */
+export function inputPlaceholder(hasPendingAsk: boolean): string {
+  return hasPendingAsk ? "回答上面的提问…" : "Ask LabPilot...";
+}

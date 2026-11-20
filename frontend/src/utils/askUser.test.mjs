@@ -5,6 +5,8 @@ import {
   orderOptions,
   deriveAskState,
   shouldDeliverNotification,
+  shouldKeepOnStop,
+  inputPlaceholder,
 } from "./askUser.ts";
 
 test("normalizeOptions 归一化模型给的原始选项", () => {
@@ -225,4 +227,40 @@ test("shouldDeliverNotification 一切就绪时投递通知", () => {
     }),
     true,
   );
+});
+
+test("shouldKeepOnStop 保留还没被回答的提问", () => {
+  const message = {
+    id: "m1",
+    role: "assistant",
+    content: "",
+    isComplete: false,
+    events: [
+      {
+        type: "ask_user",
+        question: "用哪套？",
+        options: [],
+        tool_call_id: "c1",
+        step: 1,
+      },
+    ],
+  };
+  assert.equal(shouldKeepOnStop(message, new Map()), true);
+  assert.equal(shouldKeepOnStop(message, new Map([["c1", "参数集 A"]])), false);
+});
+
+test("shouldKeepOnStop 普通消息不保留", () => {
+  const message = {
+    id: "m1",
+    role: "assistant",
+    content: "",
+    isComplete: false,
+    events: [{ type: "text", content: ["在做一件事"], step: 1 }],
+  };
+  assert.equal(shouldKeepOnStop(message, new Map()), false);
+});
+
+test("inputPlaceholder 有待答提问时提示这是回答", () => {
+  assert.equal(inputPlaceholder(true), "回答上面的提问…");
+  assert.equal(inputPlaceholder(false), "Ask LabPilot...");
 });
