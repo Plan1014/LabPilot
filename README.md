@@ -169,8 +169,33 @@ LabPilot/
 | `replace_core_block(label, old, new)` | 替换 CoreBlock 内文 |
 | `search_core_blocks(query)` | 搜索 CoreBlock 内容 |
 | `compact(focus="")` | 主动触发当前会话压缩 |
+| `ask_user(question, options)` | 向用户提问并停下等待回答 |
 
 危险命令拦截：`bash` 内置 `_DANGEROUS_PATTERNS`（`rm / del / rd / Remove-Item / rmdir / format / diskpart / taskkill / kill -9 / net stop` 等），命中即拒绝执行。
+
+---
+
+## 向 Agent 提问
+
+Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（多方案抉择、只有用户
+才知道的信息、不可逆操作确认），它会调用这个工具提问：
+
+```json
+{
+  "question": "用哪套标定参数继续？",
+  "options": [
+    {"label": "参数集 A", "description": "上次实验验证过，数据可复现", "recommended": true},
+    {"label": "参数集 B", "description": "更新但尚未验证"}
+  ]
+}
+```
+
+- **提问即中断**：调用 `ask_user` 后 agent loop 当场结束，不会继续调用任何工具。
+- **回答即返回值**：你的下一条输入就是这次调用的返回值，agent 从断点继续。
+  CLI 直接打字即可；前端点选选项或自由输入。
+- **推荐项在前**：前端把 `recommended` 的选项排在第一位并标注「推荐」，
+  每个选项下方是模型给的一句理由。
+- **等待期间不打扰**：有待答提问时，通知中心不会自动触发 agent。
 
 ---
 
