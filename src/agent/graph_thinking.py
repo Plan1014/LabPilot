@@ -25,6 +25,7 @@ from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
 from src.agent.tools import TOOLS, is_failure_result
+from src.agent.ask_user import detect_ask, sanitize_ask_message, format_ask_cli
 from src.agent.memory import process_pending_self, PendingCache
 from src.agent.memory.constants import PENDING_THRESHOLD
 
@@ -147,6 +148,7 @@ class InterleavedState:
     pending_tool_calls: list = field(default_factory=list)  # 临时存储待执行的工具调用
     step_count: int = 0
     session_id: Optional[str] = None  # None = REPL (不写 pending);WebSocket 注入 uuid
+    pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
 
 
 # ==================== Content Block Parsing ====================
@@ -275,6 +277,23 @@ def print_final_text(text_blocks: list[str], step: int) -> None:
     print(flush=True)
 
 
+def print_ask(ask: dict, step: int) -> None:
+    """Emit the ask event and print the CLI version.
+
+    提问之后本轮即结束 —— 前端据此弹出选项卡片，等待用户回答。
+    """
+    emitter = _event_emitter.get()
+    if emitter:
+        emitter({
+            "type": "ask_user",
+            "question": ask.get("question", ""),
+            "options": ask.get("options", []),
+            "tool_call_id": ask.get("tool_call_id", ""),
+            "step": step,
+        })
+    print(f"\n\033[93m{format_ask_cli(ask)}\033[0m", flush=True)
+
+
 # ==================== Helper Functions ====================
 
 _pending_cache: Optional[PendingCache] = None
@@ -387,6 +406,21 @@ def generate(state: InterleavedState) -> dict:
     # Print thinking immediately
     for thinking in thinking_blocks:
         print_thinking(thinking, step)
+
+    # 提问即终止本轮：模型调用 ask_user 后，agent loop 必须停下等用户回答，
+    # 不能继续执行其它工具。响应里的兄弟 tool_use 一并丢弃 —— 它们没有对应的
+    # tool_result，留在历史里会让下一轮上游 API 报 400。
+    ask = detect_ask(tool_use_blocks)
+    if ask:
+        response = sanitize_ask_message(response, ask)
+        print_final_text(text_blocks, step)
+        print_ask(ask, step)
+        return {
+            "messages": [response],
+            "pending_tool_calls": [],
+            "step_count": step,
+            "pending_ask": ask,
+        }
 
     # 如果没有工具调用，打印最终文本
     if not tool_use_blocks:
