@@ -7,12 +7,45 @@ archival_store → prompt_context → tools → src.agent.memory → archival �
 """
 
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
 
 DEFAULT_RELEVANCE_THRESHOLD = 0.45
 MEMORY_RELEVANCE_THRESHOLD_ENV = "MEMORY_RELEVANCE_THRESHOLD"
+
+FACT_CANDIDATES = 5
+SUMMARY_CANDIDATES = 3
+RETRIEVED_MEMORY_LIMIT = 3
+SUMMARY_MEMORY_LIMIT = 1
+
+
+@dataclass
+class FactEntry:
+    text: str
+    distance: float
+    timestamp: float | None = None
+
+
+@dataclass
+class SummaryEntry:
+    text: str
+    distance: float
+    timestamp: float | None = None
+
+
+@dataclass
+class RetrievedMemory:
+    facts: list[FactEntry] = field(default_factory=list)
+    summaries: list[SummaryEntry] = field(default_factory=list)
+
+
+def filter_by_distance(entries, threshold):
+    """按 cosine distance 过滤。threshold=None 表示不过门槛。"""
+    if threshold is None:
+        return list(entries)
+    return [e for e in entries if e.distance <= threshold]
 
 
 def relevance_threshold() -> float:
