@@ -8,12 +8,11 @@ import json
 import time
 from typing import Any, Dict, Union
 
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
-from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
+from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED
 from src.agent.llm import summarize_text
-from src.agent.session_manager import message_to_dict, dict_to_ai_message
+from src.agent.session_manager import message_to_dict
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
 from src.agent.ask_user import build_turn_row, find_pending_ask
@@ -182,7 +181,6 @@ def main() -> None:
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         # 延迟初始化 CoreMemoryManager（在函数属性上缓存）
         if not hasattr(run_agent_query, '_core_memory_manager'):
@@ -224,38 +222,22 @@ def main() -> None:
             history = auto_compact(history)
 
         # 转换为 LangChain messages
-        langchain_messages = []
-
-        # Base system prompt (Skills descriptions — LangChain doesn't auto-inject these)
-        base_system = SYSTEM_PROMPT_TEMPLATE.format(
-            workdir=WORKDIR,
-            skills=SKILLS.descriptions(),
-        )
-        langchain_messages.append(SystemMessage(content=base_system))
+        from src.agent.prompt_context import build_prompt_messages
+        from src.agent.tools import SKILLS, TOOLS
 
         # 注入 Core Memory 作为 system message（只有变化时才注入）
         compiled_memory = getattr(run_agent_query, '_compiled_memory', '')
-        if compiled_memory:
-            langchain_messages.append(SystemMessage(content=compiled_memory))
 
-        for msg in history:
-            if isinstance(msg, HumanMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, AIMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, ToolMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, dict):
-                if msg.get("role") == "user":
-                    langchain_messages.append(HumanMessage(content=msg.get("content", "")))
-                elif msg.get("role") == "assistant":
-                    langchain_messages.append(dict_to_ai_message(msg))
-                elif msg.get("role") == "tool":
-                    langchain_messages.append(ToolMessage(
-                        content=msg.get("content", ""),
-                        name=msg.get("name", ""),
-                        tool_call_id=msg.get("tool_call_id", ""),
-                    ))
+        # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 历史/当前轮，
+        # 每条都带来源标签。REPL 不做检索注入（设计上不新增噪音源）。
+        # history 里已经含当前这轮（append_user_turn 在前面执行过）。
+        langchain_messages = build_prompt_messages(
+            history=list(history),
+            core_memory=compiled_memory,
+            retrieved=None,
+            tools=TOOLS,
+            skills=SKILLS.descriptions(),
+        )
 
         # 调用 graph
         try:

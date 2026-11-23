@@ -7,8 +7,11 @@ archival_store → prompt_context → tools → src.agent.memory → archival �
 """
 
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
 
@@ -84,15 +87,33 @@ def build_system_prompt(tools, skills: str, now=None) -> str:
 
 
 def label_user_message(text: str) -> str:
-    return f"<UserMessage>{text}</UserMessage>"
+    return f"<UserMessage>{_escape_tags(text)}</UserMessage>"
 
 
 def label_user_answer(text: str, name: str) -> str:
-    return f'<UserAnswer name="{name}">{text}</UserAnswer>'
+    return f'<UserAnswer name="{name}">{_escape_tags(text)}</UserAnswer>'
 
 
 def label_tool_result(text: str, name: str) -> str:
-    return f'<ToolResult name="{name}">{text}</ToolResult>'
+    return f'<ToolResult name="{name}">{_escape_tags(text)}</ToolResult>'
+
+
+# 标签是提示词里的结构边界 —— 用户输入不能自己伪造一个来骗模型。
+# 只中和已知标签的字面量，其它尖括号（代码里的 <、>）原样保留。
+_TAG_LITERALS = (
+    "UserMessage", "UserAnswer", "CoreMemory",
+    "RetrievedMemory", "ToolResult", "AvailableTools",
+)
+_TAG_PATTERN = re.compile(
+    r"<\s*/?\s*(" + "|".join(_TAG_LITERALS) + r")\b"
+)
+
+
+def _escape_tags(text: str) -> str:
+    """把用户内容里形如标签的字面量降级成普通文本（只换 '<'，保留可读性）。"""
+    if not isinstance(text, str):
+        text = str(text)
+    return _TAG_PATTERN.sub(lambda m: "&lt;" + m.group(0)[1:], text)
 
 
 def _fmt_epoch(ts: float | None) -> str:
@@ -126,3 +147,68 @@ def render_retrieved_memory(retrieved: RetrievedMemory, now=None) -> str:
 def _stamp_suffix(ts: float | None) -> str:
     stamp = _fmt_epoch(ts)
     return f", 记录于 {stamp}" if stamp else ""
+
+
+ASK_USER_TOOL_NAME = "ask_user"
+
+
+def build_conversation_messages(history):
+    """把历史行变成送进模型的消息，每条都标出来源。
+
+    assistant 行不加标签 —— 那是模型自己说过的话。
+    """
+    from src.agent.session_manager import dict_to_ai_message
+
+    messages = []
+    for row in history or []:
+        if not isinstance(row, dict):
+            # 已经是 LangChain 消息对象 —— 补上标签后原样传下去。
+            if isinstance(row, HumanMessage):
+                messages.append(HumanMessage(content=label_user_message(row.content)))
+            elif isinstance(row, ToolMessage):
+                name = row.name or ""
+                labeled = (label_user_answer(row.content, name)
+                           if name == ASK_USER_TOOL_NAME
+                           else label_tool_result(row.content, name))
+                messages.append(ToolMessage(content=labeled, name=name,
+                                            tool_call_id=row.tool_call_id))
+            elif isinstance(row, AIMessage):
+                messages.append(row)
+            continue
+        role = row.get("role", "")
+        content = row.get("content", "")
+        if role == "user":
+            messages.append(HumanMessage(content=label_user_message(content)))
+        elif role == "assistant":
+            messages.append(dict_to_ai_message(row))
+        elif role == "tool":
+            name = row.get("name", "")
+            if name == ASK_USER_TOOL_NAME:
+                labeled = label_user_answer(content, name)
+            else:
+                labeled = label_tool_result(content, name)
+            messages.append(ToolMessage(
+                content=labeled,
+                name=name,
+                tool_call_id=row.get("tool_call_id", ""),
+            ))
+    return messages
+
+
+def build_prompt_messages(history, core_memory="", retrieved=None, tools=None,
+                          skills="", now=None):
+    """组装一次模型调用要用的全部消息。
+
+    顺序：系统提示词 → Core Memory → 检索记忆 → 历史/当前轮。
+    """
+    messages = [SystemMessage(content=build_system_prompt(tools, skills, now=now))]
+
+    if core_memory:
+        messages.append(SystemMessage(content=f"<CoreMemory>{core_memory}</CoreMemory>"))
+
+    block = render_retrieved_memory(retrieved, now=now) if retrieved else ""
+    if block:
+        messages.append(SystemMessage(content=block))
+
+    messages.extend(build_conversation_messages(history))
+    return messages

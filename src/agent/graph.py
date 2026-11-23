@@ -9,16 +9,13 @@ platform. Do NOT pass a custom checkpointer here.
 
 from langgraph.prebuilt import create_react_agent
 
-from src.agent.config import WORKDIR
 from src.agent.llm import llm
+from src.agent.prompt_context import build_system_prompt
 from src.agent.tools import TOOLS_FOR_REACT, SKILLS
 
 
 # System prompt used by the server agent
-system_prompt = f"""You are a lab agent at {WORKDIR}. Use tools to solve tasks.
-# Use spawn_subagent for multi-step or isolated work.  # 临时禁用 2026-08-28
-Use load_skill for specialized knowledge.
-Skills: {SKILLS.descriptions()}"""
+system_prompt = build_system_prompt(TOOLS_FOR_REACT, SKILLS.descriptions())
 
 
 def _build_graph():
