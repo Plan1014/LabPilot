@@ -25,6 +25,7 @@ from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMes
 from langgraph.graph import StateGraph, END, add_messages
 
 from src.agent.llm import llm
+from src.agent.prompt_context import strip_labels
 from src.agent.tools import TOOLS, is_failure_result
 from src.agent.ask_user import detect_ask, sanitize_ask_message, format_ask_cli
 from src.agent.memory import process_pending_self, PendingCache
@@ -319,15 +320,21 @@ def _save_to_pending(messages: list, session_id: Optional[str]) -> None:
         return
 
     # 转换为dict格式以便JSON序列化
+    # 注意：state.messages 里已经带了提示词标签（<UserMessage> 等），那些标签是
+    # 给主模型看的结构边界，不能流进 pending cache —— memory sub-agent 读到带标签
+    # 的文本，会把标签一起当成记忆内容写进长期记忆。
     dict_messages = []
     for msg in messages:
         if hasattr(msg, "content"):
             dict_messages.append({
                 "role": getattr(msg, "role", "unknown"),
-                "content": getattr(msg, "content", "")
+                "content": strip_labels(getattr(msg, "content", ""))
             })
         elif isinstance(msg, dict):
-            dict_messages.append(msg)
+            row = dict(msg)
+            if isinstance(row.get("content"), str):
+                row["content"] = strip_labels(row["content"])
+            dict_messages.append(row)
     if dict_messages:
         cache = _get_pending_cache()
         cache.save_pending(dict_messages, session_id=session_id)

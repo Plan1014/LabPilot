@@ -98,14 +98,25 @@ def label_tool_result(text: str, name: str) -> str:
     return f'<ToolResult name="{name}">{_escape_tags(text)}</ToolResult>'
 
 
+def label_system_note(text: str) -> str:
+    """系统自己生成的内容（压缩摘要、循环警告）—— 不是用户说的话。"""
+    return f"<SystemNote>{_escape_tags(text)}</SystemNote>"
+
+
+def label_current_request(text: str) -> str:
+    """当前这一轮用户真正在问的那句话 —— 只有它是要回答的对象。"""
+    return f"<CurrentRequest>{_escape_tags(text)}</CurrentRequest>"
+
+
 # 标签是提示词里的结构边界 —— 用户输入不能自己伪造一个来骗模型。
 # 只中和已知标签的字面量，其它尖括号（代码里的 <、>）原样保留。
 _TAG_LITERALS = (
-    "UserMessage", "UserAnswer", "CoreMemory",
+    "UserMessage", "UserAnswer", "CurrentRequest", "CoreMemory", "SystemNote",
     "RetrievedMemory", "ToolResult", "AvailableTools",
 )
 _TAG_PATTERN = re.compile(
-    r"<\s*/?\s*(" + "|".join(_TAG_LITERALS) + r")\b"
+    r"<\s*/?\s*(" + "|".join(_TAG_LITERALS) + r")\b",
+    re.IGNORECASE,
 )
 
 
@@ -114,6 +125,47 @@ def _escape_tags(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
     return _TAG_PATTERN.sub(lambda m: "&lt;" + m.group(0)[1:], text)
+
+
+# 反向操作：把标签外壳剥掉，只留内容。给「需要原始文本」的下游用
+# （pending cache → memory sub-agent，标签不该进长期记忆）。
+_LABEL_PATTERN = re.compile(
+    r"<\s*(?P<tag>" + "|".join(_TAG_LITERALS) + r")(?P<attrs>[^>]*)>"
+    r"(?P<body>.*?)<\s*/\s*(?P=tag)\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_labels(text):
+    """剥掉已知标签的外壳，保留里面的原文。"""
+    if not isinstance(text, str):
+        return text
+    return _LABEL_PATTERN.sub(lambda m: m.group("body"), text)
+
+
+def _content_to_text(content) -> str:
+    """把各种形态的 content 归一成纯文本。
+
+    Anthropic 模式下 content 是 block 列表，OpenAI 模式下 text 字段还可能是
+    字符串列表 —— 直接 str() 会得到 Python repr，不能进提示词。
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text", "")
+                if isinstance(text, list):
+                    parts.extend(t for t in text if isinstance(t, str))
+                elif isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return str(content)
 
 
 def _fmt_epoch(ts: float | None) -> str:
@@ -131,11 +183,13 @@ def render_retrieved_memory(retrieved: RetrievedMemory, now=None) -> str:
     if retrieved.summaries:
         lines.append("【相关历史对话摘要】")
         for s in retrieved.summaries:
-            lines.append(f"- (相似度 {s.distance:.3f}{_stamp_suffix(s.timestamp)}) {s.text}")
+            lines.append(f"- (距离 {s.distance:.3f}，越小越相关{_stamp_suffix(s.timestamp)}) "
+                         f"{_escape_tags(s.text)}")
     if retrieved.facts:
         lines.append("【相关事实记忆 (参数/结论)】")
         for f in retrieved.facts:
-            lines.append(f"- (相似度 {f.distance:.3f}{_stamp_suffix(f.timestamp)}) {f.text}")
+            lines.append(f"- (距离 {f.distance:.3f}，越小越相关{_stamp_suffix(f.timestamp)}) "
+                         f"{_escape_tags(f.text)}")
     if not lines:
         return ""
     now = now or datetime.now(timezone.utc)
@@ -151,6 +205,46 @@ def _stamp_suffix(ts: float | None) -> str:
 
 ASK_USER_TOOL_NAME = "ask_user"
 
+# 历史行的归类：决定哪一行是「当前请求」，以及给它套哪个标签。
+_KIND_USER = "user"        # 用户说的话
+_KIND_ANSWER = "answer"    # 用户对模型提问的回答
+_KIND_SYSTEM = "system"    # 系统自己生成的（压缩摘要、循环警告）
+_KIND_OTHER = "other"      # assistant / 其它工具
+
+
+def _row_kind(row) -> str:
+    if isinstance(row, dict):
+        role = row.get("role", "")
+        if role == "user":
+            return _KIND_SYSTEM if row.get("origin") == "system" else _KIND_USER
+        if role == "tool":
+            return _KIND_ANSWER if row.get("name") == ASK_USER_TOOL_NAME else _KIND_OTHER
+        return _KIND_OTHER
+    if isinstance(row, SystemMessage):
+        return _KIND_SYSTEM
+    if isinstance(row, HumanMessage):
+        return _KIND_USER
+    if isinstance(row, ToolMessage):
+        return _KIND_ANSWER if (row.name or "") == ASK_USER_TOOL_NAME else _KIND_OTHER
+    return _KIND_OTHER
+
+
+def _current_request_index(history) -> int:
+    """当前请求是哪一行 —— 多轮对话里模型得知道该回答哪一句。
+
+    最后一条用户输入（提问或回答）才是当前请求；如果最后一条是
+    ask_user 的回答，那它自己就是当前请求（<UserAnswer>），前一句提问
+    反而是背景。
+    """
+    last = -1
+    for i, row in enumerate(history or []):
+        kind = _row_kind(row)
+        if kind in (_KIND_USER, _KIND_ANSWER):
+            last = i
+    if last < 0 or _row_kind(history[last]) == _KIND_ANSWER:
+        return -1
+    return last
+
 
 def build_conversation_messages(history):
     """把历史行变成送进模型的消息，每条都标出来源。
@@ -159,26 +253,45 @@ def build_conversation_messages(history):
     """
     from src.agent.session_manager import dict_to_ai_message
 
+    history = list(history or [])
+    current_index = _current_request_index(history)
+
     messages = []
-    for row in history or []:
+    for i, row in enumerate(history):
+        kind = _row_kind(row)
         if not isinstance(row, dict):
             # 已经是 LangChain 消息对象 —— 补上标签后原样传下去。
             if isinstance(row, HumanMessage):
-                messages.append(HumanMessage(content=label_user_message(row.content)))
+                text = _content_to_text(row.content)
+                if kind == _KIND_USER and i == current_index:
+                    messages.append(HumanMessage(content=label_current_request(text)))
+                else:
+                    messages.append(HumanMessage(content=label_user_message(text)))
             elif isinstance(row, ToolMessage):
                 name = row.name or ""
-                labeled = (label_user_answer(row.content, name)
+                text = _content_to_text(row.content)
+                labeled = (label_user_answer(text, name)
                            if name == ASK_USER_TOOL_NAME
-                           else label_tool_result(row.content, name))
+                           else label_tool_result(text, name))
                 messages.append(ToolMessage(content=labeled, name=name,
                                             tool_call_id=row.tool_call_id))
+            elif isinstance(row, SystemMessage):
+                messages.append(HumanMessage(
+                    content=label_system_note(_content_to_text(row.content))))
             elif isinstance(row, AIMessage):
                 messages.append(row)
             continue
         role = row.get("role", "")
-        content = row.get("content", "")
+        content = _content_to_text(row.get("content", ""))
         if role == "user":
-            messages.append(HumanMessage(content=label_user_message(content)))
+            # origin=system 的行是系统生成的（压缩摘要、循环警告），
+            # 标成 <UserMessage> 会让模型去回答它而不是用户的真问题。
+            if kind == _KIND_SYSTEM:
+                messages.append(HumanMessage(content=label_system_note(content)))
+            elif i == current_index:
+                messages.append(HumanMessage(content=label_current_request(content)))
+            else:
+                messages.append(HumanMessage(content=label_user_message(content)))
         elif role == "assistant":
             messages.append(dict_to_ai_message(row))
         elif role == "tool":
@@ -204,7 +317,8 @@ def build_prompt_messages(history, core_memory="", retrieved=None, tools=None,
     messages = [SystemMessage(content=build_system_prompt(tools, skills, now=now))]
 
     if core_memory:
-        messages.append(SystemMessage(content=f"<CoreMemory>{core_memory}</CoreMemory>"))
+        messages.append(SystemMessage(
+            content=f"<CoreMemory>{_escape_tags(core_memory)}</CoreMemory>"))
 
     block = render_retrieved_memory(retrieved, now=now) if retrieved else ""
     if block:

@@ -148,7 +148,9 @@ def auto_compact(messages: list) -> list:
     # [新增]将真正的摘要持久化到 ChromaDB
     memory_system.save_summary(summary, filepath=str(path))
     # =====================================
-    return [{"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"}]
+    # origin=system —— 这行是压缩摘要，不是用户说的话。
+    return [{"role": "user", "origin": "system",
+             "content": f"[Compressed. Transcript: {path}]\n{summary}"}]
 
 
 # ==================== REPL Main ====================
@@ -209,12 +211,13 @@ def main() -> None:
         # 如果 6+ 循环，直接阻断
         if loop_block:
             print(f"\033[31m{loop_block}\033[0m")
-            history = [{"role": "user", "content": "Please respond with a brief status summary."}]
+            history = [{"role": "user", "origin": "system",
+                        "content": "Please respond with a brief status summary."}]
             return
 
         # 如果 3+ 循环，注入警告
         if loop_warning:
-            history.append({"role": "user", "content": loop_warning})
+            history.append({"role": "user", "origin": "system", "content": loop_warning})
 
         # 自动压缩检查（回答轮不压缩 —— 会把刚记下的提问与回答一起抹掉）
         if should_compact(history, turn_row):

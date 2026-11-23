@@ -1,5 +1,5 @@
 import src.agent.memory.archival_store as store
-from src.agent.prompt_context import RetrievedMemory
+from src.agent.prompt_context import RetrievedMemory, relevance_threshold
 
 
 class _StubCollection:
@@ -90,3 +90,31 @@ def test_retrieve_context_keeps_plain_text():
 def test_retrieve_returns_retrieved_memory_type():
     r = _retriever(["x"], [0.1])
     assert isinstance(r.retrieve("q", threshold=0.45), RetrievedMemory)
+
+
+def test_distance_exactly_at_threshold_is_kept():
+    """门槛是闭区间：distance == 0.45 应当保留。"""
+    r = _retriever(["正好在门槛上"], [0.45])
+    result = r.retrieve("q", threshold=0.45)
+    assert [f.text for f in result.facts] == ["正好在门槛上"]
+
+
+def test_threshold_is_configurable(monkeypatch):
+    """MEMORY_RELEVANCE_THRESHOLD 改了，检索结果跟着改。"""
+    monkeypatch.setenv("MEMORY_RELEVANCE_THRESHOLD", "0.2")
+    r = _retriever(["近的", "远的"], [0.1, 0.3])
+    result = r.retrieve("q", threshold=relevance_threshold())
+    assert [f.text for f in result.facts] == ["近的"]
+
+
+def test_search_memory_tool_is_not_gated(monkeypatch):
+    """工具路径不过门槛 —— 只有自动注入才过。"""
+    import src.agent.tools as tools_mod
+
+    class _StubRetriever:
+        def retrieve_context(self, query):
+            return "很旧的记忆原文"
+
+    monkeypatch.setattr(tools_mod, "memory_retriever", _StubRetriever())
+    out = tools_mod.search_memory.invoke({"query": "很旧的事"})
+    assert "很旧的记忆原文" in out
