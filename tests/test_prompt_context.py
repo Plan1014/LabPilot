@@ -1,11 +1,15 @@
 from datetime import datetime, timezone
 
 from src.agent.prompt_context import (
+    FactEntry,
+    RetrievedMemory,
+    SummaryEntry,
     build_system_prompt,
     label_tool_result,
     label_user_answer,
     label_user_message,
     relevance_threshold,
+    render_retrieved_memory,
     tool_name_index,
 )
 
@@ -62,3 +66,57 @@ def test_relevance_threshold_reads_env(monkeypatch):
 def test_relevance_threshold_falls_back_on_garbage(monkeypatch):
     monkeypatch.setenv("MEMORY_RELEVANCE_THRESHOLD", "abc")
     assert relevance_threshold() == 0.45
+
+
+def test_system_prompt_wraps_tools_in_available_tools_tag():
+    prompt = build_system_prompt([_FakeTool("bash")], "- a")
+    assert "<AvailableTools>bash</AvailableTools>" in prompt
+
+
+def test_render_retrieved_memory_empty_returns_empty_string():
+    assert render_retrieved_memory(RetrievedMemory()) == ""
+
+
+def test_render_retrieved_memory_wraps_in_tag():
+    block = render_retrieved_memory(
+        RetrievedMemory(facts=[FactEntry(text="相关事实", distance=0.359)])
+    )
+    assert block.startswith("<RetrievedMemory>")
+    assert block.endswith("</RetrievedMemory>")
+    assert "相关事实" in block
+
+
+def test_render_retrieved_memory_includes_similarity():
+    block = render_retrieved_memory(
+        RetrievedMemory(facts=[FactEntry(text="相关事实", distance=0.359)])
+    )
+    assert "0.359" in block
+
+
+def test_render_retrieved_memory_includes_current_time():
+    now = datetime(2026, 11, 23, 16, 20, 0, tzinfo=timezone.utc)
+    block = render_retrieved_memory(
+        RetrievedMemory(facts=[FactEntry(text="x", distance=0.1)]), now=now
+    )
+    assert "2026-11-23" in block
+
+
+def test_render_retrieved_memory_includes_fact_timestamp():
+    block = render_retrieved_memory(
+        RetrievedMemory(facts=[FactEntry(text="x", distance=0.1, timestamp=1792154714.2)])
+    )
+    assert "2026-10-16" in block
+
+
+def test_render_retrieved_memory_omits_missing_timestamp():
+    block = render_retrieved_memory(
+        RetrievedMemory(facts=[FactEntry(text="x", distance=0.1)])
+    )
+    assert "未知时间" not in block
+
+
+def test_render_retrieved_memory_includes_summary():
+    block = render_retrieved_memory(
+        RetrievedMemory(summaries=[SummaryEntry(text="一段摘要", distance=0.2)])
+    )
+    assert "一段摘要" in block

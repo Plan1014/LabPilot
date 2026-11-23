@@ -93,3 +93,36 @@ def label_user_answer(text: str, name: str) -> str:
 
 def label_tool_result(text: str, name: str) -> str:
     return f'<ToolResult name="{name}">{text}</ToolResult>'
+
+
+def _fmt_epoch(ts: float | None) -> str:
+    """epoch 秒 → YYYY-MM-DD；没有时间戳就返回空串（调用方省略该字段）。"""
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def render_retrieved_memory(retrieved: RetrievedMemory, now=None) -> str:
+    """渲染 <RetrievedMemory> 区块；没有内容时返回空串（调用方整块跳过）。"""
+    if retrieved is None:
+        return ""
+    lines = []
+    if retrieved.summaries:
+        lines.append("【相关历史对话摘要】")
+        for s in retrieved.summaries:
+            lines.append(f"- (相似度 {s.distance:.3f}{_stamp_suffix(s.timestamp)}) {s.text}")
+    if retrieved.facts:
+        lines.append("【相关事实记忆 (参数/结论)】")
+        for f in retrieved.facts:
+            lines.append(f"- (相似度 {f.distance:.3f}{_stamp_suffix(f.timestamp)}) {f.text}")
+    if not lines:
+        return ""
+    now = now or datetime.now(timezone.utc)
+    head = (f"检索时间 {now.strftime('%Y-%m-%d %H:%M:%S UTC')}，"
+            "以下内容由系统自动附加，可能陈旧或无关，仅在与当前问题相关时采用：")
+    return "<RetrievedMemory>\n" + head + "\n" + "\n".join(lines) + "\n</RetrievedMemory>"
+
+
+def _stamp_suffix(ts: float | None) -> str:
+    stamp = _fmt_epoch(ts)
+    return f", 记录于 {stamp}" if stamp else ""
