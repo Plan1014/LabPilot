@@ -285,6 +285,40 @@ class SkillLoader:
         self.skills = {}
         self._scan()
 
+    @staticmethod
+    def _parse_frontmatter(text: str) -> tuple[dict, str]:
+        """解析 YAML frontmatter。
+
+        要支持折叠块 `description: >` —— 仓库里的 SKILL.md 都用它写多行描述，
+        逐行 split(":") 只能拿到字面量 ">"。
+        """
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        raw_meta, body = match.group(1), match.group(2).strip()
+        meta: dict = {}
+        lines = raw_meta.strip().splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            if ":" not in line:
+                i += 1
+                continue
+            key, value = line.split(":", 1)
+            key, value = key.strip(), value.strip()
+            if value in (">", "|", ">-", "|-", ">+", "|+"):
+                folded = []
+                i += 1
+                while i < len(lines) and (not lines[i].strip()
+                                         or lines[i].startswith((" ", "\t"))):
+                    folded.append(lines[i].strip())
+                    i += 1
+                meta[key] = " ".join(x for x in folded if x)
+                continue
+            meta[key] = value
+            i += 1
+        return meta, body
+
     def _scan(self):
         """Scan skills directory and load all SKILL.md files."""
         self.skills.clear()
@@ -301,14 +335,7 @@ class SkillLoader:
             if text is None:
                 continue
 
-            match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
-            meta, body = {}, text
-            if match:
-                for line in match.group(1).strip().splitlines():
-                    if ":" in line:
-                        k, v = line.split(":", 1)
-                        meta[k.strip()] = v.strip()
-                body = match.group(2).strip()
+            meta, body = self._parse_frontmatter(text)
 
             name = meta.get("name", f.parent.name)
             self.skills[name] = {"meta": meta, "body": body}
