@@ -293,11 +293,10 @@ def _spawn_drain_others_thread(current_session_id: str) -> None:
 def create_session_router():
     """Create the session management router."""
     from fastapi import APIRouter
-    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
     from src.agent.session_manager import (
         create_session, get_session_meta, get_session_history,
         append_to_session, update_session_title, delete_session,
-        list_sessions, archive_session, dict_to_ai_message,
+        list_sessions, archive_session,
     )
 
     router = APIRouter()
@@ -362,7 +361,6 @@ def create_session_router():
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         # 延迟初始化（在模块级变量缓存）
         if not hasattr(session_query, '_core_memory_manager'):
@@ -382,8 +380,12 @@ def create_session_router():
         # === Core Memory 注入结束 ===
 
         # === RAG 检索 fact 库 ===
+        # 自动注入的记忆要过相关性门槛；门槛外的噪音宁可不注入。
         from src.agent.memory import memory_retriever
-        rag_context = memory_retriever.retrieve_context(req.query)
+        from src.agent.prompt_context import relevance_threshold
+        rag_retrieved = memory_retriever.retrieve(
+            req.query, threshold=relevance_threshold()
+        )
         # === RAG 检索结束 ===
 
         # Set session_id in response headers for frontend to pick up
@@ -430,47 +432,18 @@ def create_session_router():
             set_event_emitter(emitter)
             try:
                 # Build messages list from session history
-                langchain_messages = []
+                from src.agent.prompt_context import build_prompt_messages
+                from src.agent.tools import SKILLS, TOOLS
 
-                # 注入 Core Memory 作为 system message
-                if compiled_memory:
-                    langchain_messages.append(SystemMessage(content=compiled_memory))
-
-                if rag_context and rag_context != "当前无长期记忆记录。":
-                    langchain_messages.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
-
-                # 注入 Base System Prompt (Skills)
-                from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
-                from src.agent.tools import SKILLS
-                base_system = SYSTEM_PROMPT_TEMPLATE.format(
-                    workdir=str(WORKDIR),
+                # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 检索记忆 +
+                # 历史/当前轮，每条都带来源标签。
+                langchain_messages = build_prompt_messages(
+                    history=list(history) + [turn_row],
+                    core_memory=compiled_memory,
+                    retrieved=rag_retrieved,
+                    tools=TOOLS,
                     skills=SKILLS.descriptions(),
                 )
-                langchain_messages.insert(0, SystemMessage(content=base_system))
-
-                for msg in history:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        langchain_messages.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        langchain_messages.append(dict_to_ai_message(msg))
-                    elif role == "tool":
-                        langchain_messages.append(ToolMessage(
-                            content=content,
-                            name=msg.get("name", ""),
-                            tool_call_id=msg.get("tool_call_id", ""),
-                        ))
-
-                # Append current user message —— 或作为对上一问的回答（tool_result）
-                if turn_row["role"] == "tool":
-                    langchain_messages.append(ToolMessage(
-                        content=turn_row["content"],
-                        name=turn_row["name"],
-                        tool_call_id=turn_row["tool_call_id"],
-                    ))
-                else:
-                    langchain_messages.append(HumanMessage(content=req.query))
 
                 # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
                 # 标记成已回答。
@@ -663,7 +636,6 @@ def create_memory_router():
 def create_sse_router():
     """Create the SSE query router (lazy import to avoid circular deps)."""
     from fastapi import APIRouter
-    from langchain_core.messages import HumanMessage
 
     router = APIRouter()
 
@@ -674,13 +646,10 @@ def create_sse_router():
         from src.agent.graph_thinking import (
             build_graph, set_event_emitter, InterleavedState
         )
-        from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
-        from src.agent.tools import SKILLS
         graph = build_graph()
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         if not hasattr(query_agent, '_core_memory_manager'):
             query_agent._core_memory_manager = CoreMemoryManager()
@@ -692,7 +661,10 @@ def create_sse_router():
 
         # === RAG 检索 fact 库 ===
         from src.agent.memory import memory_retriever
-        rag_context = memory_retriever.retrieve_context(req.query)
+        from src.agent.prompt_context import relevance_threshold
+        rag_retrieved = memory_retriever.retrieve(
+            req.query, threshold=relevance_threshold()
+        )
         # === RAG 检索结束 ===
 
         event_queue: queue.Queue = queue.Queue()
@@ -723,21 +695,16 @@ def create_sse_router():
             set_event_emitter(emitter)
             try:
                 # 构建 initial_state，注入 Base System + Core Memory
-                messages_list = []
+                from src.agent.prompt_context import build_prompt_messages
+                from src.agent.tools import SKILLS, TOOLS
 
-                # Base system prompt (Skills descriptions)
-                base_system = SYSTEM_PROMPT_TEMPLATE.format(
-                    workdir=str(WORKDIR),
+                messages_list = build_prompt_messages(
+                    history=[{"role": "user", "content": req.query}],
+                    core_memory=compiled_memory,
+                    retrieved=rag_retrieved,
+                    tools=TOOLS,
                     skills=SKILLS.descriptions(),
                 )
-                messages_list.append(SystemMessage(content=base_system))
-
-                if compiled_memory:
-                    messages_list.append(SystemMessage(content=compiled_memory))
-
-                if rag_context and rag_context != "当前无长期记忆记录。":
-                    messages_list.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
-                messages_list.append(HumanMessage(content=req.query))
 
                 initial_state = {
                     "messages": messages_list,
