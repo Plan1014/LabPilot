@@ -386,7 +386,10 @@ def append_to_session(session_id: str, messages: list[dict]) -> int:
             "UPDATE sessions SET last_message_at = ?, message_count = message_count + ? WHERE id = ?",
             (now, len(messages), session_id)
         )
-    return get_session_meta(session_id)["message_count"]
+    # 会话行可能不存在（直接拿一个没建过的 session_id 发消息）：
+    # 上面的 UPDATE 不会命中，get_session_meta 返回 None —— 别在这崩掉。
+    meta = get_session_meta(session_id)
+    return meta["message_count"] if meta else 0
 
 
 def update_session_title(session_id: str, title: str) -> None:

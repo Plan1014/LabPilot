@@ -288,6 +288,66 @@ def _spawn_drain_others_thread(current_session_id: str) -> None:
     thread.start()
 
 
+# ==================== Prompt Debug ====================
+
+def assemble_debug_prompt(query: str, session_id: Optional[str] = None,
+                          include_query: bool = True):
+    """拼出「这一轮会发给模型的东西」，不调模型。
+
+    调试接口和 PROMPT_DEBUG 自动打印共用这一份装配逻辑 ——
+    打印出来的必须就是真发出去的那一份。
+    """
+    from src.agent.session_manager import get_session_history, _compact_tool_results
+    from src.agent.tools import TOOLS, SKILLS
+    from src.agent.memory.core import CoreMemoryManager
+    from src.agent.memory import memory_retriever
+    from src.agent.prompt_context import (
+        RetrievedMemory, build_prompt_messages, relevance_threshold,
+    )
+    from src.agent.ask_user import find_pending_ask, build_turn_row
+
+    history = list(get_session_history(session_id)) if session_id else []
+    history = _compact_tool_results(history)
+
+    core_memory = CoreMemoryManager().compile()
+    threshold = relevance_threshold()
+    if query:
+        retrieved = memory_retriever.retrieve(query, threshold=threshold)
+    else:
+        retrieved = RetrievedMemory()
+
+    if include_query and query:
+        history = history + [build_turn_row(find_pending_ask(history), query)]
+
+    messages = build_prompt_messages(
+        history=history,
+        core_memory=core_memory,
+        retrieved=retrieved,
+        tools=TOOLS,
+        skills=SKILLS.descriptions(),
+    )
+    meta = {
+        "session_id": session_id,
+        "query": query,
+        "threshold": threshold,
+        "tool_count": len(TOOLS),
+        "retrieved_facts": len(retrieved.facts),
+        "retrieved_summaries": len(retrieved.summaries),
+        "history_rows": len(history),
+    }
+    return messages, meta
+
+
+def debug_payload(messages, meta) -> dict:
+    """调试接口的返回体。"""
+    from src.agent.prompt_debug import format_prompt, messages_to_dicts
+    return {
+        "meta": meta,
+        "messages": messages_to_dicts(messages),
+        "text": format_prompt(messages, meta),
+    }
+
+
 # ==================== Session Router ====================
 
 def create_session_router():
@@ -324,6 +384,14 @@ def create_session_router():
             from fastapi import HTTPException
             raise HTTPException(status_code=404, detail="Session not found")
         return {"id": session_id, "messages": history}
+
+    @router.get("/{session_id}/prompt")
+    async def get_session_prompt_endpoint(session_id: str):
+        """调试：按这个会话现有历史拼出「这一轮会发给模型的东西」。不调模型。"""
+        messages, meta = assemble_debug_prompt("", session_id, include_query=False)
+        from src.agent.prompt_debug import maybe_dump
+        maybe_dump(messages, meta)
+        return debug_payload(messages, meta)
 
     @router.delete("/{session_id}")
     async def delete_session_endpoint(session_id: str):
@@ -444,6 +512,18 @@ def create_session_router():
                     tools=TOOLS,
                     skills=SKILLS.descriptions(),
                 )
+
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端
+                from src.agent.prompt_debug import maybe_dump
+                maybe_dump(langchain_messages, {
+                    "session_id": session_id,
+                    "query": req.query,
+                    "threshold": relevance_threshold(),
+                    "tool_count": len(TOOLS),
+                    "retrieved_facts": len(rag_retrieved.facts),
+                    "retrieved_summaries": len(rag_retrieved.summaries),
+                    "history_rows": len(history) + 1,
+                })
 
                 # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
                 # 标记成已回答。
@@ -706,6 +786,18 @@ def create_sse_router():
                     skills=SKILLS.descriptions(),
                 )
 
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端
+                from src.agent.prompt_debug import maybe_dump
+                maybe_dump(messages_list, {
+                    "session_id": None,
+                    "query": req.query,
+                    "threshold": relevance_threshold(),
+                    "tool_count": len(TOOLS),
+                    "retrieved_facts": len(rag_retrieved.facts),
+                    "retrieved_summaries": len(rag_retrieved.summaries),
+                    "history_rows": 1,
+                })
+
                 initial_state = {
                     "messages": messages_list,
                     "pending_tool_calls": [],
@@ -830,6 +922,21 @@ def create_notification_hub_app() -> FastAPI:
     # Memory router
     memory_router = create_memory_router()
     app.include_router(memory_router, prefix="/memory")
+
+    # 调试 router —— 看「实际发给模型的完整输入」
+    debug_router = APIRouter()
+
+    @debug_router.post("/prompt")
+    async def debug_prompt(req: SessionQueryRequest):
+        """调试：给一条 query，现场拼出这一轮会发的内容。不调模型。"""
+        messages, meta = assemble_debug_prompt(
+            req.query, req.session_id, include_query=True
+        )
+        from src.agent.prompt_debug import maybe_dump
+        maybe_dump(messages, meta)
+        return debug_payload(messages, meta)
+
+    app.include_router(debug_router, prefix="/debug")
 
     return app
 
