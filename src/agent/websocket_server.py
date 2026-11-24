@@ -338,13 +338,14 @@ def assemble_debug_prompt(query: str, session_id: Optional[str] = None,
     return messages, meta
 
 
-def debug_payload(messages, meta) -> dict:
-    """调试接口的返回体。"""
-    from src.agent.prompt_debug import format_prompt, messages_to_dicts
+def debug_payload(messages, meta, tools=None) -> dict:
+    """调试接口的返回体 —— 完整的一份：提示词正文 + 工具完整定义。"""
+    from src.agent.prompt_debug import format_prompt, messages_to_dicts, tools_schema
     return {
         "meta": meta,
         "messages": messages_to_dicts(messages),
-        "text": format_prompt(messages, meta),
+        "tools": tools_schema(tools or []),
+        "text": format_prompt(messages, meta, tools),
     }
 
 
@@ -388,10 +389,11 @@ def create_session_router():
     @router.get("/{session_id}/prompt")
     async def get_session_prompt_endpoint(session_id: str):
         """调试：按这个会话现有历史拼出「这一轮会发给模型的东西」。不调模型。"""
+        from src.agent.tools import TOOLS
         messages, meta = assemble_debug_prompt("", session_id, include_query=False)
         from src.agent.prompt_debug import maybe_dump
-        maybe_dump(messages, meta)
-        return debug_payload(messages, meta)
+        maybe_dump(messages, meta, tools=TOOLS, full=True, track=False)
+        return debug_payload(messages, meta, TOOLS)
 
     @router.delete("/{session_id}")
     async def delete_session_endpoint(session_id: str):
@@ -513,7 +515,7 @@ def create_session_router():
                     skills=SKILLS.descriptions(),
                 )
 
-                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
                 from src.agent.prompt_debug import maybe_dump
                 maybe_dump(langchain_messages, {
                     "session_id": session_id,
@@ -523,7 +525,7 @@ def create_session_router():
                     "retrieved_facts": len(rag_retrieved.facts),
                     "retrieved_summaries": len(rag_retrieved.summaries),
                     "history_rows": len(history) + 1,
-                })
+                }, tools=TOOLS, state_key=session_id)
 
                 # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
                 # 标记成已回答。
@@ -786,7 +788,7 @@ def create_sse_router():
                     skills=SKILLS.descriptions(),
                 )
 
-                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
                 from src.agent.prompt_debug import maybe_dump
                 maybe_dump(messages_list, {
                     "session_id": None,
@@ -796,7 +798,7 @@ def create_sse_router():
                     "retrieved_facts": len(rag_retrieved.facts),
                     "retrieved_summaries": len(rag_retrieved.summaries),
                     "history_rows": 1,
-                })
+                }, tools=TOOLS, state_key="sse")
 
                 initial_state = {
                     "messages": messages_list,
@@ -929,12 +931,13 @@ def create_notification_hub_app() -> FastAPI:
     @debug_router.post("/prompt")
     async def debug_prompt(req: SessionQueryRequest):
         """调试：给一条 query，现场拼出这一轮会发的内容。不调模型。"""
+        from src.agent.tools import TOOLS
         messages, meta = assemble_debug_prompt(
             req.query, req.session_id, include_query=True
         )
         from src.agent.prompt_debug import maybe_dump
-        maybe_dump(messages, meta)
-        return debug_payload(messages, meta)
+        maybe_dump(messages, meta, tools=TOOLS, full=True, track=False)
+        return debug_payload(messages, meta, TOOLS)
 
     app.include_router(debug_router, prefix="/debug")
 

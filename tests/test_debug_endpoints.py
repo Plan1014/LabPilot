@@ -58,6 +58,18 @@ def test_post_debug_prompt_includes_core_and_retrieved(client, stub_memory):
     assert "注入的事实" in body
 
 
+def test_post_debug_prompt_includes_full_tool_definitions(client, stub_memory):
+    """工具的完整定义也是送给模型的输入 —— 接口里要能拿到。"""
+    data = client.post("/debug/prompt", json={"query": "随便问问"}).json()
+    names = [t["function"]["name"] for t in data["tools"]]
+    assert "bash" in names
+    assert "ask_user" in names
+    for tool in data["tools"]:
+        assert tool["function"]["description"]
+        assert "parameters" in tool["function"]
+    assert "TOOLS (" in data["text"]
+
+
 def test_get_session_prompt_returns_session_history(client, stub_memory):
     r = client.get("/session/unknown-session-id/prompt")
     assert r.status_code == 200

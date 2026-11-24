@@ -242,14 +242,14 @@ def main() -> None:
             skills=SKILLS.descriptions(),
         )
 
-        # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端
+        # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
         from src.agent.prompt_debug import maybe_dump
         maybe_dump(langchain_messages, {
             "session_id": None,
             "query": query,
             "tool_count": len(TOOLS),
             "history_rows": len(history),
-        })
+        }, tools=TOOLS, state_key="repl")
 
         # 调用 graph
         try:
