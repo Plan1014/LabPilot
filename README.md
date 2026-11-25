@@ -13,6 +13,7 @@
 - **跨会话记忆**：参数、错误解法、历史结论自动留存，下次同类实验自动召回
 - **技能可插拔**：每个领域（光学测量、论文解析、…）可独立写一个 `SKILL.md` 即用
 - **流式可观测**：每步思考 + 工具调用 + 结果实时显示，便于调试和复盘
+- **输入全可见**：调试开关一开，后端终端直接显示**实际发给模型的那一整套输入**（含工具完整定义）
 - **模型无关**：同一套 Agent 可跑在 Claude / DeepSeek / Qwen / Ollama 上，横向对比零代码改动
 - **自动压缩会话**：长实验自动摘要，不丢上下文、不爆 token
 - **Tauri 桌面 + Vite Dev 双前端**：开发用 Web，部署用桌面，按场景切换
@@ -107,6 +108,8 @@ LabPilot/
 │   ├── graph.py             # Server 模式图（langgraph.json 入口）
 │   ├── graph_thinking.py    # ReAct 图 + SSE 事件发射 + tool_use id 跨 message 去重
 │   ├── llm.py               # LLM 初始化（Anthropic / LiteLLM Proxy / ChatOpenAI 三态）
+│   ├── prompt_context.py    # 提示词组装（系统提示词 + 核心记忆 + 检索记忆 + 历史，带来源标签）
+│   ├── prompt_debug.py      # 调试输出（忠实完整地呈现实际发给模型的输入）
 │   ├── tools.py             # 工具集（bash / read / write / edit / subagent / memory / skill / compact）
 │   ├── session_manager.py   # 会话存储（SQLite，三层压缩 + partial_json 兜底）
 │   ├── websocket_server.py  # NotificationHub（SSE + WebSocket + REST API）
@@ -243,6 +246,7 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 | `/session/list` | GET | 会话列表（按最近活动排序） |
 | `/session/{id}` | GET | 会话元信息 |
 | `/session/{id}/history` | GET | 加载完整历史 |
+| `/session/{id}/prompt` | GET | 回看该会话当前会发给模型的完整输入 |
 | `/session/{id}` | DELETE | 删除会话 |
 
 ### 长期记忆
@@ -265,6 +269,24 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 | `/notify` | POST | 设备任务完成回调 |
 | `/ws` | WebSocket | Agent ↔ Hub 双向通道 |
 | `/health` | GET | 健康检查 |
+
+### 调试
+
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/debug/prompt` | POST | 现场拼装：给定 `query`，返回这一轮**会**发给模型的完整输入（body: `query`, `session_id?`） |
+| `/session/{id}/prompt` | GET | 回看某个已有会话当前会发给模型的完整输入 |
+
+两个接口都只拼装、不调模型。返回体：
+
+```json
+{
+  "meta":    { "session_id": "...", "query": "...", "threshold": 0.45, "tool_count": 13, "...": "..." },
+  "messages":[ { "type": "human", "role": "user", "content": "<CurrentRequest>...</CurrentRequest>" } ],
+  "tools":   [ { "type": "function", "function": { "name": "bash", "description": "...", "parameters": {} } } ],
+  "text":    "── PROMPT ── ...（可直接复制到终端的完整文本）"
+}
+```
 
 ---
 
@@ -306,6 +328,49 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 
 ---
 
+## 调试：看清实际发给模型的输入
+
+组装完提示词、**交给模型之前**，把这一轮的完整输入原样打到后端终端。设 `PROMPT_DEBUG=1` 生效：
+
+```bash
+PROMPT_DEBUG=1 uvicorn src.agent.websocket_server:create_notification_hub_app --factory --port 8000
+```
+
+原则是**忠实、完整** —— 模型收到的东西全在这里，一样不少：
+
+| 打印内容 | 说明 |
+|---------|------|
+| `[1] system` | 系统提示词（含动态工具索引、当前时间） |
+| `[2] system` | `<CoreMemory>` 热记忆 |
+| `[3] system` | `<RetrievedMemory>` 检索注入的记忆（只打印**真正注入**的，低于阈值的不会出现） |
+| `[4] user` 起 | 对话历史与当前轮，每条都带来源标签（`<CurrentRequest>` / `<UserMessage>` / `<UserAnswer>` / `<SystemNote>` / `<ToolResult>`） |
+| `TOOLS (13)` | **工具的完整定义**：描述 + 参数 schema。这部分不在提示词正文里，而是随 API 的 `tools` 字段一起发出去 —— 打印的和模型收到的是同一份（`convert_to_openai_tool`） |
+
+排版按终端来：缩进分节，不用方框，长文本让终端自己换行。
+
+第一轮打**完整**的一份；之后每轮只打**增量**（新增消息 + 变了的内容块），没变的块留一行 `未变` 说明：
+
+```
+── PROMPT ── 2026-11-24 07:35:07 UTC
+（本轮增量 —— 相对上次打印）
+[5] assistant · 16 字符
+    [tool_use: bash]
+[6] tool · 48 字符
+    <ToolResult name="bash">(no output)</ToolResult>
+[8] user · 40 字符
+    <CurrentRequest>用本地镜像备份</CurrentRequest>
+[系统提示词] 未变（3204 字符）
+[核心记忆] 未变（350 字符）
+[3] system · 247 字符
+    <RetrievedMemory>...</RetrievedMemory>
+[工具定义] 未变（13 个）
+── 本轮新增 4 条消息 ──
+```
+
+HTTP 调试接口（见上文「后端 API」）**永远返回完整的一份**，且不影响终端的增量状态。
+
+---
+
 ## REPL 命令
 
 | 命令 | 说明 |
@@ -338,5 +403,7 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 | `NOTIFICATION_HUB_ENABLED` | `true` | 是否启用 NotificationHub |
 | `SESSION_TTL_DAYS` | `30` | 会话保留天数 |
 | `TOKEN_THRESHOLD` | `100000` | 触发 auto_compact 的 token 阈值 |
+| `MEMORY_RELEVANCE_THRESHOLD` | `0.45` | 检索记忆的余弦**距离**阈值，越小越相关；超阈值的不注入 |
+| `PROMPT_DEBUG` | — | 设 `1` 时，每轮把实际发给模型的完整输入打到后端终端 |
 | `HF_HUB_OFFLINE` | `1` | sentence-transformers 不联网检查模型 |
 | `TRANSFORMERS_OFFLINE` | `1` | 同上 |
