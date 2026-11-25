@@ -5,9 +5,16 @@ interface Props {
   onSubmit: (query: string) => void;
   isStreaming: boolean;
   onStop?: () => void;
+  /** 输入框占位文案 */
+  placeholder?: string;
 }
 
-export default function InputArea({ onSubmit, isStreaming, onStop }: Props) {
+export default function InputArea({
+  onSubmit,
+  isStreaming,
+  onStop,
+  placeholder = "Ask LabPilot...",
+}: Props) {
   const [input, setInput] = useState("");
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -37,7 +44,7 @@ export default function InputArea({ onSubmit, isStreaming, onStop }: Props) {
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Ask LabPilot..."
+          placeholder={placeholder}
           disabled={isStreaming}
           className="flex-1 px-4 py-2 border border-[#d1d5db] rounded-lg text-sm
                      focus:outline-none focus:border-[#d97757] focus:ring-1 focus:ring-[#d97757]

@@ -1,15 +1,37 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import Message from "./Message";
 import InputArea from "./InputArea";
 import HistoryModal from "./HistoryModal";
 import MemoryModal from "./MemoryModal";
+import AskUserCard from "./AskUserCard";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { getStoredSessionId, persistSessionId, parseHistoryMessages } from "../hooks/useSession";
+import {
+  deriveAskState,
+  shouldDeliverNotification,
+  shouldKeepOnStop,
+  inputPlaceholder,
+} from "../utils/askUser";
 import type { Message as MessageType, SessionMeta } from "../types/events";
 import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
 const API_BASE = "http://127.0.0.1:8000";
+
+/** 通知的去重键 —— 同一条通知不重复投递给 agent。 */
+function notificationKey(notif: {
+  source?: string;
+  task_id?: string;
+  type?: string;
+  timestamp?: string;
+}): string {
+  return [
+    notif.source ?? "",
+    notif.task_id ?? "",
+    notif.type ?? "",
+    notif.timestamp ?? "",
+  ].join("|");
+}
 
 export default function ChatWindow() {
   const [messages, setMessages] = useState<MessageType[]>([]);
@@ -22,6 +44,9 @@ export default function ChatWindow() {
 
   // WebSocket for notifications
   const { notifications, isConnected: wsConnected } = useWebSocket();
+
+  // 提问状态：待答提问、已答对照
+  const askState = useMemo(() => deriveAskState(messages), [messages]);
 
   // Restore session on mount if there's a stored session_id but no messages yet
   useEffect(() => {
@@ -77,6 +102,9 @@ export default function ChatWindow() {
     }
   }, [events, streamingMessageId]);
 
+  // 已投递过的通知 —— 暂停期间的通知在回答完后再投，不重复也不丢。
+  const deliveredNotifications = useRef<Set<string>>(new Set());
+
   // Show notification as system prompt and notify REPL
   useEffect(() => {
     // [LABPILOT-DEBUG] 通知 useEffect 触发入口
@@ -86,7 +114,23 @@ export default function ChatWindow() {
       currentIsStreaming: isStreaming,
     });
     if (notifications.length === 0) return;
-    const last = notifications[notifications.length - 1];
+    // 只发还没发过的通知 —— 否则每次 notifications 数组换新引用都会重发最后一条。
+    const undelivered = notifications.filter(
+      (n) => !deliveredNotifications.current.has(notificationKey(n))
+    );
+    // 有待答提问 / 本轮还在跑时不发 —— 判定逻辑见 utils/askUser.ts（有单测）。
+    if (
+      !shouldDeliverNotification({
+        undeliveredCount: undelivered.length,
+        hasPendingAsk: askState.pendingAsk !== null,
+        isStreaming,
+        streamingMessageId,
+      })
+    ) {
+      return;
+    }
+    const last = undelivered[undelivered.length - 1];
+    deliveredNotifications.current.add(notificationKey(last));
     console.log("[LABPILOT-DEBUG] notification PAYLOAD", last);
     const formatted = formatNotification(last);
 
@@ -127,10 +171,9 @@ export default function ChatWindow() {
       formatted,
     });
     sendQuery(formatted, storedId);
-  }, [notifications]);
+  }, [notifications, askState.pendingAsk, isStreaming, streamingMessageId]);
 
-  const formatNotification = (notif: { source?: string; type?: string; result?: Record<string, unknown>; timestamp?: string }): string => {
-    const ts_str = notif.timestamp ? `[${notif.timestamp}] ` : "";
+  const formatNotification = (notif: { source?: string; type?: string; result?: Record<string, unknown>; timestamp?: string }): string => {    const ts_str = notif.timestamp ? `[${notif.timestamp}] ` : "";
     const source_str = notif.source ? `[${notif.source}] ` : "";
     const result = notif.result || {};
 
@@ -186,6 +229,14 @@ export default function ChatWindow() {
     [abort, sendQuery]
   );
 
+  // 点选项作答 —— 直接把选项文本提交；后端会把它当作对上一问的回答。
+  const handleAskSelect = useCallback(
+    (label: string) => {
+      void handleSubmit(label);
+    },
+    [handleSubmit]
+  );
+
   const listSessions = useCallback(async (): Promise<SessionMeta[]> => {
     const res = await fetch(`${API_BASE}/session/list`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -200,9 +251,21 @@ export default function ChatWindow() {
     // 1. Abort SSE request
     abort();
 
-    // 2. Delete the streaming assistant message
+    // 2. Delete the streaming assistant message —— 除非它里面有一个
+    //    还没被回答的提问：删掉的话提问卡片消失，用户下一句话会被后端
+    //    静默当成那个提问的回答。
     if (streamingMessageId) {
-      setMessages((prev) => prev.filter((msg) => msg.id !== streamingMessageId));
+      setMessages((prev) =>
+        prev
+          .filter(
+            (msg) =>
+              msg.id !== streamingMessageId ||
+              shouldKeepOnStop(msg, askState.answers)
+          )
+          .map((msg) =>
+            msg.id === streamingMessageId ? { ...msg, isComplete: true } : msg
+          )
+      );
     }
 
     // 3. Delete the user message that triggered the request
@@ -214,7 +277,7 @@ export default function ChatWindow() {
     // 4. Reset streaming state
     setIsStreaming(false);
     setStreamingMessageId(null);
-  }, [abort, streamingMessageId]);
+  }, [abort, streamingMessageId, askState.answers]);
 
   const loadSession = useCallback(
     async (id: string) => {
@@ -307,13 +370,27 @@ export default function ChatWindow() {
           </div>
         )}
         {messages.map((msg) => (
-          <Message key={msg.id} {...msg} />
+          <Message key={msg.id} {...msg} askAnswers={askState.answers} />
         ))}
         <div ref={messagesEndRef} />
       </main>
 
+      {/* 待答提问弹窗 —— 位于输入框上方 */}
+      {askState.pendingAsk && (
+        <AskUserCard
+          ask={askState.pendingAsk}
+          onSelect={handleAskSelect}
+          disabled={isStreaming}
+        />
+      )}
+
       {/* Input */}
-      <InputArea onSubmit={handleSubmit} isStreaming={isStreaming} onStop={handleStop} />
+      <InputArea
+        onSubmit={handleSubmit}
+        isStreaming={isStreaming}
+        onStop={handleStop}
+        placeholder={inputPlaceholder(askState.pendingAsk !== null)}
+      />
 
       {/* History Modal */}
       {showHistory && (

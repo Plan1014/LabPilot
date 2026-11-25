@@ -7,26 +7,38 @@ Note: Server-mode persistence is handled automatically by the langgraph API
 platform. Do NOT pass a custom checkpointer here.
 """
 
+from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
 
-from src.agent.config import WORKDIR
 from src.agent.llm import llm
-from src.agent.tools import TOOLS, SKILLS
+from src.agent.prompt_context import build_system_prompt
+from src.agent.tools import TOOLS_FOR_REACT, SKILLS
 
 
-# System prompt used by the server agent
-system_prompt = f"""You are a lab agent at {WORKDIR}. Use tools to solve tasks.
-# Use spawn_subagent for multi-step or isolated work.  # 临时禁用 2026-08-28
-Use load_skill for specialized knowledge.
-Skills: {SKILLS.descriptions()}"""
+def dynamic_system_prompt(state):
+    """每次调用时重新生成系统提示词。
+
+    系统提示词里有 "Current time" —— 冻结在 import 那一刻的话，
+    server 模式跑久了模型拿到的时间就是错的。
+    """
+    if isinstance(state, dict):
+        messages = list(state.get("messages") or [])
+    else:
+        messages = list(getattr(state, "messages", None) or [])
+    system = SystemMessage(
+        content=build_system_prompt(TOOLS_FOR_REACT, SKILLS.descriptions())
+    )
+    return [system] + messages
 
 
 def _build_graph():
     """Build and return the compiled server-mode graph."""
     return create_react_agent(
         model=llm,
-        tools=TOOLS,
-        prompt=system_prompt,
+        # TOOLS_FOR_REACT 不含 ask_user —— 这条路径会真的执行工具，
+        # 而提问必须由 graph_thinking 的 agent loop 拦截后停下等用户回答。
+        tools=TOOLS_FOR_REACT,
+        prompt=dynamic_system_prompt,
         # No custom checkpointer — langgraph API handles persistence
         debug=False,
     )

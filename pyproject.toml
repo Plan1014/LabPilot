@@ -3,7 +3,7 @@ name = "labpilot"
 version = "0.1.0"
 description = "光学实验 Agent 助手，基于 LangGraph ReAct 智能体，支持 PDH/PNA 设备控制、长期记忆与 Skill 技能系统"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
 authors = [
     { name = "LabPilot Authors" },
@@ -89,3 +89,10 @@ managed = true
 
 # 锁文件即真相；CI/协作者靠 uv.lock 复现一致环境
 # 生成锁文件：uv lock  /  安装：uv sync
+
+# ================= pytest =================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: 需要加载本地模型/向量库的慢速测试（用 -m 'not slow' 跳过）",
+]

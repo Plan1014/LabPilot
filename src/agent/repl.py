@@ -8,16 +8,49 @@ import json
 import time
 from typing import Any, Dict, Union
 
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langgraph.graph import END
 
-from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED, SYSTEM_PROMPT_TEMPLATE
+from src.agent.config import WORKDIR, TRANSCRIPT_DIR, TOKEN_THRESHOLD, MODEL_ID, NOTIFICATION_HUB_ENABLED
 from src.agent.llm import summarize_text
-from src.agent.session_manager import message_to_dict, dict_to_ai_message
+from src.agent.session_manager import message_to_dict
 from src.agent.tools import TOOLS, SKILLS
 from src.agent.graph_thinking import build_graph
+from src.agent.ask_user import build_turn_row, find_pending_ask
 
 from src.agent.memory import memory_system
+
+
+def append_user_turn(history: list[dict], query: str) -> dict:
+    """把一行用户输入追加进历史，返回追加的那一行。
+
+    有待答提问时，这一行输入是对上一问的回答 —— 必须作为 tool_result 回填，
+    模型才能从 tool_use 的断点继续；否则就是普通用户消息。
+    """
+    row = build_turn_row(find_pending_ask(history), query)
+    history.append(row)
+    return row
+
+
+def can_set_idle(history: list[dict]) -> bool:
+    """现在是否可以把通知队列置为 idle。
+
+    有待答提问时不能置 idle —— 通知会触发 agent 跑一轮，那段通知文本会被
+    当成「用户对上一问的回答」吞掉。
+    """
+    return find_pending_ask(history) is None
+
+
+def should_compact(history: list[dict], turn_row: dict, threshold: int | None = None) -> bool:
+    """这一轮要不要触发自动压缩。
+
+    回答轮不压缩：auto_compact 会把整个 history 换成一行摘要，提问的
+    tool_use 和刚记下的 tool_result 双双消失 —— 模型这一轮根本看不到
+    用户的回答。
+    """
+    if isinstance(turn_row, dict) and turn_row.get("role") == "tool":
+        return False
+    limit = TOKEN_THRESHOLD if threshold is None else threshold
+    return estimate_tokens(history) > limit
 
 # ==================== Loop Detection ====================
 
@@ -115,7 +148,9 @@ def auto_compact(messages: list) -> list:
     # [新增]将真正的摘要持久化到 ChromaDB
     memory_system.save_summary(summary, filepath=str(path))
     # =====================================
-    return [{"role": "user", "content": f"[Compressed. Transcript: {path}]\n{summary}"}]
+    # origin=system —— 这行是压缩摘要，不是用户说的话。
+    return [{"role": "user", "origin": "system",
+             "content": f"[Compressed. Transcript: {path}]\n{summary}"}]
 
 
 # ==================== REPL Main ====================
@@ -148,7 +183,6 @@ def main() -> None:
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         # 延迟初始化 CoreMemoryManager（在函数属性上缓存）
         if not hasattr(run_agent_query, '_core_memory_manager'):
@@ -168,8 +202,8 @@ def main() -> None:
         run_agent_query._compiled_memory = new_memory_str
         # === Core Memory 注入结束 ===
 
-        # 添加用户消息到历史
-        history.append({"role": "user", "content": query})
+        # 添加用户消息到历史（有待答提问时，这一行就是对上一问的回答）
+        turn_row = append_user_turn(history, query)
 
         # 检测工具循环
         loop_warning, loop_block = detect_tool_loop(history)
@@ -177,51 +211,45 @@ def main() -> None:
         # 如果 6+ 循环，直接阻断
         if loop_block:
             print(f"\033[31m{loop_block}\033[0m")
-            history = [{"role": "user", "content": "Please respond with a brief status summary."}]
+            history = [{"role": "user", "origin": "system",
+                        "content": "Please respond with a brief status summary."}]
             return
 
         # 如果 3+ 循环，注入警告
         if loop_warning:
-            history.append({"role": "user", "content": loop_warning})
+            history.append({"role": "user", "origin": "system", "content": loop_warning})
 
-        # 自动压缩检查
-        if estimate_tokens(history) > TOKEN_THRESHOLD:
+        # 自动压缩检查（回答轮不压缩 —— 会把刚记下的提问与回答一起抹掉）
+        if should_compact(history, turn_row):
             print("[auto-compact triggered]", flush=True)
             history = auto_compact(history)
 
         # 转换为 LangChain messages
-        langchain_messages = []
-
-        # Base system prompt (Skills descriptions — LangChain doesn't auto-inject these)
-        base_system = SYSTEM_PROMPT_TEMPLATE.format(
-            workdir=WORKDIR,
-            skills=SKILLS.descriptions(),
-        )
-        langchain_messages.append(SystemMessage(content=base_system))
+        from src.agent.prompt_context import build_prompt_messages
+        from src.agent.tools import SKILLS, TOOLS
 
         # 注入 Core Memory 作为 system message（只有变化时才注入）
         compiled_memory = getattr(run_agent_query, '_compiled_memory', '')
-        if compiled_memory:
-            langchain_messages.append(SystemMessage(content=compiled_memory))
 
-        for msg in history:
-            if isinstance(msg, HumanMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, AIMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, ToolMessage):
-                langchain_messages.append(msg)
-            elif isinstance(msg, dict):
-                if msg.get("role") == "user":
-                    langchain_messages.append(HumanMessage(content=msg.get("content", "")))
-                elif msg.get("role") == "assistant":
-                    langchain_messages.append(dict_to_ai_message(msg))
-                elif msg.get("role") == "tool":
-                    langchain_messages.append(ToolMessage(
-                        content=msg.get("content", ""),
-                        name=msg.get("name", ""),
-                        tool_call_id=msg.get("tool_call_id", ""),
-                    ))
+        # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 历史/当前轮，
+        # 每条都带来源标签。REPL 不做检索注入（设计上不新增噪音源）。
+        # history 里已经含当前这轮（append_user_turn 在前面执行过）。
+        langchain_messages = build_prompt_messages(
+            history=list(history),
+            core_memory=compiled_memory,
+            retrieved=None,
+            tools=TOOLS,
+            skills=SKILLS.descriptions(),
+        )
+
+        # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
+        from src.agent.prompt_debug import maybe_dump
+        maybe_dump(langchain_messages, {
+            "session_id": None,
+            "query": query,
+            "tool_count": len(TOOLS),
+            "history_rows": len(history),
+        }, tools=TOOLS, state_key="repl")
 
         # 调用 graph
         try:
@@ -234,7 +262,9 @@ def main() -> None:
             result_messages = result.get("messages", [])
 
             # 累积到 history（确保所有消息都是可序列化的 dict）
-            for msg in result_messages[len(history):]:
+            # 偏移按「本次实际送进 graph 的消息条数」切：result_messages 前面
+            # 还带着 system message，用 len(history) 会多切掉同样数量的历史消息。
+            for msg in result_messages[len(langchain_messages):]:
                 history.append(message_to_dict(msg))
 
         except Exception as e:
@@ -248,7 +278,9 @@ def main() -> None:
         notification_queue.set_idle(True)
 
     while True:
-        if NOTIFICATION_HUB_ENABLED:
+        # 有待答提问时保持 idle=False —— 通知会被排队而不是立刻触发 agent，
+        # 否则通知文本会被当成「用户对上一问的回答」吞掉。
+        if NOTIFICATION_HUB_ENABLED and can_set_idle(history):
             notification_queue.set_idle(True)
 
         try:

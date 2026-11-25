@@ -21,6 +21,16 @@ from chromadb import Documents, EmbeddingFunction, Embeddings
 from sentence_transformers import SentenceTransformer
 
 from src.agent.config import WORKDIR
+from src.agent.prompt_context import (
+    FACT_CANDIDATES,
+    RETRIEVED_MEMORY_LIMIT,
+    SUMMARY_CANDIDATES,
+    SUMMARY_MEMORY_LIMIT,
+    FactEntry,
+    RetrievedMemory,
+    SummaryEntry,
+    filter_by_distance,
+)
 
 MEMORY_DIR = WORKDIR / "data" / "memory"
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,35 +115,60 @@ class MemoryRetriever:
         self.summaries_col = manager.summaries_col
         self.sql_conn = manager.sql_conn
 
+    # === 已移除：后台任务/事件记录的注入（2026-11-23）===
+    # 原因：task_states.status 存的是通知事件类型（log_errors / lock_anomaly /
+    # task_completed），不是任务生命周期状态，没有任何代码写 "running"，
+    # 所以这段一直在把陈旧的日志事件当"正在运行的后台任务"喂给模型。
+    # 后续：日志系统重做后，连接事件的日志应当【仅在连接期间】注入，
+    #       并带上事件时间戳与当前时间戳，让模型自己判断新鲜度。
+    #       见 docs/superpowers/specs/2026-11-23-prompt-assembly-fixes-design.md §10
+
+    def _query(self, col, user_query, n_results, threshold, entry_cls):
+        res = col.query(
+            query_texts=[user_query],
+            n_results=n_results,
+            include=["documents", "distances", "metadatas"],
+        )
+        docs = (res.get("documents") or [[]])[0] or []
+        dists = (res.get("distances") or [[]])[0] or []
+        metas = (res.get("metadatas") or [[]])[0] or []
+        entries = []
+        for i, doc in enumerate(docs):
+            distance = dists[i] if i < len(dists) else 0.0
+            meta = metas[i] if i < len(metas) else {}
+            entries.append(entry_cls(text=doc, distance=distance,
+                                    timestamp=(meta or {}).get("timestamp")))
+        return filter_by_distance(entries, threshold)
+
+    def retrieve(self, user_query: str, threshold: float | None = None) -> RetrievedMemory:
+        """检索事实与摘要。
+
+        threshold=None 表示不过门槛（模型主动 search_memory 走这条）；
+        传数字则只保留 distance <= threshold 的条目。
+        """
+        facts = self._query(self.facts_col, user_query, FACT_CANDIDATES,
+                            threshold, FactEntry)[:RETRIEVED_MEMORY_LIMIT]
+        summaries = self._query(self.summaries_col, user_query, SUMMARY_CANDIDATES,
+                                threshold, SummaryEntry)[:SUMMARY_MEMORY_LIMIT]
+        return RetrievedMemory(facts=facts, summaries=summaries)
+
     def retrieve_context(self, user_query: str) -> str:
+        """纯文本上下文（给 search_memory 工具和 /memory/search 面板用）。
+
+        注意：这里不过门槛 —— 显式检索是探询行为；自动注入走
+        retrieve(threshold=relevance_threshold())。
         """
-        基于用户输入，从不同层级召回记忆，组织成理解上下文。
-        """
-        context_parts =[]
-
-        # A. 提取活跃任务状态 (SQLite)
-        cursor = self.sql_conn.execute("SELECT task_id, status FROM task_states WHERE status != 'completed'")
-        active_tasks = [f"- [{row[0]}] 状态: {row[1]}" for row in cursor.fetchall()]
-        if active_tasks:
-            context_parts.append("【正在运行的后台任务】\n" + "\n".join(active_tasks))
-
-        # B. 检索相关历史摘要 (ChromaDB)
-        # 即使用户问的不是很明确，也能捞出最相关的 1 条历史大背景
-        sum_res = self.summaries_col.query(query_texts=[user_query], n_results=1)
-        if sum_res["documents"] and sum_res["documents"][0]:
-            context_parts.append("【相关历史对话摘要】\n" + sum_res["documents"][0][0])
-
-        # C. 检索具体事实记忆 (ChromaDB)
-        # 提取过去总结的参数、踩过的坑等
-        fact_res = self.facts_col.query(query_texts=[user_query], n_results=3)
-        if fact_res["documents"] and fact_res["documents"][0]:
-            facts = "\n".join(f"- {doc}" for doc in fact_res["documents"][0])
-            context_parts.append("【相关事实记忆 (参数/结论)】\n" + facts)
-
-        if not context_parts:
+        retrieved = self.retrieve(user_query, threshold=None)
+        parts = []
+        if retrieved.summaries:
+            parts.append("【相关历史对话摘要】\n" + retrieved.summaries[0].text)
+        if retrieved.facts:
+            parts.append("【相关事实记忆 (参数/结论)】\n"
+                         + "\n".join(f"- {f.text}" for f in retrieved.facts))
+        if not parts:
             return "当前无长期记忆记录。"
-            
-        return "\n\n".join(context_parts)
+
+        return "\n\n".join(parts)
 
 # 实例化全局单例
 memory_system = MemoryManager()

@@ -288,16 +288,76 @@ def _spawn_drain_others_thread(current_session_id: str) -> None:
     thread.start()
 
 
+# ==================== Prompt Debug ====================
+
+def assemble_debug_prompt(query: str, session_id: Optional[str] = None,
+                          include_query: bool = True):
+    """拼出「这一轮会发给模型的东西」，不调模型。
+
+    调试接口和 PROMPT_DEBUG 自动打印共用这一份装配逻辑 ——
+    打印出来的必须就是真发出去的那一份。
+    """
+    from src.agent.session_manager import get_session_history, _compact_tool_results
+    from src.agent.tools import TOOLS, SKILLS
+    from src.agent.memory.core import CoreMemoryManager
+    from src.agent.memory import memory_retriever
+    from src.agent.prompt_context import (
+        RetrievedMemory, build_prompt_messages, relevance_threshold,
+    )
+    from src.agent.ask_user import find_pending_ask, build_turn_row
+
+    history = list(get_session_history(session_id)) if session_id else []
+    history = _compact_tool_results(history)
+
+    core_memory = CoreMemoryManager().compile()
+    threshold = relevance_threshold()
+    if query:
+        retrieved = memory_retriever.retrieve(query, threshold=threshold)
+    else:
+        retrieved = RetrievedMemory()
+
+    if include_query and query:
+        history = history + [build_turn_row(find_pending_ask(history), query)]
+
+    messages = build_prompt_messages(
+        history=history,
+        core_memory=core_memory,
+        retrieved=retrieved,
+        tools=TOOLS,
+        skills=SKILLS.descriptions(),
+    )
+    meta = {
+        "session_id": session_id,
+        "query": query,
+        "threshold": threshold,
+        "tool_count": len(TOOLS),
+        "retrieved_facts": len(retrieved.facts),
+        "retrieved_summaries": len(retrieved.summaries),
+        "history_rows": len(history),
+    }
+    return messages, meta
+
+
+def debug_payload(messages, meta, tools=None) -> dict:
+    """调试接口的返回体 —— 完整的一份：提示词正文 + 工具完整定义。"""
+    from src.agent.prompt_debug import format_prompt, messages_to_dicts, tools_schema
+    return {
+        "meta": meta,
+        "messages": messages_to_dicts(messages),
+        "tools": tools_schema(tools or []),
+        "text": format_prompt(messages, meta, tools),
+    }
+
+
 # ==================== Session Router ====================
 
 def create_session_router():
     """Create the session management router."""
     from fastapi import APIRouter
-    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
     from src.agent.session_manager import (
         create_session, get_session_meta, get_session_history,
         append_to_session, update_session_title, delete_session,
-        list_sessions, archive_session, dict_to_ai_message,
+        list_sessions, archive_session,
     )
 
     router = APIRouter()
@@ -326,6 +386,15 @@ def create_session_router():
             raise HTTPException(status_code=404, detail="Session not found")
         return {"id": session_id, "messages": history}
 
+    @router.get("/{session_id}/prompt")
+    async def get_session_prompt_endpoint(session_id: str):
+        """调试：按这个会话现有历史拼出「这一轮会发给模型的东西」。不调模型。"""
+        from src.agent.tools import TOOLS
+        messages, meta = assemble_debug_prompt("", session_id, include_query=False)
+        from src.agent.prompt_debug import maybe_dump
+        maybe_dump(messages, meta, tools=TOOLS, full=True, track=False)
+        return debug_payload(messages, meta, TOOLS)
+
     @router.delete("/{session_id}")
     async def delete_session_endpoint(session_id: str):
         """Delete a session."""
@@ -337,6 +406,7 @@ def create_session_router():
         """Stream SSE events with session history management."""
         logger.info("[/session/query] called — session_id=%s query_len=%d", req.session_id, len(req.query))
         from src.agent.graph_thinking import build_graph, set_event_emitter
+        from src.agent.ask_user import find_pending_ask, build_turn_row, build_answer_event
         from src.agent.session_manager import (
             message_to_dict, _compact_tool_results,
             estimate_tokens, session_auto_compact,
@@ -361,7 +431,6 @@ def create_session_router():
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         # 延迟初始化（在模块级变量缓存）
         if not hasattr(session_query, '_core_memory_manager'):
@@ -381,19 +450,18 @@ def create_session_router():
         # === Core Memory 注入结束 ===
 
         # === RAG 检索 fact 库 ===
+        # 自动注入的记忆要过相关性门槛；门槛外的噪音宁可不注入。
         from src.agent.memory import memory_retriever
-        rag_context = memory_retriever.retrieve_context(req.query)
+        from src.agent.prompt_context import relevance_threshold
+        rag_retrieved = memory_retriever.retrieve(
+            req.query, threshold=relevance_threshold()
+        )
         # === RAG 检索结束 ===
 
         # Set session_id in response headers for frontend to pick up
         graph = build_graph()
         event_queue: queue.Queue = queue.Queue()
         seen_keys: set[str] = set()
-
-        # Generate title from first user message if this is a new session
-        if not history:
-            first_title = req.query[:100] if len(req.query) > 100 else req.query
-            update_session_title(session_id, first_title)
 
         def emitter(event: dict):
             # Dedup key includes `step` so distinct LLM iterations of the same
@@ -418,48 +486,52 @@ def create_session_router():
 
         # Track new messages added during this stream (for saving to Redis)
         new_messages: list[dict] = []
-        # Start with user message
-        user_msg_dict = {"role": "user", "content": req.query}
-        new_messages.append(user_msg_dict)
+
+        # 有待答提问时，本次 query 是对上一问的回答 —— 作为 tool_result 回填，
+        # 模型从 tool_use 断点继续；否则是普通用户消息。
+        pending_ask = find_pending_ask(history)
+        turn_row = build_turn_row(pending_ask, req.query)
+        new_messages.append(turn_row)
+
+        # 回答轮不覆盖会话标题
+        if not history and turn_row["role"] == "user":
+            first_title = req.query[:100] if len(req.query) > 100 else req.query
+            update_session_title(session_id, first_title)
 
         async def event_generator():
             set_event_emitter(emitter)
             try:
                 # Build messages list from session history
-                langchain_messages = []
+                from src.agent.prompt_context import build_prompt_messages
+                from src.agent.tools import SKILLS, TOOLS
 
-                # 注入 Core Memory 作为 system message
-                if compiled_memory:
-                    langchain_messages.append(SystemMessage(content=compiled_memory))
-
-                if rag_context and rag_context != "当前无长期记忆记录。":
-                    langchain_messages.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
-
-                # 注入 Base System Prompt (Skills)
-                from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
-                from src.agent.tools import SKILLS
-                base_system = SYSTEM_PROMPT_TEMPLATE.format(
-                    workdir=str(WORKDIR),
+                # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 检索记忆 +
+                # 历史/当前轮，每条都带来源标签。
+                langchain_messages = build_prompt_messages(
+                    history=list(history) + [turn_row],
+                    core_memory=compiled_memory,
+                    retrieved=rag_retrieved,
+                    tools=TOOLS,
                     skills=SKILLS.descriptions(),
                 )
-                langchain_messages.insert(0, SystemMessage(content=base_system))
 
-                for msg in history:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        langchain_messages.append(HumanMessage(content=content))
-                    elif role == "assistant":
-                        langchain_messages.append(dict_to_ai_message(msg))
-                    elif role == "tool":
-                        langchain_messages.append(ToolMessage(
-                            content=content,
-                            name=msg.get("name", ""),
-                            tool_call_id=msg.get("tool_call_id", ""),
-                        ))
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
+                from src.agent.prompt_debug import maybe_dump
+                maybe_dump(langchain_messages, {
+                    "session_id": session_id,
+                    "query": req.query,
+                    "threshold": relevance_threshold(),
+                    "tool_count": len(TOOLS),
+                    "retrieved_facts": len(rag_retrieved.facts),
+                    "retrieved_summaries": len(rag_retrieved.summaries),
+                    "history_rows": len(history) + 1,
+                }, tools=TOOLS, state_key=session_id)
 
-                # Append current user message
-                langchain_messages.append(HumanMessage(content=req.query))
+                # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
+                # 标记成已回答。
+                answer_event = build_answer_event(turn_row)
+                if answer_event:
+                    event_queue.put(answer_event)
 
                 # Stream events
                 async for event in graph.astream_events(
@@ -490,6 +562,16 @@ def create_session_router():
                         pending.sort(key=lambda e: e.get("step", 0))
                         for ev in pending:
                             yield f"data: {json.dumps(ev)}\n\n"
+                # 最后再 drain 一次 —— 回答事件是在循环开始前 put 的，
+                # 最后一个 on_chain_end 之后产生的事件也不能丢。
+                pending: list[dict] = []
+                while True:
+                    try:
+                        pending.append(event_queue.get_nowait())
+                    except queue.Empty:
+                        break
+                for ev in pending:
+                    yield f"data: {json.dumps(ev)}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'step': 0, 'session_id': session_id})}\n\n"
             finally:
                 set_event_emitter(None)
@@ -636,7 +718,6 @@ def create_memory_router():
 def create_sse_router():
     """Create the SSE query router (lazy import to avoid circular deps)."""
     from fastapi import APIRouter
-    from langchain_core.messages import HumanMessage
 
     router = APIRouter()
 
@@ -647,13 +728,10 @@ def create_sse_router():
         from src.agent.graph_thinking import (
             build_graph, set_event_emitter, InterleavedState
         )
-        from src.agent.config import SYSTEM_PROMPT_TEMPLATE, WORKDIR
-        from src.agent.tools import SKILLS
         graph = build_graph()
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
-        from langchain_core.messages import SystemMessage
 
         if not hasattr(query_agent, '_core_memory_manager'):
             query_agent._core_memory_manager = CoreMemoryManager()
@@ -665,7 +743,10 @@ def create_sse_router():
 
         # === RAG 检索 fact 库 ===
         from src.agent.memory import memory_retriever
-        rag_context = memory_retriever.retrieve_context(req.query)
+        from src.agent.prompt_context import relevance_threshold
+        rag_retrieved = memory_retriever.retrieve(
+            req.query, threshold=relevance_threshold()
+        )
         # === RAG 检索结束 ===
 
         event_queue: queue.Queue = queue.Queue()
@@ -696,21 +777,28 @@ def create_sse_router():
             set_event_emitter(emitter)
             try:
                 # 构建 initial_state，注入 Base System + Core Memory
-                messages_list = []
+                from src.agent.prompt_context import build_prompt_messages
+                from src.agent.tools import SKILLS, TOOLS
 
-                # Base system prompt (Skills descriptions)
-                base_system = SYSTEM_PROMPT_TEMPLATE.format(
-                    workdir=str(WORKDIR),
+                messages_list = build_prompt_messages(
+                    history=[{"role": "user", "content": req.query}],
+                    core_memory=compiled_memory,
+                    retrieved=rag_retrieved,
+                    tools=TOOLS,
                     skills=SKILLS.descriptions(),
                 )
-                messages_list.append(SystemMessage(content=base_system))
 
-                if compiled_memory:
-                    messages_list.append(SystemMessage(content=compiled_memory))
-
-                if rag_context and rag_context != "当前无长期记忆记录。":
-                    messages_list.append(SystemMessage(content=f"【相关事实记忆】\n{rag_context}"))
-                messages_list.append(HumanMessage(content=req.query))
+                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
+                from src.agent.prompt_debug import maybe_dump
+                maybe_dump(messages_list, {
+                    "session_id": None,
+                    "query": req.query,
+                    "threshold": relevance_threshold(),
+                    "tool_count": len(TOOLS),
+                    "retrieved_facts": len(rag_retrieved.facts),
+                    "retrieved_summaries": len(rag_retrieved.summaries),
+                    "history_rows": 1,
+                }, tools=TOOLS, state_key="sse")
 
                 initial_state = {
                     "messages": messages_list,
@@ -836,6 +924,22 @@ def create_notification_hub_app() -> FastAPI:
     # Memory router
     memory_router = create_memory_router()
     app.include_router(memory_router, prefix="/memory")
+
+    # 调试 router —— 看「实际发给模型的完整输入」
+    debug_router = APIRouter()
+
+    @debug_router.post("/prompt")
+    async def debug_prompt(req: SessionQueryRequest):
+        """调试：给一条 query，现场拼出这一轮会发的内容。不调模型。"""
+        from src.agent.tools import TOOLS
+        messages, meta = assemble_debug_prompt(
+            req.query, req.session_id, include_query=True
+        )
+        from src.agent.prompt_debug import maybe_dump
+        maybe_dump(messages, meta, tools=TOOLS, full=True, track=False)
+        return debug_payload(messages, meta, TOOLS)
+
+    app.include_router(debug_router, prefix="/debug")
 
     return app
 
