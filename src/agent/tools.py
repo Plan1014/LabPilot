@@ -102,9 +102,11 @@ READ_ONLY_EXECUTABLES: frozenset[str] = frozenset({
 _REDIRECT_OP_RE = re.compile(r"^(?:\d*>>?|&>)$")
 
 # 会改动文件的命令 → 目标参数取哪几个
-#   "all"  = 全部位置参数（rm / mv —— mv 的源也算，把仓库里的文件搬走同样是破坏）
-#   "last" = 最后一个位置参数（cp / sed -i / patch —— 只有目标是写）
-#   "first"= 第一个位置参数（truncate / chmod）
+#   "all"  = 全部位置参数（rm / mv / mkdir / touch —— mv 的源也算，
+#            把仓库里的文件搬走同样是破坏；mkdir 的每个参数都是一个新目录）
+#   "last" = 最后一个位置参数（cp / patch —— 只有目标是写）
+#   "pathlike" = 位置参数里「像路径的那些」（chmod / chown / truncate ——
+#            模式、属主、大小也是位置参数，但不是路径）
 _WRITE_VERB_TARGETS: dict[str, str] = {
     "tee": "all",
     "mv": "all",
@@ -114,16 +116,25 @@ _WRITE_VERB_TARGETS: dict[str, str] = {
     "erase": "all",
     "remove-item": "all",
     "cp": "last",
-    "sed": "last",
+    "sed": "all",
     "patch": "last",
     "rsync": "last",
     "scp": "last",
     "install": "last",
-    "truncate": "first",
-    "chmod": "first",
-    "chown": "first",
-    "mkdir": "first",
+    "truncate": "pathlike",
+    "chmod": "pathlike",
+    "chown": "pathlike",
+    "mkdir": "all",
     "touch": "all",
+}
+
+# 这些选项会吃掉下一个 token —— 那个 token 是选项的参数，不是文件目标。
+# `chmod --reference src/ref src/x` 里 src/ref 只被读，不该当成写目标。
+_CONSUMES_NEXT_ARG: dict[str, tuple[str, ...]] = {
+    "chmod": ("--reference",),
+    "chown": ("--reference", "--from"),
+    "truncate": ("--size", "--reference"),
+    "sed": ("-e", "--expression", "-f", "--file"),
 }
 
 
@@ -251,9 +262,89 @@ def _is_redirect_op(token: str) -> bool:
     return bool(_REDIRECT_OP_RE.match(token))
 
 
+# curl 里「会往磁盘写东西」的选项 —— 白名单不能放行带这些选项的 curl，
+# 而且能明确指出写目标的要把目标解析出来。
+#
+# curl 是 skills 里的高频工具，白名单会放行它。输出选项漏解析 =
+# `curl -o src/x.txt http://127.0.0.1:8001/` 一路放行改受保护区。
+CURL_WRITE_OPTIONS: tuple[str, ...] = (
+    "-o", "--output", "-O", "--output-dir", "-J", "--remote-header-name",
+    "-D", "--dump-header", "--trace", "--trace-ascii", "--stderr",
+)
+
+# 会把本地文件传出去的选项 —— 不写本地（不是写目标），但它读本地文件。
+CURL_UPLOAD_OPTIONS: tuple[str, ...] = ("-T", "--upload-file", "-F", "--form")
+
+# 明确给出写目标的 curl 选项 → 目标在下一个 token 还是 `=` 后面
+_CURL_TARGET_OPTIONS: dict[str, str] = {
+    "-o": "next", "--output": "next", "--output-dir": "next",
+    "-D": "next", "--dump-header": "next", "--trace": "next",
+    "--trace-ascii": "next", "--stderr": "next",
+}
+
+
+def curl_has_output_option(args: list[str]) -> bool:
+    """curl 的参数里有没有输出 / 上传类选项。
+
+    白名单的语义是「skills 里的只读探活请求」—— 带输出选项的 curl
+    已经不是同一类东西，不能算命中（闸门层用它，见 rules.match_skill_curl）。
+
+    选项名**大小写敏感**（`-T` 是上传、`-t` 是 telnet），所以按原样比。
+    """
+    for a in args:
+        for opt in CURL_WRITE_OPTIONS + CURL_UPLOAD_OPTIONS:
+            if a == opt or (opt.startswith("--") and a.startswith(opt + "=")):
+                return True
+    return False
+
+
+def _short_flags(args: list[str]) -> set[str]:
+    """短选项里的字母集合（`-czf` → {c, z, f}）。"""
+    flags: set[str] = set()
+    for a in args:
+        if a.startswith("--") or not a.startswith("-"):
+            continue
+        for ch in a[1:]:
+            flags.add(ch)
+    return flags
+
+
+def _is_f_option(token: str) -> bool:
+    """这个 token 是不是 tar 的 `-f`（含 `-cf` / `-czf` 这种短选项簇）。"""
+    if token in ("-f", "--file"):
+        return True
+    return token.startswith("-") and not token.startswith("--") and "f" in token[1:]
+
+
 def _positional(args: list[str]) -> list[str]:
     """位置参数（去掉 `-` 开头的选项）。"""
     return [a for a in args if not a.startswith("-")]
+
+
+def _looks_like_path(arg: str) -> bool:
+    """这个位置参数像不像一个路径。
+
+    chmod/chown/truncate 的位置参数里混着模式（`+x` / `755`）、属主（`me`）、
+    大小（`100`）—— 它们不是路径。当成目标的话，L1 会说「试图修改只读区域 +x」
+    并硬拒：`chmod +x tmp/run.sh` 是 agent 在沙箱里最常见的操作之一，
+    卡在确定性拒绝层，判官和用户都放行不了。
+
+    判据：含路径分隔符、有文件后缀、或确实存在。字面量三条都不满足。
+    判不出来就当不是目标 —— 漏判比错判安全。
+    """
+    if not arg:
+        return False
+    if "/" in arg or "\\" in arg:
+        return True
+    try:
+        if Path(arg).suffix:
+            return True
+    except (OSError, ValueError):
+        return False
+    try:
+        return (WORKDIR / arg).exists()
+    except OSError:
+        return False
 
 
 def bash_write_targets(segment: str) -> list[str]:
@@ -287,6 +378,24 @@ def bash_write_targets(segment: str) -> list[str]:
 
     exe = _exe_name(tokens[0])
 
+    # 选项吃掉下一个 token 时，那个 token 是选项的参数，不是文件目标
+    # （`chmod --reference src/ref src/x` 里 src/ref 只被读）。
+    consumes = _CONSUMES_NEXT_ARG.get(exe, ())
+    saw_script_opt = False
+    if consumes:
+        kept: list[str] = []
+        skip_next = False
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in consumes:
+                skip_next = True
+                saw_script_opt = True
+                continue
+            kept.append(a)
+        args = kept
+
     if exe == "dd":
         # dd 的写目标藏在 `of=` 里，不是位置参数
         for a in args:
@@ -317,6 +426,50 @@ def bash_write_targets(segment: str) -> list[str]:
                 targets.append(a[len("--output="):])
         return targets
 
+    if exe == "curl":
+        # curl 的写目标藏在输出选项里：`-o FILE` 写响应体，
+        # `--output-dir DIR` 写目录。curl 是 skills 里的高频工具，
+        # 白名单会放行它 —— 输出选项必须在这里被认出来。
+        for i, a in enumerate(args):
+            how = _CURL_TARGET_OPTIONS.get(a)
+            if how == "next":
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--") and "=" in a:
+                name, _, value = a.partition("=")
+                if name in _CURL_TARGET_OPTIONS and value:
+                    targets.append(value)
+        return targets
+
+    if exe == "wget":
+        # wget 的写目标：`-O FILE` / `--output-document=FILE` / `-P DIR`
+        for i, a in enumerate(args):
+            if a in ("-O", "--output-document", "-P", "--directory-prefix"):
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--") and "=" in a:
+                name, _, value = a.partition("=")
+                if name in ("--output-document", "--directory-prefix") and value:
+                    targets.append(value)
+        return targets
+
+    if exe == "tar":
+        # 建档（-c）时 `-f` 是要生成的归档文件；解档（-x）时 `-C` 是落地目录。
+        # 两者的角色相反 —— 建档时的 `-C src` 只是「从这里开始打包」，
+        # 不是写目标，当成写目标会硬拒 `tar -cf tmp/a.tar -C src .` 这种正常命令。
+        flags = _short_flags(args)
+        for i, a in enumerate(args):
+            if "x" in flags and a in ("-C", "--directory"):
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif "x" in flags and a.startswith("--directory="):
+                targets.append(a[len("--directory="):])
+            elif "c" in flags and _is_f_option(a):
+                # `-cf` / `-czf` 是短选项簇 —— 归档文件跟在簇后面那个 token
+                if i + 1 < len(args) and args[i + 1] != "-":
+                    targets.append(args[i + 1])
+        return targets
+
     mode = _WRITE_VERB_TARGETS.get(exe)
     if mode is None:
         return targets
@@ -331,12 +484,19 @@ def bash_write_targets(segment: str) -> list[str]:
     positional = _positional(args)
     if not positional:
         return targets
+    if exe == "sed" and not saw_script_opt:
+        # 第一个位置参数是 sed 脚本（`s/a/b/`），不是文件 —— 没有 -e 时它
+        # 就在脚本位置。`sed -i s/a/b/` 改的是标准输入，不动文件；
+        # 把脚本当目标会把「s/a/b/」说成受保护区路径，硬拒一条正常命令。
+        positional = positional[1:]
+        if not positional:
+            return targets
     if mode == "all":
         targets.extend(positional)
     elif mode == "last":
         targets.append(positional[-1])
-    else:  # first
-        targets.append(positional[0])
+    else:  # pathlike
+        targets.extend(p for p in positional if _looks_like_path(p))
     return targets
 
 

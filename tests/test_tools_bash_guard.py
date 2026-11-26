@@ -325,3 +325,39 @@ def test_git_write_subcommand_is_not_read_only():
 
 def test_git_diff_with_output_file_is_not_read_only():
     assert not tools.is_read_only_bash("git diff --output=tmp/d.txt")
+
+
+# ==================== 模式/属主/大小不是路径（评审 C2）====================
+# `chmod +x tmp/run.sh` 里第一个位置参数是模式，不是路径。把它当写目标，
+# L1 会把 `+x` 说成「只读区域」并硬拒 —— agent 在沙箱里最常见的操作之一
+# 被彻底堵死，而且卡在确定性拒绝层，判官和用户都放行不了。
+
+def test_chmod_mode_literal_is_not_a_write_target():
+    assert tools.bash_write_targets("chmod +x tmp/run.sh") == ["tmp/run.sh"]
+
+
+def test_chmod_numeric_mode_is_not_a_write_target():
+    assert tools.bash_write_targets("chmod 755 tmp/run.sh") == ["tmp/run.sh"]
+
+
+def test_chown_owner_literal_is_not_a_write_target():
+    assert tools.bash_write_targets("chown me tmp/x") == ["tmp/x"]
+
+
+def test_truncate_size_literal_is_not_a_write_target():
+    assert tools.bash_write_targets("truncate -s 100 tmp/x") == ["tmp/x"]
+
+
+def test_chmod_on_protected_file_is_still_blocked(workdir):
+    reason = tools.bash_blocked_write_target("chmod +x src/app.py")
+    assert reason is not None
+    assert "src/app.py" in reason
+
+
+def test_chmod_plus_x_in_tmp_is_not_blocked(workdir):
+    assert tools.bash_blocked_write_target("chmod +x tmp/run.sh") is None
+
+
+def test_sed_without_file_operand_has_no_write_target():
+    # `sed -i s/a/b/` 没有文件操作数 —— 改的是标准输入，不动文件
+    assert tools.bash_write_targets("sed -i s/a/b/") == []

