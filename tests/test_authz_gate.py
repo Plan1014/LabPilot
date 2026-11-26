@@ -9,10 +9,8 @@ import json
 import pytest
 
 from src.agent import paths, session_manager
-from src.agent.authz import audit
+from src.agent.authz import Verdict, audit, authorize, ledger
 from src.agent.authz import judge as judge_module
-from src.agent.authz import ledger
-from src.agent.authz import authorize, Verdict
 
 
 @pytest.fixture
