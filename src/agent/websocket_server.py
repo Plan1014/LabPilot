@@ -69,6 +69,13 @@ class SessionQueryRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class AuthRespondRequest(BaseModel):
+    """Payload for /auth/respond endpoint."""
+    session_id: str
+    tool_call_id: str
+    choice: str
+
+
 # ==================== NotificationQueue ====================
 
 class NotificationQueue:
@@ -405,10 +412,9 @@ def create_session_router():
     async def session_query(req: SessionQueryRequest):
         """Stream SSE events with session history management."""
         logger.info("[/session/query] called — session_id=%s query_len=%d", req.session_id, len(req.query))
-        from src.agent.graph_thinking import build_graph, set_event_emitter
         from src.agent.ask_user import find_pending_ask, build_turn_row, build_answer_event
         from src.agent.session_manager import (
-            message_to_dict, _compact_tool_results,
+            _compact_tool_results,
             estimate_tokens, session_auto_compact,
         )
 
@@ -458,39 +464,16 @@ def create_session_router():
         )
         # === RAG 检索结束 ===
 
-        # Set session_id in response headers for frontend to pick up
-        graph = build_graph()
-        event_queue: queue.Queue = queue.Queue()
-        seen_keys: set[str] = set()
-
-        def emitter(event: dict):
-            # Dedup key includes `step` so distinct LLM iterations of the same
-            # tool (e.g. agent calls `bash` three times in a row) are NOT
-            # collapsed — each one carries a unique `step` from
-            # graph_thinking.generate's state.step_count, which is the natural
-            # collision boundary. Without `step` here, three bash events
-            # stringify to the same key and only the first ever reaches the
-            # frontend; the user sees a single "Step 1" tool card and the loop
-            # appears to hang.
-            #
-            # For 'done' events we use a fixed key — only the first one
-            # matters, later ones would carry a stale session_id.
-            step = event.get("step", -1)
-            if event.get("type") == "done":
-                key = "done"
-            else:
-                key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
-            if key not in seen_keys:
-                seen_keys.add(key)
-                event_queue.put(event)
-
-        # Track new messages added during this stream (for saving to Redis)
-        new_messages: list[dict] = []
+        # === 待批批次：有待批记录时用户直接敲字 → 视为 deny（spec §5.4）===
+        recovery_rows = _deny_earliest_pending_if_typed(session_id, req.query)
 
         # 有待答提问时，本次 query 是对上一问的回答 —— 作为 tool_result 回填，
         # 模型从 tool_use 断点继续；否则是普通用户消息。
         pending_ask = find_pending_ask(history)
         turn_row = build_turn_row(pending_ask, req.query)
+
+        # Track new messages added during this stream (for saving to Redis)
+        new_messages: list[dict] = list(recovery_rows)
         new_messages.append(turn_row)
 
         # 回答轮不覆盖会话标题
@@ -498,95 +481,296 @@ def create_session_router():
             first_title = req.query[:100] if len(req.query) > 100 else req.query
             update_session_title(session_id, first_title)
 
-        async def event_generator():
-            set_event_emitter(emitter)
-            try:
-                # Build messages list from session history
-                from src.agent.prompt_context import build_prompt_messages
-                from src.agent.tools import SKILLS, TOOLS
+        # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
+        # 标记成已回答。
+        answer_event = build_answer_event(turn_row)
 
-                # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 检索记忆 +
-                # 历史/当前轮，每条都带来源标签。
-                langchain_messages = build_prompt_messages(
-                    history=list(history) + [turn_row],
-                    core_memory=compiled_memory,
-                    retrieved=rag_retrieved,
-                    tools=TOOLS,
-                    skills=SKILLS.descriptions(),
-                )
+        return await _stream_agent_turn(
+            session_id=session_id,
+            history=history,
+            turn_rows=list(recovery_rows) + [turn_row],
+            compiled_memory=compiled_memory,
+            retrieved=rag_retrieved,
+            new_messages=new_messages,
+            extra_events=[answer_event] if answer_event else None,
+            query_label=req.query,
+        )
 
-                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
-                from src.agent.prompt_debug import maybe_dump
-                maybe_dump(langchain_messages, {
-                    "session_id": session_id,
-                    "query": req.query,
-                    "threshold": relevance_threshold(),
-                    "tool_count": len(TOOLS),
-                    "retrieved_facts": len(rag_retrieved.facts),
-                    "retrieved_summaries": len(rag_retrieved.summaries),
-                    "history_rows": len(history) + 1,
-                }, tools=TOOLS, state_key=session_id)
+    return router
 
-                # 回答轮补一条 tool_result 事件 —— 前端靠 tool_call_id 把提问卡片
-                # 标记成已回答。
-                answer_event = build_answer_event(turn_row)
-                if answer_event:
-                    event_queue.put(answer_event)
 
-                # Stream events
-                async for event in graph.astream_events(
-                    {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0, "session_id": session_id},
-                    config={"recursion_limit": 100},
-                    stream_mode="values",
-                ):
-                    event_type = event.get("event", "")
-                    if event_type == "on_chain_end":
-                        # Capture new messages from this event
-                        chain_output = event.get("data", {}).get("output", {})
-                        if isinstance(chain_output, dict) and "messages" in chain_output:
-                            msgs = chain_output["messages"]
-                            if isinstance(msgs, list):
-                                for msg in msgs[len(langchain_messages):]:
-                                    new_messages.append(message_to_dict(msg))
-                        elif isinstance(chain_output, list):
-                            for msg in chain_output[len(langchain_messages):]:
+async def _stream_agent_turn(
+    *,
+    session_id: str,
+    history: list[dict],
+    turn_rows: list[dict],
+    compiled_memory: str = "",
+    retrieved=None,
+    new_messages: list[dict] | None = None,
+    extra_events: list[dict] | None = None,
+    query_label: str = "",
+) -> StreamingResponse:
+    """跑一轮 agent，把 SSE 吐给前端。
+
+    `turn_rows` —— 本轮要进模型的消息行（用户消息 / tool_result）。
+    `new_messages` —— 本轮结束后落库的行；默认与 `turn_rows` 相同。
+    `extra_events` —— 进 SSE 队列的前置事件（如 ask_user 的回答事件）。
+
+    普通对话和提权恢复走同一条路 —— 恢复出来的 tool_result 和普通轮的用户
+    消息在模型眼里没有区别。
+    """
+    from src.agent.graph_thinking import build_graph, set_event_emitter
+    from src.agent.prompt_context import build_prompt_messages, relevance_threshold
+    from src.agent.session_manager import message_to_dict
+    from src.agent.tools import SKILLS, TOOLS
+
+    graph = build_graph()
+    event_queue: queue.Queue = queue.Queue()
+    seen_keys: set[str] = set()
+    if new_messages is None:
+        new_messages = list(turn_rows)
+
+    def emitter(event: dict):
+        # Dedup key includes `step` so distinct LLM iterations of the same
+        # tool (e.g. agent calls `bash` three times in a row) are NOT
+        # collapsed — each one carries a unique `step` from
+        # graph_thinking.generate's state.step_count, which is the natural
+        # collision boundary. Without `step` here, three bash events
+        # stringify to the same key and only the first ever reaches the
+        # frontend; the user sees a single "Step 1" tool card and the loop
+        # appears to hang.
+        #
+        # For 'done' events we use a fixed key — only the first one
+        # matters, later ones would carry a stale session_id.
+        step = event.get("step", -1)
+        if event.get("type") == "done":
+            key = "done"
+        else:
+            key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
+        if key not in seen_keys:
+            seen_keys.add(key)
+            event_queue.put(event)
+
+    async def event_generator():
+        set_event_emitter(emitter)
+        try:
+            # 统一拼装：系统提示词（动态工具索引）+ Core Memory + 检索记忆 +
+            # 历史/当前轮，每条都带来源标签。
+            langchain_messages = build_prompt_messages(
+                history=list(history) + list(turn_rows),
+                core_memory=compiled_memory,
+                retrieved=retrieved,
+                tools=TOOLS,
+                skills=SKILLS.descriptions(),
+            )
+
+            # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
+            from src.agent.prompt_debug import maybe_dump
+            maybe_dump(langchain_messages, {
+                "session_id": session_id,
+                "query": query_label,
+                "threshold": relevance_threshold(),
+                "tool_count": len(TOOLS),
+                "retrieved_facts": len(getattr(retrieved, "facts", []) or []),
+                "retrieved_summaries": len(getattr(retrieved, "summaries", []) or []),
+                "history_rows": len(history) + len(turn_rows),
+            }, tools=TOOLS, state_key=session_id)
+
+            for ev in extra_events or []:
+                event_queue.put(ev)
+
+            # Stream events
+            async for event in graph.astream_events(
+                {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0, "session_id": session_id},
+                config={"recursion_limit": 100},
+                stream_mode="values",
+            ):
+                event_type = event.get("event", "")
+                if event_type == "on_chain_end":
+                    # Capture new messages from this event
+                    chain_output = event.get("data", {}).get("output", {})
+                    if isinstance(chain_output, dict) and "messages" in chain_output:
+                        msgs = chain_output["messages"]
+                        if isinstance(msgs, list):
+                            for msg in msgs[len(langchain_messages):]:
                                 new_messages.append(message_to_dict(msg))
+                    elif isinstance(chain_output, list):
+                        for msg in msgs[len(langchain_messages):]:
+                            new_messages.append(message_to_dict(msg))
 
-                        # Drain queue → sort by step → yield immediately
-                        pending: list[dict] = []
-                        while True:
-                            try:
-                                pending.append(event_queue.get_nowait())
-                            except queue.Empty:
-                                break
-                        pending.sort(key=lambda e: e.get("step", 0))
-                        for ev in pending:
-                            yield f"data: {json.dumps(ev)}\n\n"
-                # 最后再 drain 一次 —— 回答事件是在循环开始前 put 的，
-                # 最后一个 on_chain_end 之后产生的事件也不能丢。
-                pending: list[dict] = []
-                while True:
-                    try:
-                        pending.append(event_queue.get_nowait())
-                    except queue.Empty:
-                        break
-                for ev in pending:
-                    yield f"data: {json.dumps(ev)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'step': 0, 'session_id': session_id})}\n\n"
-            finally:
-                set_event_emitter(None)
-                seen_keys.clear()
+                    # Drain queue → sort by step → yield immediately
+                    pending: list[dict] = []
+                    while True:
+                        try:
+                            pending.append(event_queue.get_nowait())
+                        except queue.Empty:
+                            break
+                    pending.sort(key=lambda e: e.get("step", 0))
+                    for ev in pending:
+                        yield f"data: {json.dumps(ev)}\n\n"
+            # 最后再 drain 一次 —— 回答事件是在循环开始前 put 的，
+            # 最后一个 on_chain_end 之后产生的事件也不能丢。
+            pending: list[dict] = []
+            while True:
+                try:
+                    pending.append(event_queue.get_nowait())
+                except queue.Empty:
+                    break
+            for ev in pending:
+                yield f"data: {json.dumps(ev)}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'step': 0, 'session_id': session_id})}\n\n"
+        finally:
+            set_event_emitter(None)
+            seen_keys.clear()
 
-        # Return the streaming response; messages will be saved after iteration completes
-        return StreamingResponse(
-            _stream_and_save(event_generator(), session_id, new_messages, history),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-                "X-Session-Id": session_id,
-            },
+    # Return the streaming response; messages will be saved after iteration completes
+    return StreamingResponse(
+        _stream_and_save(event_generator(), session_id, new_messages, history),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-Session-Id": session_id,
+        },
+    )
+
+
+# ==================== 鉴权路由 ====================
+
+def _resolve_batch_tool_rows(batch: dict) -> list[dict]:
+    """批次裁决完了 → 为每个调用产出一条 tool_result 行（原始顺序）。
+
+    一个 tool_use 缺了配对的 tool_result，上游 API 会直接报 400 —— 这里
+    必须一条不落，包括被拒绝的那几条。
+    """
+    from src.agent.authz import pending as authz_pending
+    from src.agent.graph_thinking import run_single_tool
+
+    rows: list[dict] = []
+    for call in batch.get("calls") or []:
+        tool_call_id = call.get("tool_call_id") or ""
+        tool_name = call.get("tool_name") or ""
+        tool_input = call.get("tool_input") or {}
+        verdict = call.get("verdict")
+        if verdict == "allow":
+            content = run_single_tool(tool_name, tool_input)
+        elif verdict == "deny":
+            content = f"授权拒绝：{call.get('reason') or '该操作被拒绝'}"
+        else:
+            # escalate —— 看用户的裁决
+            row = authz_pending.get_pending_by_tool_call_id(tool_call_id)
+            choice = (row or {}).get("status")
+            if choice == "deny":
+                content = "授权拒绝：用户拒绝了该操作"
+            else:
+                content = run_single_tool(tool_name, tool_input)
+        rows.append(
+            {
+                "role": "tool",
+                "content": content,
+                "name": tool_name,
+                "tool_call_id": tool_call_id,
+            }
+        )
+    return rows
+
+
+def _deny_earliest_pending_if_typed(session_id: str, query: str) -> list[dict]:
+    """用户有待批记录时直接敲了文字 → 最早的待批项判 deny（spec §5.4）。
+
+    不去解析自由文本 —— 猜用户的意思比拒绝更危险。返回要补进本轮的
+    tool_result 行；批次还没解决就 409，让用户先在卡片上选。
+    """
+    from src.agent.authz import pending as authz_pending
+
+    if not (query or "").strip():
+        return []
+    rows = authz_pending.list_pending(session_id)
+    if not rows:
+        return []
+    earliest = rows[0]
+    authz_pending.record_decision(earliest["tool_call_id"], "deny")
+    if not authz_pending.batch_is_resolved(earliest["batch_id"]):
+        remaining = len(authz_pending.list_pending(session_id))
+        raise HTTPException(
+            status_code=409,
+            detail=f"还有 {remaining} 个操作待确认，请先在卡片上选择",
+        )
+    batch = authz_pending.get_batch(earliest["batch_id"])
+    if not batch:
+        return []
+    return _resolve_batch_tool_rows(batch)
+
+
+async def _done_only_stream():
+    """只回一个 done —— 批次还没全部裁决完时，前端不用等图。"""
+    yield f"data: {json.dumps({'type': 'done', 'step': 0})}\n\n"
+
+
+def create_auth_router():
+    """鉴权路由 —— 待批查询、授权台账、提权回复。"""
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.get("/pending")
+    async def auth_pending(session_id: str):
+        """该会话还没裁决的调用。"""
+        from src.agent.authz import pending as authz_pending
+
+        return {"pending": authz_pending.list_pending(session_id)}
+
+    @router.get("/grants")
+    async def auth_grants(session_id: str | None = None, scope: str | None = None):
+        """授权台账 —— 用户批准过什么。"""
+        from src.agent.authz import ledger
+
+        return {"grants": ledger.list_grants(session_id=session_id, scope=scope)}
+
+    @router.delete("/grants/{grant_id}")
+    async def auth_revoke(grant_id: str):
+        """撤销一条授权。"""
+        from src.agent.authz import ledger
+
+        return {"ok": ledger.revoke_grant(grant_id)}
+
+    @router.post("/respond")
+    async def auth_respond(req: AuthRespondRequest):
+        """用户裁决一个待批调用。批次全部裁决完 → 补齐 tool_result 并重跑图。"""
+        from src.agent.authz import ledger
+        from src.agent.authz import pending as authz_pending
+        from src.agent.session_manager import get_session_history
+
+        if req.choice not in authz_pending.VALID_CHOICES:
+            raise HTTPException(
+                status_code=400, detail=f"invalid choice: {req.choice!r}"
+            )
+
+        row = authz_pending.record_decision(req.tool_call_id, req.choice)
+        if row is None:
+            raise HTTPException(status_code=404, detail="没有这个待批调用")
+
+        # 「允许并记住」—— 模式由用户授权，不是模型给的
+        if req.choice == "allow_always" and row.get("pattern"):
+            ledger.record_grant(row["pattern"], session_id=req.session_id)
+
+        if not authz_pending.batch_is_resolved(row["batch_id"]):
+            return StreamingResponse(
+                _done_only_stream(), media_type="text/event-stream"
+            )
+
+        batch = authz_pending.get_batch(row["batch_id"])
+        if not batch:
+            raise HTTPException(status_code=404, detail="批次不存在")
+        tool_rows = _resolve_batch_tool_rows(batch)
+        history = get_session_history(req.session_id)
+        return await _stream_agent_turn(
+            session_id=req.session_id,
+            history=history,
+            turn_rows=tool_rows,
+            new_messages=list(tool_rows),
+            query_label="",
         )
 
     return router
@@ -925,6 +1109,9 @@ def create_notification_hub_app() -> FastAPI:
     memory_router = create_memory_router()
     app.include_router(memory_router, prefix="/memory")
 
+    # 鉴权 router —— 待批批次、授权台账、提权回复
+    app.include_router(create_auth_router(), prefix="/auth")
+
     # 调试 router —— 看「实际发给模型的完整输入」
     debug_router = APIRouter()
 
@@ -938,6 +1125,13 @@ def create_notification_hub_app() -> FastAPI:
         from src.agent.prompt_debug import maybe_dump
         maybe_dump(messages, meta, tools=TOOLS, full=True, track=False)
         return debug_payload(messages, meta, TOOLS)
+
+    @debug_router.get("/authz")
+    async def debug_authz(n: int = 100):
+        """最近的鉴权判定 —— 看闸门到底放了什么、拒了什么。"""
+        from src.agent.authz import audit
+
+        return {"verdicts": audit.recent(n), "log_path": str(audit.authz_log_path())}
 
     app.include_router(debug_router, prefix="/debug")
 

@@ -537,17 +537,38 @@ def generate(state: InterleavedState) -> dict:
     }
 
 
-def execute_tools(state: InterleavedState) -> dict:
-    """Execute pending tool calls and return results."""
-    tool_messages = []
+def run_single_tool(tool_name: str, tool_input: dict) -> str:
+    """执行一个工具，返回结果字符串。找不到工具 → "Error: Unknown tool 'x'"。
 
-    # Build a name->tool map
+    工具执行只有这一处实现 —— 图里的 `execute_tools` 和提权恢复都用它，
+    两边跑出来的结果必须一模一样。
+    """
     tool_map = {}
     for t in TOOLS:
         if hasattr(t, "name"):
             tool_map[t.name] = t
         elif hasattr(t, "__name__"):
             tool_map[t.__name__] = t
+
+    tool = tool_map.get(tool_name)
+    if tool is None:
+        result = f"Error: Unknown tool '{tool_name}'"
+    else:
+        try:
+            result = tool.invoke(tool_input or {})
+        except Exception as e:
+            result = f"Error: {e}"
+
+    # 轻量触发：当工具返回失败时，提示模型记录
+    result_str = str(result)
+    if is_failure_result(result_str):
+        result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+    return result_str
+
+
+def execute_tools(state: InterleavedState) -> dict:
+    """Execute pending tool calls and return results."""
+    tool_messages = []
 
     for tool_use in state.pending_tool_calls:
         if isinstance(tool_use, dict):
@@ -576,20 +597,7 @@ def execute_tools(state: InterleavedState) -> dict:
 
         print_tool_call(tool_name, raw_input, state.step_count)
 
-        tool = tool_map.get(tool_name)
-        if tool is None:
-            result = f"Error: Unknown tool '{tool_name}'"
-            print(f"  Error: {result}", flush=True)
-        else:
-            try:
-                result = tool.invoke(raw_input)
-            except Exception as e:
-                result = f"Error: {e}"
-
-        # 轻量触发：当工具返回失败时，提示模型记录
-        result_str = str(result)
-        if is_failure_result(result_str):
-            result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+        result_str = run_single_tool(tool_name, raw_input)
 
         print_tool_result(result_str, state.step_count)
 
