@@ -593,7 +593,7 @@ def run_single_tool(tool_name: str, tool_input: dict) -> str:
         try:
             try:
                 result = tool.invoke(tool_input or {})
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 —— 工具崩了不能掀翻整轮，兜成一条错误结果
                 result = f"Error: {e}"
             result_str = str(result)
             if snapshot_dir is not None:

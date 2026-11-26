@@ -180,7 +180,10 @@ def test_client_uses_json_response_format_and_no_thinking(monkeypatch):
     judge._make_client("judge-model")
 
     assert recorded["model"] == "judge-model"
-    assert recorded["response_format"] == {"type": "json_object"}
+    # response_format 走 model_kwargs：顶层传的话 langchain 会打一条
+    # 「不是默认参数、已转进 model_kwargs」的 warning，判官每次调用都打。
+    assert recorded["model_kwargs"] == {"response_format": {"type": "json_object"}}
+    assert "response_format" not in recorded
     assert recorded["extra_body"] == {"enable_thinking": False}
     assert recorded["timeout"] == judge.JUDGE_TIMEOUT_S
 

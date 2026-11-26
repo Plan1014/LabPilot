@@ -77,7 +77,10 @@ def _make_client(model_id: str) -> Any:
             base_url=api_base,
             model=model_id,
             timeout=JUDGE_TIMEOUT_S,
-            response_format={"type": "json_object"},
+            # response_format 走 model_kwargs —— 直接当顶层参数传，langchain 会
+            # 打一条 warning 说它不是默认参数、已转进 model_kwargs。判官每次调用
+            # 都走这条路，一天几百条 warning 把真警告埋了。
+            model_kwargs={"response_format": {"type": "json_object"}},
             # 判官要严格 JSON，开 thinking 耗时翻倍且污染输出
             extra_body={"enable_thinking": False},
         )
