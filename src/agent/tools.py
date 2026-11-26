@@ -6,7 +6,7 @@ All tools are @tool-decorated functions exposed to the LangGraph agent.
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, List
 
 from langchain_core.tools import tool
@@ -284,6 +284,29 @@ def bash_write_targets(segment: str) -> list[str]:
                 targets.append(a[3:])
         return targets
 
+    if exe == "find":
+        # find 的写目标藏在 -fprint / -fprintf / -fls 里，不是位置参数。
+        # 这三个选项会把匹配结果写进文件 —— `find` 在只读命令表里，
+        # 但带着这些选项时它就是写命令。
+        for i, a in enumerate(args):
+            for opt in ("-fprint", "-fprintf", "-fls"):
+                if a == opt:
+                    if i + 1 < len(args):
+                        targets.append(args[i + 1])
+                elif a.startswith(opt + "="):
+                    targets.append(a[len(opt) + 1:])
+        return targets
+
+    if exe == "diff":
+        # diff 的写目标藏在 --output= 里
+        for i, a in enumerate(args):
+            if a == "--output":
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--output="):
+                targets.append(a[len("--output="):])
+        return targets
+
     mode = _WRITE_VERB_TARGETS.get(exe)
     if mode is None:
         return targets
@@ -329,16 +352,189 @@ def _is_read_only_segment(segment: str) -> bool:
     if not tokens:
         return False
     exe = _exe_name(tokens[0])
-    if exe not in READ_ONLY_EXECUTABLES:
-        return False
     for tok in tokens[1:]:
         if _is_redirect_op(tok):
             return False
+    if exe == "git":
+        return _is_read_only_git(tokens[1:])
+    if exe not in READ_ONLY_EXECUTABLES:
+        return False
     if exe == "find":
         for a in tokens[1:]:
-            if a.startswith("-delete") or a.startswith("-exec") or a.startswith("-ok"):
+            if a.startswith(("-delete", "-exec", "-ok", "-fprint", "-fprintf", "-fls")):
+                return False
+    if exe == "diff":
+        for a in tokens[1:]:
+            if a.startswith("--output"):
                 return False
     return True
+
+
+def _is_read_only_git(args: list[str]) -> bool:
+    """git 子命令是不是只读的。
+
+    只读子命令不该被拦，也不该花判官调用（spec D7a：agent 用 bash 读源码
+    是合法退路，`git status` / `git log` 同理）。
+    """
+    if not args:
+        return False
+    # 跳过全局选项（`git --no-pager status`）
+    rest: list[str] = []
+    for a in args:
+        if not rest and a.startswith("-"):
+            continue
+        rest.append(a)
+    if not rest or rest[0].lower() not in _GIT_READ_ONLY_SUBCOMMANDS:
+        return False
+    for a in rest[1:]:
+        low = a.lower()
+        # `git diff --output=FILE` 会把结果写进文件
+        if low.startswith("--output") or low == "-o":
+            return False
+    return True
+
+
+# ==================== git 破坏性命令 ====================
+# git 不改"文件路径"，它直接改工作区和历史 —— 效果比改文件更狠：
+# 用户没提交的改动一旦没了，快照兜底也救不回来（.git 不在受保护集合里，
+# 而 `git reset --hard` 抹掉的历史快照根本存不下来）。
+#
+# 判的是**子命令**，不是正则扫全文 —— git 的子命令是有限的几个词，
+# 逐个查表比正则稳，也不会误伤 `echo "git reset --hard"` 这种字符串。
+
+# 无论带什么参数都要拒的 git 子命令
+_GIT_ALWAYS_DENY: dict[str, str] = {
+    "push": "会把改动推到远端 —— 本项目禁止推送",
+    "filter-branch": "会重写提交历史",
+}
+
+# git 只读子命令 —— 这些只看不改
+_GIT_READ_ONLY_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "diff", "log", "show", "blame", "describe", "rev-parse",
+    "ls-files", "ls-tree", "shortlog", "cat-file", "whatchanged", "name-rev",
+})
+
+
+def _git_arg_is_repo_path(arg: str) -> bool:
+    """这个 git 参数是仓库里的路径，还是分支名？
+
+    分支名可以带斜杠（`feat/x`），所以不能只看有没有 `/`：
+
+    - `.` `..` → 路径
+    - 带文件后缀 → 路径
+    - 首段是仓库里真实存在的目录 → 路径（`src/agent/xxx`）
+    - 其余（`feat/x`、纯分支名）→ 分支名
+    """
+    if arg in (".", ".."):
+        return True
+    parts = PurePosixPath(arg.replace("\\", "/")).parts
+    if not parts:
+        return False
+    if PurePosixPath(arg.replace("\\", "/")).suffix:
+        return True
+    if len(parts) < 2:
+        return False
+    try:
+        return (WORKDIR / parts[0]).is_dir()
+    except OSError:
+        return False
+
+
+def _git_subcommand_reason(args: list[str]) -> str | None:
+    """git 子命令会不会毁掉工作区或历史 → 理由串；不会 → None。"""
+    if not args:
+        return None
+    sub = args[0].lower()
+    rest = args[1:]
+    low = [a.lower() for a in rest]
+
+    if sub in _GIT_ALWAYS_DENY:
+        return _GIT_ALWAYS_DENY[sub]
+
+    if sub == "reset":
+        if "--hard" in low:
+            return "会丢弃工作区里未提交的改动（`git reset --hard`）"
+        return None
+
+    if sub == "clean":
+        if any(a in ("-n", "--dry-run") for a in low):
+            return None
+        return "会删除未跟踪的文件（`git clean`）"
+
+    if sub == "restore":
+        # `git restore --staged` 只动暂存区，不丢工作区里的内容
+        # （`--staged --worktree` 两个一起才是恢复工作区）
+        if "--staged" in low and "--worktree" not in low:
+            return None
+        return "会丢弃工作区里未提交的改动（`git restore`）"
+
+    if sub == "checkout":
+        if "--orphan" in low:
+            return "会清空工作区（`git checkout --orphan`）"
+        if "--" in rest:
+            return "会丢弃工作区里未提交的改动（`git checkout -- <路径>`）"
+        for a in rest:
+            if a.startswith("-"):
+                continue
+            if _git_arg_is_repo_path(a):
+                return f"会丢弃 {a} 上未提交的改动（`git checkout`）"
+        return None
+
+    if sub == "switch":
+        if "--discard-changes" in low:
+            return "会丢弃工作区里未提交的改动（`git switch --discard-changes`）"
+        if any(a in ("-C", "--force-create") for a in rest):
+            return "会强制重建分支，丢掉该分支上的提交（`git switch -C`）"
+        return None
+
+    if sub == "branch":
+        if any(a in ("-D", "--delete-force") for a in rest):
+            return "会删掉分支上的提交（`git branch -D`）"
+        return None
+
+    if sub == "stash":
+        if low and low[0] in ("drop", "clear"):
+            return f"会丢掉暂存起来的改动（`git stash {low[0]}`）"
+        return None
+
+    if sub == "reflog":
+        if low and low[0] == "expire":
+            return "会清掉历史里可回溯的引用（`git reflog expire`）"
+        return None
+
+    if sub == "gc":
+        if any(a.startswith("--prune=now") for a in low):
+            return "会永久删除不可达对象（`git gc --prune=now`）"
+        return None
+
+    if sub == "remote":
+        if low and low[0] in ("remove", "set-url"):
+            return f"会改掉远端指向（`git remote {low[0]}`）"
+        return None
+
+    if sub == "worktree":
+        if low and low[0] == "remove":
+            return "会删掉工作树（`git worktree remove`）"
+        return None
+
+    return None
+
+
+def git_blocked_reason(command: str) -> str | None:
+    """命令里有会毁掉工作区/历史的 git 子命令 → 返回理由串；否则 None。
+
+    按段判定，理由里说明是哪一段 —— 和 `bash_blocked_write_target` 同一套话术。
+    """
+    for idx, segment in enumerate(split_bash_segments(command), start=1):
+        tokens = _tokenize(segment)
+        if not tokens:
+            continue
+        if _exe_name(tokens[0]) != "git":
+            continue
+        reason = _git_subcommand_reason(tokens[1:])
+        if reason:
+            return f"命令第 {idx} 段 `{segment.strip()}` {reason}"
+    return None
 
 
 def is_read_only_bash(command: str) -> bool:
@@ -430,6 +626,10 @@ def bash(command: str, background: bool = False) -> str:
     blocked = bash_blocked_write_target(command)
     if blocked:
         return err("Error", f"危险行为拒绝执行: {blocked}")
+    # git 改写类命令：不动文件路径，但一样能把用户的改动弄没
+    git_blocked = git_blocked_reason(command)
+    if git_blocked:
+        return err("Error", f"危险行为拒绝执行: {git_blocked}")
     try:
         if background:
             # Windows: hide console window for background process

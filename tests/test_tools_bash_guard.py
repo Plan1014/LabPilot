@@ -176,3 +176,152 @@ def test_bash_tool_still_allows_reading_source(workdir):
     (workdir / "src" / "x.py").write_text("hello", encoding="utf-8")
     out = tools.bash.invoke({"command": "cat src/x.py"})
     assert "hello" in out
+
+
+# ==================== find / diff 的隐藏写目标 ====================
+# `find` 和 `diff` 都在只读命令表里，但它们各自藏着一个能把结果写进文件的选项。
+# 只读表说"只看不改"，这两个选项一出现就不成立了。
+
+def test_find_fprint_target_is_a_write(workdir):
+    assert tools.bash_write_targets("find src -fprint src/out.txt") == ["src/out.txt"]
+
+
+def test_find_fprintf_target_is_a_write(workdir):
+    assert tools.bash_write_targets("find src -fprintf src/out.txt") == ["src/out.txt"]
+
+
+def test_find_without_write_option_is_not_a_write():
+    assert tools.bash_write_targets("find src -name '*.py'") == []
+
+
+def test_find_with_fprint_is_not_read_only():
+    assert not tools.is_read_only_bash("find src -fprint src/out.txt")
+
+
+def test_find_fprint_into_protected_dir_is_blocked(workdir):
+    reason = tools.bash_blocked_write_target("find src -fprint src/out.txt")
+    assert reason is not None and "src/out.txt" in reason
+
+
+def test_diff_output_target_is_a_write(workdir):
+    assert tools.bash_write_targets("diff a b --output=src/x.txt") == ["src/x.txt"]
+
+
+def test_diff_with_output_is_not_read_only():
+    assert not tools.is_read_only_bash("diff a b --output=tmp/x.txt")
+
+
+# ==================== git 破坏性命令 ====================
+# git 不改"文件路径"，它直接改工作区和历史 —— 效果比改文件更狠，
+# 而且用户的未提交改动一旦没了，快照兜底也救不回来（.git 不在受保护集合里）。
+
+def test_git_reset_hard_is_blocked(workdir):
+    reason = tools.git_blocked_reason("git reset --hard")
+    assert reason is not None and "reset" in reason
+
+
+def test_git_reset_without_hard_is_not_blocked(workdir):
+    assert tools.git_blocked_reason("git reset HEAD~1") is None
+
+
+def test_git_checkout_dot_is_blocked(workdir):
+    assert tools.git_blocked_reason("git checkout .") is not None
+
+
+def test_git_checkout_path_is_blocked(workdir):
+    (workdir / "src" / "x.py").write_text("hi", encoding="utf-8")
+    assert tools.git_blocked_reason("git checkout src/x.py") is not None
+
+
+def test_git_checkout_branch_is_not_blocked(workdir):
+    # 切分支是正常操作，不能误伤（分支名可以带斜杠）
+    assert tools.git_blocked_reason("git checkout feat/tool-authz") is None
+
+
+def test_git_checkout_dash_dash_path_is_blocked(workdir):
+    assert tools.git_blocked_reason("git checkout -- src/x.py") is not None
+
+
+def test_git_restore_is_blocked(workdir):
+    assert tools.git_blocked_reason("git restore src/x.py") is not None
+
+
+def test_git_restore_staged_only_is_not_blocked(workdir):
+    assert tools.git_blocked_reason("git restore --staged src/x.py") is None
+
+
+def test_git_clean_is_blocked(workdir):
+    assert tools.git_blocked_reason("git clean -fd") is not None
+
+
+def test_git_clean_dry_run_is_not_blocked(workdir):
+    assert tools.git_blocked_reason("git clean -n") is None
+
+
+def test_git_push_is_blocked(workdir):
+    assert tools.git_blocked_reason("git push origin main") is not None
+
+
+def test_git_branch_force_delete_is_blocked(workdir):
+    assert tools.git_blocked_reason("git branch -D feat/x") is not None
+
+
+def test_git_stash_drop_is_blocked(workdir):
+    assert tools.git_blocked_reason("git stash drop") is not None
+
+
+def test_git_stash_is_not_blocked(workdir):
+    assert tools.git_blocked_reason("git stash") is None
+
+
+def test_git_status_is_not_blocked(workdir):
+    assert tools.git_blocked_reason("git status") is None
+
+
+def test_git_compound_command_names_the_segment(workdir):
+    reason = tools.git_blocked_reason("git status && git reset --hard")
+    assert reason is not None and "第 2 段" in reason
+
+
+def test_bash_tool_refuses_git_reset_hard(workdir):
+    out = tools.bash.invoke({"command": "git reset --hard"})
+    assert "危险行为拒绝执行" in out
+
+
+def test_authz_l1_blocks_git_reset_hard(workdir):
+    from src.agent.authz.rules import find_denied_write_target
+
+    reason = find_denied_write_target("bash", {"command": "git reset --hard"})
+    assert reason is not None
+
+
+def test_authz_l1_allows_git_status(workdir):
+    from src.agent.authz.rules import find_denied_write_target
+
+    assert find_denied_write_target("bash", {"command": "git status"}) is None
+
+
+# ==================== git 只读子命令 ====================
+
+def test_git_status_is_read_only_bash():
+    assert tools.is_read_only_bash("git status")
+
+
+def test_git_log_is_read_only_bash():
+    assert tools.is_read_only_bash("git log --oneline")
+
+
+def test_git_diff_is_read_only_bash():
+    assert tools.is_read_only_bash("git diff")
+
+
+def test_git_global_option_still_read_only():
+    assert tools.is_read_only_bash("git --no-pager status")
+
+
+def test_git_write_subcommand_is_not_read_only():
+    assert not tools.is_read_only_bash("git reset --hard")
+
+
+def test_git_diff_with_output_file_is_not_read_only():
+    assert not tools.is_read_only_bash("git diff --output=tmp/d.txt")

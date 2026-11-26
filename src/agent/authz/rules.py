@@ -59,7 +59,12 @@ def find_denied_write_target(tool_name: str, tool_input: dict) -> str | None:
 
     if tool_name == "bash":
         command = (tool_input or {}).get("command") or ""
-        return tools.bash_blocked_write_target(command)
+        reason = tools.bash_blocked_write_target(command)
+        if reason:
+            return reason
+        # git 改写类命令也归 L1 —— 判官看不见工作区状态，不该让它来决定
+        # 用户的未提交改动能不能丢。
+        return tools.git_blocked_reason(command)
 
     return None
 

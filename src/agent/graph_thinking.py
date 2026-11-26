@@ -19,13 +19,15 @@ import threading
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Callable, Literal, Optional, Sequence
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, StateGraph, add_messages
 
+from src.agent import tools as tools_mod
 from src.agent.ask_user import detect_ask, format_ask_cli, sanitize_ask_message
-from src.agent.authz import Verdict, authorize
+from src.agent.authz import Verdict, authorize, protect
 from src.agent.authz import ledger as authz_ledger
 from src.agent.authz import pending as authz_pending
 from src.agent.llm import llm
@@ -537,6 +539,33 @@ def generate(state: InterleavedState) -> dict:
     }
 
 
+def _snapshot_protected() -> Path | None:
+    """给 bash 执行拍一张受保护区的快照。拍不了就返回 None（不挡工具执行）。"""
+    try:
+        return protect.snapshot(tools_mod.WORKDIR)
+    except OSError:
+        return None
+
+
+def _apply_protection(snapshot_dir, result_str: str) -> str:
+    """比对快照与现状，把越界的改动还原掉，并把这次调用判为失败。
+
+    还原报告拼在原始输出前面 —— 主 agent 要先看到「保护区被动过」，
+    再看到命令本身说了什么。
+    """
+    try:
+        report = protect.diff_and_restore(snapshot_dir, tools_mod.WORKDIR)
+    except OSError:
+        return result_str
+    if not report["restored"]:
+        return result_str
+    return (
+        "Error: 隔离兜底触发：命令改动了受保护区域，已还原。\n"
+        f"{protect.format_report(report)}\n\n"
+        f"命令原始输出：\n{result_str}"
+    )
+
+
 def run_single_tool(tool_name: str, tool_input: dict) -> str:
     """执行一个工具，返回结果字符串。找不到工具 → "Error: Unknown tool 'x'"。
 
@@ -553,14 +582,29 @@ def run_single_tool(tool_name: str, tool_input: dict) -> str:
     tool = tool_map.get(tool_name)
     if tool is None:
         result = f"Error: Unknown tool '{tool_name}'"
+        result_str = str(result)
     else:
+        # bash 前后拍快照 —— 隔离兜底（spec §5.6）。
+        # background=True 的 bash 不走这条路（Popen 立刻返回，还原跑完后台
+        # 进程还没动文件），那一类由 L2 判官强制挡。
+        snapshot_dir = None
+        if tool_name == "bash" and not (tool_input or {}).get("background"):
+            snapshot_dir = _snapshot_protected()
         try:
-            result = tool.invoke(tool_input or {})
-        except Exception as e:
-            result = f"Error: {e}"
+            try:
+                result = tool.invoke(tool_input or {})
+            except Exception as e:
+                result = f"Error: {e}"
+            result_str = str(result)
+            if snapshot_dir is not None:
+                result_str = _apply_protection(snapshot_dir, result_str)
+        finally:
+            # 快照比对完就没用了 —— 不删的话每次 bash 都在 tmp/_protect/ 里
+            # 留一份受保护区的副本，跑几十次就是几百 MB。
+            if snapshot_dir is not None:
+                protect.cleanup(snapshot_dir)
 
     # 轻量触发：当工具返回失败时，提示模型记录
-    result_str = str(result)
     if is_failure_result(result_str):
         result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
     return result_str

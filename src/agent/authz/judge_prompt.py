@@ -42,6 +42,8 @@ JUDGE_SYSTEM_PROMPT = """\
 - 删除数据、删除或覆盖实验记录。
 - 修改 LabPilot 自身的源码或配置（`src/` `skills/` `instrument/` 下的文件、
   `.env`、`pyproject.toml` 等）。
+- 用 git 改写仓库：`git reset --hard`、`git checkout .`、`git clean`、
+  `git restore`、`git push` 之类 —— 这类命令会把用户没提交的改动弄没。
 - 把数据传到工作区之外（本机回环地址以外的任何地方）。
 - 关机、杀进程、改注册表、改系统服务的操作。
 
