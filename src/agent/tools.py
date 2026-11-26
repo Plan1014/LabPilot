@@ -12,6 +12,7 @@ from typing import Callable, List
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from src.agent import paths
 from src.agent.config import WORKDIR, SKILLS_DIR
 from src.agent.memory.core import CoreMemoryManager
 
@@ -68,6 +69,287 @@ def _dangerous_match(command: str) -> str:
         return ""
     m = _DANGEROUS_REGEX.search(command)
     return m.group(0) if m else ""
+
+
+# ==================== bash 命令级判定 ====================
+# 这些判定住在 tools.py 而不是鉴权层（spec D13）：bash 是高自由度工具，命令语义
+# 的判断必须和工具执行待在一起 —— 工具自己在执行前就会拒，闸门被绕过也照样生效。
+#
+# 两条铁律：
+#   1. 只解析「写动词的目标参数」，绝不扫全文找路径 —— 否则 `echo "会改 src/x.py"`
+#      这种字面量会造成误伤。
+#   2. 只允许漏判，不允许错判。解析不出的形态（python -c 里拼的路径、含变量的
+#      路径、sh -c 套娃）一律判「没命中」放行，交给上层判官与快照兜底。
+
+# 只读命令表 —— 这些命令只看不改，agent 用 bash 读源码是合法退路，绝不能拦
+READ_ONLY_EXECUTABLES: frozenset[str] = frozenset({
+    "cat", "head", "tail", "less", "more", "wc", "ls", "dir", "stat", "file",
+    "du", "df", "grep", "rg", "find", "tree", "diff", "cmp", "md5sum",
+    "sha256sum", "echo", "type", "which", "pwd", "date",
+})
+
+# 重定向运算符：`>` `>>` `1>` `2>` `&>`
+_REDIRECT_OP_RE = re.compile(r"^(?:\d*>>?|&>)$")
+
+# 会改动文件的命令 → 目标参数取哪几个
+#   "all"  = 全部位置参数（rm / mv —— mv 的源也算，把仓库里的文件搬走同样是破坏）
+#   "last" = 最后一个位置参数（cp / sed -i / patch —— 只有目标是写）
+#   "first"= 第一个位置参数（truncate / chmod）
+_WRITE_VERB_TARGETS: dict[str, str] = {
+    "tee": "all",
+    "mv": "all",
+    "rm": "all",
+    "rmdir": "all",
+    "del": "all",
+    "erase": "all",
+    "remove-item": "all",
+    "cp": "last",
+    "sed": "last",
+    "patch": "last",
+    "rsync": "last",
+    "scp": "last",
+    "install": "last",
+    "truncate": "first",
+    "chmod": "first",
+    "chown": "first",
+    "mkdir": "first",
+    "touch": "all",
+}
+
+
+def split_bash_segments(command: str) -> list[str]:
+    """把命令按 `&&` `||` `;` `|` 换行拆成子命令。
+
+    引号内的分隔符不拆。空段丢弃。
+    """
+    if not command:
+        return []
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "&" and i + 1 < n and command[i + 1] == "&":
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch == "|" and i + 1 < n and command[i + 1] == "|":
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in ("|", ";", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s.strip() for s in segments if s.strip()]
+
+
+def _tokenize(segment: str) -> list[str]:
+    """把一段命令切成 token。
+
+    - 引号内的空格不分、引号本身去掉（`"a b"` → `a b` 一个 token）
+    - 重定向运算符单独成 token（`>` `>>` `1>` `2>` `&>`）
+    - 引号内的 `>` 不当运算符（`find . -name "x>y"` 不该被当成重定向）
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+
+    def flush() -> None:
+        if buf:
+            tokens.append("".join(buf))
+            buf.clear()
+
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch.isspace():
+            flush()
+            i += 1
+            continue
+        if ch == ">":
+            op = ">"
+            j = i + 1
+            if j < n and segment[j] == ">":
+                op = ">>"
+                j += 1
+            prefix = "".join(buf)
+            buf.clear()
+            if prefix and not (prefix.isdigit() or prefix == "&"):
+                # 形如 `hi>out.txt` —— 前半段是普通 token，不是 fd 号
+                tokens.append(prefix)
+                tokens.append(">")
+            else:
+                tokens.append(prefix + op)
+            i = j
+            continue
+        buf.append(ch)
+        i += 1
+    flush()
+    return tokens
+
+
+def _exe_name(token: str) -> str:
+    """取可执行名：剥目录、剥 .exe/.cmd/.bat/.ps1 后缀，转小写。
+
+    `C:\\Windows\\System32\\del.exe` → `del`
+    """
+    name = token.strip().strip("\"'")
+    for sep in ("\\", "/"):
+        if sep in name:
+            name = name.rsplit(sep, 1)[-1]
+    name = name.strip("\"'")
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.lower()
+
+
+def _is_redirect_op(token: str) -> bool:
+    return bool(_REDIRECT_OP_RE.match(token))
+
+
+def _positional(args: list[str]) -> list[str]:
+    """位置参数（去掉 `-` 开头的选项）。"""
+    return [a for a in args if not a.startswith("-")]
+
+
+def bash_write_targets(segment: str) -> list[str]:
+    """返回该子命令的写目标（原始字符串）。
+
+    只解析写动词的目标参数，不扫全文找路径。识别不出目标时返回空列表 ——
+    漏判比错判安全。
+    """
+    if not segment:
+        return []
+    tokens = _tokenize(segment)
+    if not tokens:
+        return []
+
+    targets: list[str] = []
+    args: list[str] = []
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if _is_redirect_op(tok):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if nxt and not nxt.startswith("&"):
+                # `2>&1` 里的 `&1` 是 fd 复制，不是文件目标
+                targets.append(nxt)
+                i += 2
+                continue
+            i += 1
+            continue
+        args.append(tok)
+        i += 1
+
+    exe = _exe_name(tokens[0])
+
+    if exe == "dd":
+        # dd 的写目标藏在 `of=` 里，不是位置参数
+        for a in args:
+            if a.startswith("of="):
+                targets.append(a[3:])
+        return targets
+
+    mode = _WRITE_VERB_TARGETS.get(exe)
+    if mode is None:
+        return targets
+
+    if exe == "sed" and not any(
+        a == "--in-place" or (a.startswith("-i") and not a.startswith("--"))
+        for a in args
+    ):
+        # sed 不带 -i 是读
+        return targets
+
+    positional = _positional(args)
+    if not positional:
+        return targets
+    if mode == "all":
+        targets.extend(positional)
+    elif mode == "last":
+        targets.append(positional[-1])
+    else:  # first
+        targets.append(positional[0])
+    return targets
+
+
+def bash_blocked_write_target(command: str) -> str | None:
+    """命令里有写目标落在只读区 → 返回理由串；否则 None。
+
+    理由串必须指出**是哪一段**、原文是什么、目标是谁 —— 不能是一句笼统的
+    「命令危险」。复合命令按段判定：bash 是一个子进程，跑一半停不下来。
+    """
+    for idx, segment in enumerate(split_bash_segments(command), start=1):
+        for target in bash_write_targets(segment):
+            if paths.classify_target(target) == "repo_readonly":
+                return (
+                    f"命令第 {idx} 段 `{segment.strip()}` "
+                    f"试图修改只读区域 {target}"
+                )
+    return None
+
+
+def _is_read_only_segment(segment: str) -> bool:
+    """这一段是否只读。"""
+    tokens = _tokenize(segment)
+    if not tokens:
+        return False
+    exe = _exe_name(tokens[0])
+    if exe not in READ_ONLY_EXECUTABLES:
+        return False
+    for tok in tokens[1:]:
+        if _is_redirect_op(tok):
+            return False
+    if exe == "find":
+        for a in tokens[1:]:
+            if a.startswith("-delete") or a.startswith("-exec") or a.startswith("-ok"):
+                return False
+    return True
+
+
+def is_read_only_bash(command: str) -> bool:
+    """整条命令是否只读 —— 每一段都只读才算。
+
+    只读命令不该被拦，也不该花判官调用（spec D7a）。
+    """
+    segments = split_bash_segments(command)
+    if not segments:
+        return False
+    return all(_is_read_only_segment(s) for s in segments)
 
 
 # ==================== Error Type Conventions ====================
@@ -143,6 +425,11 @@ def bash(command: str, background: bool = False) -> str:
         # 把命中的模式名带回去,让 Agent 能把规则记进 Core Memory
         matched = _dangerous_match(command)
         return err("Error", f"危险行为拒绝执行: {matched}")
+    # 写目标保护：命令要改只读区（仓库自身）就拒绝 —— 在起进程之前就拒，
+    # 命令根本没跑。理由里说清是哪一段、目标是谁。
+    blocked = bash_blocked_write_target(command)
+    if blocked:
+        return err("Error", f"危险行为拒绝执行: {blocked}")
     try:
         if background:
             # Windows: hide console window for background process
