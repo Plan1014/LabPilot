@@ -381,3 +381,76 @@ def test_typed_text_while_pending_is_treated_as_deny(client, db, fake_graph, mon
     tool_rows = [m for m in _history("s1") if m.get("role") == "tool"]
     assert tool_rows
     assert tool_rows[0]["content"].startswith("授权拒绝：")
+
+
+# ==================== 多 escalate 批次（评审 C4）====================
+# 一轮里两个调用都要人裁决时，两张卡片都得出来。
+# 后端的事件去重键是 `type:step:name:content:result:input` —— auth_request
+# 事件里这些字段全空、step 恒为 0，于是同一批的两个事件键完全相同，
+# 第二个在进 SSE 队列之前就被丢了。用户看不到第二张卡，批次也收敛不了。
+
+def test_two_escalations_in_one_turn_produce_two_auth_request_events(
+    client, db, monkeypatch
+):
+    from langchain_core.messages import AIMessage
+
+    from src.agent import graph_thinking
+    from src.agent import memory as memory_mod
+    from src.agent.authz import judge as judge_module
+    from src.agent.prompt_context import RetrievedMemory
+
+    class _StubRetriever:
+        def retrieve(self, query, threshold=None):
+            return RetrievedMemory(facts=[], summaries=[])
+
+    monkeypatch.setattr(memory_mod, "memory_retriever", _StubRetriever())
+
+    class FakeJudge:
+        def __call__(self, tool_name, tool_input):
+            return judge_module.JudgeResult("escalate", "不确定", "要执行吗？")
+
+    monkeypatch.setattr(judge_module, "judge", FakeJudge())
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[
+                    {"id": "c1", "name": "bash", "type": "tool_call",
+                     "args": {"command": "python tmp/x.py"}},
+                    {"id": "c2", "name": "bash", "type": "tool_call",
+                     "args": {"command": "python tmp/y.py"}},
+                ])
+            return AIMessage(content="好了")
+
+    monkeypatch.setattr(graph_thinking, "llm", FakeLLM())
+
+    r = client.post("/session/query", json={"session_id": "s1", "query": "跑两个"})
+    assert r.status_code == 200
+    reqs = [e for e in _sse_events(r.text) if e.get("type") == "auth_request"]
+    assert len(reqs) == 2
+    assert {e["tool_call_id"] for e in reqs} == {"c1", "c2"}
+    # 两条待批记录都落库 —— 卡片少了批次就收敛不了
+    assert len(authz_pending.list_pending("s1")) == 2
+
+
+def test_auth_request_events_are_not_deduped_by_step():
+    from src.agent.websocket_server import _event_dedup_key
+
+    a = {"type": "auth_request", "tool_call_id": "c1", "question": "第一个", "step": 0}
+    b = {"type": "auth_request", "tool_call_id": "c2", "question": "第二个", "step": 0}
+    assert _event_dedup_key(a) != _event_dedup_key(b)
+
+
+def test_identical_tool_events_are_still_deduped():
+    from src.agent.websocket_server import _event_dedup_key
+
+    a = {"type": "tool_call", "step": 1, "name": "bash", "input": {"command": "ls"}}
+    b = {"type": "tool_call", "step": 1, "name": "bash", "input": {"command": "ls"}}
+    assert _event_dedup_key(a) == _event_dedup_key(b)

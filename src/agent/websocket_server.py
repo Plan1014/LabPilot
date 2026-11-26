@@ -267,6 +267,32 @@ class ConnectionManager:
 _manager = ConnectionManager()
 
 
+# ==================== 事件去重键 ====================
+
+def _event_dedup_key(event: dict) -> str:
+    """事件去重键。同一批 SSE 事件里重复的事件只发一次。
+
+    键里带 `step`，所以 agent 连续调三次 `bash` 不会被折叠成一张卡 ——
+    每次 tool_call 都带 graph_thinking.generate 的 state.step_count。
+
+    **`auth_request` 单独按 `tool_call_id` 编键**：这类事件里 name/content/
+    result/input 全空，`step` 又是恒定的 0 —— 一批里两个 escalate 就会算出
+    同一个键，第二张卡片在进 SSE 队列之前就被丢掉，用户永远看不到它，
+    批次也收敛不了。tool_call_id 才是它们的天然身份。
+    """
+    event_type = event.get("type")
+    if event_type == "done":
+        # 只有第一个 done 有意义，后面的带的是过期 session_id
+        return "done"
+    if event_type == "auth_request":
+        return f"auth_request:{event.get('tool_call_id', '')}"
+    step = event.get("step", -1)
+    return (
+        f"{event_type}:{step}:{event.get('name', '')}:{event.get('content', '')}"
+        f":{event.get('result', '')}:{event.get('input', '')}"
+    )
+
+
 # ==================== Pending Drain Helpers (fix/pending-session-id) ====================
 
 def _spawn_drain_others_thread(current_session_id: str) -> None:
@@ -534,22 +560,7 @@ async def _stream_agent_turn(
         new_messages = list(turn_rows)
 
     def emitter(event: dict):
-        # Dedup key includes `step` so distinct LLM iterations of the same
-        # tool (e.g. agent calls `bash` three times in a row) are NOT
-        # collapsed — each one carries a unique `step` from
-        # graph_thinking.generate's state.step_count, which is the natural
-        # collision boundary. Without `step` here, three bash events
-        # stringify to the same key and only the first ever reaches the
-        # frontend; the user sees a single "Step 1" tool card and the loop
-        # appears to hang.
-        #
-        # For 'done' events we use a fixed key — only the first one
-        # matters, later ones would carry a stale session_id.
-        step = event.get("step", -1)
-        if event.get("type") == "done":
-            key = "done"
-        else:
-            key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
+        key = _event_dedup_key(event)
         if key not in seen_keys:
             seen_keys.add(key)
             event_queue.put(event)
@@ -962,22 +973,7 @@ def create_sse_router():
         seen_keys: set[str] = set()
 
         def emitter(event: dict):
-            # Dedup key includes `step` so distinct LLM iterations of the same
-            # tool (e.g. agent calls `bash` three times in a row) are NOT
-            # collapsed — each one carries a unique `step` from
-            # graph_thinking.generate's state.step_count, which is the natural
-            # collision boundary. Without `step` here, three bash events
-            # stringify to the same key and only the first ever reaches the
-            # frontend; the user sees a single "Step 1" tool card and the loop
-            # appears to hang.
-            #
-            # For 'done' events we use a fixed key — only the first one
-            # matters, later ones would carry a stale session_id.
-            step = event.get("step", -1)
-            if event.get("type") == "done":
-                key = "done"
-            else:
-                key = f"{event.get('type')}:{step}:{event.get('name', '')}:{event.get('content', '')}:{event.get('result', '')}:{event.get('input', '')}"
+            key = _event_dedup_key(event)
             if key not in seen_keys:
                 seen_keys.add(key)
                 event_queue.put(event)

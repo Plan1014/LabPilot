@@ -689,8 +689,14 @@ def _tool_call_fields(tool_use) -> tuple[str, str, dict]:
     return tool_id, tool_name, raw_input
 
 
-def build_auth_request_event(v: Verdict, tool_call_id: str, batch_id: str) -> dict:
-    """构造 SSE 的 auth_request 事件。"""
+def build_auth_request_event(
+    v: Verdict, tool_call_id: str, batch_id: str, step: int = 0
+) -> dict:
+    """构造 SSE 的 auth_request 事件。
+
+    `step` 取发起这轮工具调用的那一步 —— 恒为 0 会让前端把这一轮的卡片
+    全归到「第 0 步」，同一批里的两张卡看起来像同一张。
+    """
     return {
         "type": "auth_request",
         "tool_call_id": tool_call_id,
@@ -698,7 +704,7 @@ def build_auth_request_event(v: Verdict, tool_call_id: str, batch_id: str) -> di
         "reason": v.reason,
         "pattern": v.pattern,
         "batch_id": batch_id,
-        "step": 0,
+        "step": step,
     }
 
 
@@ -802,7 +808,10 @@ def authorize_node(state: InterleavedState) -> dict:
         emitter = _event_emitter.get()
         for item in escalations:
             event = build_auth_request_event(
-                item["verdict"], item["tool_call_id"], batch_id
+                item["verdict"],
+                item["tool_call_id"],
+                batch_id,
+                step=getattr(state, "step_count", 0),
             )
             if emitter:
                 emitter(event)
