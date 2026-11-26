@@ -63,6 +63,44 @@ def _init_schema(conn: sqlite3.Connection):
             CREATE INDEX IF NOT EXISTS idx_messages_session
             ON messages(session_id, id)
         """)
+        # 鉴权台账：用户批准过的操作范围
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_grants (
+                id TEXT PRIMARY KEY,
+                pattern TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                session_id TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_batches (
+                batch_id TEXT PRIMARY KEY,
+                session_id TEXT,
+                calls TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auth_pending (
+                id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
+                session_id TEXT,
+                tool_call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_input TEXT NOT NULL,
+                question TEXT,
+                reason TEXT,
+                pattern TEXT,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_auth_pending_session
+            ON auth_pending(session_id)
+        """)
 
 
 # ==================== Message Serialization ====================
