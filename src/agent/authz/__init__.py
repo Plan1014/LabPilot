@@ -14,10 +14,12 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+from langchain_core.tools import StructuredTool
+
 from . import audit, ledger, patterns, rules
 from . import judge as judge_module
 
-__all__ = ["Verdict", "authorize"]
+__all__ = ["Verdict", "authorize", "wrap_tools_with_gate"]
 
 
 @dataclass
@@ -86,3 +88,50 @@ def authorize(
             pattern=patterns.derive_pattern(tool_name, tool_input),
         )
     )
+
+
+def _make_gated_tool(t):
+    """把一个工具包成「先问闸门再执行」的工具。
+
+    名字、说明、参数 schema 全部照抄原工具 —— 模型是按名字发起调用的，
+    改了就等于换了个工具。
+    """
+    original = t
+    name = getattr(t, "name", None) or getattr(t, "__name__", "tool")
+    description = getattr(t, "description", "") or ""
+    args_schema = getattr(t, "args_schema", None)
+
+    def _gated(**kwargs):
+        verdict = authorize(name, kwargs)
+        if verdict.decision == "allow":
+            return original.invoke(kwargs)
+        if verdict.decision == "escalate":
+            # 这条执行路径没有人工审批界面 —— 判官拿不准就只能不放行
+            # （fail-closed）。不抛异常：抛出去会被 create_react_agent
+            # 变成「工具崩了」，用户看不出是自己被拦了。
+            return (
+                "Error: 该执行路径不支持人工审批，已拒绝。"
+                f"原因：{verdict.reason}"
+            )
+        return f"Error: 操作被拒绝。原因：{verdict.reason}"
+
+    _gated.__name__ = name
+    return StructuredTool.from_function(
+        func=_gated,
+        name=name,
+        description=description,
+        args_schema=args_schema,
+        return_direct=getattr(t, "return_direct", False),
+    )
+
+
+def wrap_tools_with_gate(tools: list) -> list:
+    """给一组工具套上闸门。
+
+    L0/L1/L2 正常生效；escalate → 转成 deny（fail-closed）。
+
+    给**没有**人工审批界面的执行路径用（server 模式、记忆子 agent）。
+    有卡片可弹的路径走 `graph_thinking.authorize_node` —— 那里能真的
+    把 escalate 交给用户裁决。
+    """
+    return [_make_gated_tool(t) for t in tools]

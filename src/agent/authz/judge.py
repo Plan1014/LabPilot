@@ -103,7 +103,7 @@ def _call_model(client: Any, tool_name: str, tool_input: dict) -> str | None:
                 HumanMessage(build_judge_user_message(tool_name, tool_input)),
             ]
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 —— 判官调不通就当失败，绝不能把异常掀到主 agent
         return None
     content = getattr(response, "content", response)
     if isinstance(content, str):
@@ -190,7 +190,7 @@ def judge(tool_name: str, tool_input: dict) -> JudgeResult:
 def _try_model(model_id: str, tool_name: str, tool_input: dict) -> JudgeResult | None:
     try:
         client = _make_client(model_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 —— 建不起客户端（没配 key、模型名错）也是失败
         return None
     raw = _call_model(client, tool_name, tool_input)
     if raw is None:

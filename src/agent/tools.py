@@ -18,6 +18,16 @@ from src.agent.memory.core import CoreMemoryManager
 
 
 # ==================== Dangerous Command Guard ====================
+# 这是**终局守卫**：命令在起进程之前就被拒，工具自己拒，不依赖上层。
+#
+# 闸门层（`src/agent/authz/`）**不复制**这份正则（spec D2）—— 复制两份
+# 意味着以后改一处漏一处，而两边不一致的时候没人知道该信谁。闸门层要问
+# 「这条命令危险吗」，直接调这里的函数。
+#
+# 同文件里的 `bash_blocked_write_target` 是另一回事：**写目标保护**
+# （spec D13）—— 命令要改受保护区（仓库自身）就拒。它不扫危险模式，
+# 只解析写目标落在哪。两者都是「工具自己拒」，与闸门层无关。
+#
 # All patterns are anchored at word boundaries so that legitimate names like
 # `mytaskkill.exe` or `shutdown_check.ps1` are NOT falsely blocked.
 # Matching is case-insensitive (re.IGNORECASE) — Windows built-ins are

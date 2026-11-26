@@ -101,6 +101,51 @@ SYSTEM_PROMPT = """
 _memory_agent = None
 _agent_lock = None
 
+# 记忆子 agent 该拿的工具 —— 只给它跟记忆有关的。
+# 原来它拿着含 `bash` 的全量工具表：一个「总结对话」的子 agent 能改仓库，
+# 而它根本不需要干这件事。工具越少，prompt injection 的面越小。
+MEMORY_TOOL_NAMES: tuple[str, ...] = (
+    "read_file",
+    "load_skill",
+    "search_memory",
+    "search_sessions",
+    "search_core_blocks",
+    "remember_fact",
+    "save_core_block",
+    "append_core_block",
+    "replace_core_block",
+)
+
+_memory_tools_cache: list | None = None
+
+
+def _build_memory_tools() -> list:
+    """按名字从全量工具表里挑出记忆工具。
+
+    延迟 import —— `src.agent.tools` 在模块级 import 了
+    `src.agent.memory.core`，模块级再 import 回去会绕成环。
+    """
+    global _memory_tools_cache
+    if _memory_tools_cache is None:
+        from src.agent.tools import TOOLS
+
+        by_name = {getattr(t, "name", None): t for t in TOOLS}
+        _memory_tools_cache = [
+            by_name[n] for n in MEMORY_TOOL_NAMES if n in by_name
+        ]
+    return _memory_tools_cache
+
+
+def __getattr__(name: str):
+    """`MEMORY_TOOLS` 延迟构建（PEP 562）。
+
+    模块级 `__getattr__` 只在**属性访问**时触发，模块内部的裸名字查找
+    不走这条路 —— 所以 `_get_memory_agent()` 里直接调 `_build_memory_tools()`。
+    """
+    if name == "MEMORY_TOOLS":
+        return _build_memory_tools()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def _get_memory_agent():
     """Lazy init of memory react agent"""
@@ -113,10 +158,11 @@ def _get_memory_agent():
         if _memory_agent is None:
             # Lazy imports to avoid circular dependency
             from langgraph.prebuilt import create_react_agent
-            from src.agent.tools import TOOLS
             from src.agent.llm import llm
 
-            _memory_agent = create_react_agent(model=llm, tools=TOOLS)
+            _memory_agent = create_react_agent(
+                model=llm, tools=_build_memory_tools()
+            )
         return _memory_agent
 
 

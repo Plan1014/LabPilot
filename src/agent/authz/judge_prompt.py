@@ -75,7 +75,7 @@ def _tool_descriptions() -> dict[str, str]:
                 name = getattr(t, "name", None)
                 if name:
                     descs[name] = (getattr(t, "description", "") or "").strip()
-        except Exception:
+        except Exception:  # noqa: BLE001,S110 —— 拿不到工具说明就当没说明，不能因此掀翻整个判官
             pass
         _TOOL_DESCRIPTIONS = descs
     return _TOOL_DESCRIPTIONS

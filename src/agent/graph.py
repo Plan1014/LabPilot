@@ -10,6 +10,7 @@ platform. Do NOT pass a custom checkpointer here.
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
 
+from src.agent.authz import wrap_tools_with_gate
 from src.agent.llm import llm
 from src.agent.prompt_context import build_system_prompt
 from src.agent.tools import TOOLS_FOR_REACT, SKILLS
@@ -37,7 +38,10 @@ def _build_graph():
         model=llm,
         # TOOLS_FOR_REACT 不含 ask_user —— 这条路径会真的执行工具，
         # 而提问必须由 graph_thinking 的 agent loop 拦截后停下等用户回答。
-        tools=TOOLS_FOR_REACT,
+        #
+        # 套一层闸门：这条路径没有人工审批界面，判官判 escalate 只能
+        # fail-closed 转成拒绝。TOOLS_FOR_REACT 本身不动 —— 别处还在用。
+        tools=wrap_tools_with_gate(TOOLS_FOR_REACT),
         prompt=dynamic_system_prompt,
         # No custom checkpointer — langgraph API handles persistence
         debug=False,
