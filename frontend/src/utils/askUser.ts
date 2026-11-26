@@ -89,9 +89,11 @@ export function deriveAskState(messages: Message[]): {
 /**
  * 通知该不该现在投给 agent。
  *
- * 三种情况一律不投：
+ * 四种情况一律不投：
  * - 没有未投递的通知（都已投过，别重复）
  * - 有待答提问 —— 通知文本会被后端当成「对上一问的回答」吞掉
+ * - 有待批的鉴权操作 —— 通知文本会被后端当成「直接敲字」，最早的待批
+ *   项会被判成拒绝（后端不解析自由文本，猜用户的意思比拒绝更危险）
  * - 本轮还在跑 —— sendQuery 会 abort 掉正在跑的流，通知会把这一轮打断
  *
  * 抽成纯函数是为了能单测：这段逻辑原本内联在 ChatWindow 的 useEffect 里，
@@ -102,6 +104,8 @@ export function shouldDeliverNotification(state: {
   undeliveredCount: number;
   /** 是否有待答提问 */
   hasPendingAsk: boolean;
+  /** 是否有待批的鉴权操作 */
+  hasPendingAuth?: boolean;
   /** 当前是否在流式中 */
   isStreaming: boolean;
   /** 当前流式消息 id（未开始时为 null） */
@@ -109,6 +113,7 @@ export function shouldDeliverNotification(state: {
 }): boolean {
   if (state.undeliveredCount <= 0) return false;
   if (state.hasPendingAsk) return false;
+  if (state.hasPendingAuth) return false;
   if (state.isStreaming || state.streamingMessageId) return false;
   return true;
 }
@@ -118,14 +123,20 @@ export function shouldDeliverNotification(state: {
  *
  * 消息里若有一个还没被回答的提问，就得留着 —— 删掉的话前端不再提示「在等
  * 回答」，而后端那边提问还挂着，用户下一句话会被静默当成回答。
+ *
+ * 同理，还没裁决的鉴权请求也得留着 —— 后端那一批还挂着。
  */
 export function shouldKeepOnStop(
   message: Message,
-  answers: Map<string, string>
+  answers: Map<string, string>,
+  authDecisions?: Map<string, string>
 ): boolean {
   for (const ev of message.events ?? []) {
     const ask = askFromEvent(ev);
     if (ask && !answers.has(ask.toolCallId)) return true;
+    if (ev.type === "auth_request" && ev.tool_call_id) {
+      if (!authDecisions?.has(ev.tool_call_id)) return true;
+    }
   }
   return false;
 }

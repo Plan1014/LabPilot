@@ -492,7 +492,10 @@ def create_session_router():
             compiled_memory=compiled_memory,
             retrieved=rag_retrieved,
             new_messages=new_messages,
-            extra_events=[answer_event] if answer_event else None,
+            extra_events=(
+                ([answer_event] if answer_event else [])
+                + _tool_row_events(recovery_rows)
+            ),
             query_label=req.query,
         )
 
@@ -643,6 +646,9 @@ def _resolve_batch_tool_rows(batch: dict) -> list[dict]:
 
     一个 tool_use 缺了配对的 tool_result，上游 API 会直接报 400 —— 这里
     必须一条不落，包括被拒绝的那几条。
+
+    行里额外带一个 `auth_choice` —— 前端靠它把待批卡片标成「已允许/已拒绝」。
+    落库时这个键会被忽略（append_to_session 只取 role/content/name/tool_call_id）。
     """
     from src.agent.authz import pending as authz_pending
     from src.agent.graph_thinking import run_single_tool
@@ -653,14 +659,16 @@ def _resolve_batch_tool_rows(batch: dict) -> list[dict]:
         tool_name = call.get("tool_name") or ""
         tool_input = call.get("tool_input") or {}
         verdict = call.get("verdict")
+        choice = "allow_once"
         if verdict == "allow":
             content = run_single_tool(tool_name, tool_input)
         elif verdict == "deny":
+            choice = "deny"
             content = f"授权拒绝：{call.get('reason') or '该操作被拒绝'}"
         else:
             # escalate —— 看用户的裁决
             row = authz_pending.get_pending_by_tool_call_id(tool_call_id)
-            choice = (row or {}).get("status")
+            choice = (row or {}).get("status") or "deny"
             if choice == "deny":
                 content = "授权拒绝：用户拒绝了该操作"
             else:
@@ -671,9 +679,25 @@ def _resolve_batch_tool_rows(batch: dict) -> list[dict]:
                 "content": content,
                 "name": tool_name,
                 "tool_call_id": tool_call_id,
+                "auth_choice": choice,
             }
         )
     return rows
+
+
+def _tool_row_events(rows: list[dict]) -> list[dict]:
+    """把补齐的 tool_result 行变成 SSE 事件 —— 前端据此关掉待批卡片。"""
+    return [
+        {
+            "type": "tool_result",
+            "result": r.get("content", ""),
+            "name": r.get("name", ""),
+            "tool_call_id": r.get("tool_call_id", ""),
+            "auth_choice": r.get("auth_choice", "allow_once"),
+            "step": 0,
+        }
+        for r in rows
+    ]
 
 
 def _deny_earliest_pending_if_typed(session_id: str, query: str) -> list[dict]:
@@ -770,6 +794,7 @@ def create_auth_router():
             history=history,
             turn_rows=tool_rows,
             new_messages=list(tool_rows),
+            extra_events=_tool_row_events(tool_rows),
             query_label="",
         )
 

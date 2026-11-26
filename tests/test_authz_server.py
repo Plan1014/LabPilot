@@ -279,6 +279,21 @@ def test_respond_resumes_the_graph_with_the_tool_result(client, db, fake_graph, 
     assert "你好，世界" in tool_msgs[0].content
 
 
+def test_respond_emits_tool_result_event_with_the_decision(client, db, fake_graph):
+    """前端靠这条事件把待批卡片标成已裁决 —— 必须带 tool_call_id 和选择。"""
+    _make_batch("s1")
+    r = client.post(
+        "/auth/respond",
+        json={"session_id": "s1", "tool_call_id": "c1", "choice": "deny"},
+    )
+    assert r.status_code == 200
+    events = _sse_events(r.text)
+    results = [e for e in events if e.get("type") == "tool_result"]
+    assert len(results) == 1
+    assert results[0]["tool_call_id"] == "c1"
+    assert results[0]["auth_choice"] == "deny"
+
+
 # ==================== /debug/authz ====================
 
 def test_debug_authz_endpoint_returns_recent_verdicts(client, db, monkeypatch):

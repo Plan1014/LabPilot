@@ -4,6 +4,7 @@ export type SSEEventType =
   | "tool_result"
   | "text"
   | "ask_user"
+  | "auth_request"
   | "done";
 
 export interface SSEEvent {
@@ -17,6 +18,12 @@ export interface SSEEvent {
   // `ask_user` 事件的问题正文与候选选项。
   question?: string;
   options?: AskOption[];
+  // `auth_request` 事件 —— 判官拿不准，把操作交给用户裁决。
+  reason?: string;
+  pattern?: string | null;
+  batch_id?: string;
+  // 裁决结果（补齐 tool_result 时带上）—— 前端据此显示「已允许/已拒绝」。
+  auth_choice?: AuthChoice;
   // Populated only on reload from history — not emitted by the live SSE
   // stream. Carries the upstream tool_use id so tool_result can be paired
   // back to the correct tool_call when multiple calls happen in one step.
@@ -36,6 +43,24 @@ export interface AskAsk {
   toolCallId: string;
   question: string;
   options: AskOption[];
+}
+
+// ==================== 鉴权类型 ====================
+
+/** 用户对一个工具调用的裁决 —— 固定三项，顺序不变。 */
+export type AuthChoice = "allow_once" | "allow_always" | "deny";
+
+export interface AuthRequest {
+  /** 上游 tool_use id —— 裁决按它配对 */
+  toolCallId: string;
+  /** 给用户看的问题（判官问的，或理由本身） */
+  question: string;
+  /** 判官给的理由 */
+  reason: string;
+  /** 「允许并记住」的模式；推不出来时为 null（按钮置灰） */
+  pattern: string | null;
+  /** 批次 id —— 一轮里的调用是一个原子批次 */
+  batchId: string;
 }
 
 export interface SessionMeta {
