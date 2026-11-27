@@ -19,17 +19,26 @@ import threading
 import uuid
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Annotated, Literal, Optional, Sequence, Callable
+from pathlib import Path
+from typing import Annotated, Callable, Literal, Optional, Sequence
 
-from langchain_core.messages import AnyMessage, HumanMessage, AIMessage, ToolMessage
-from langgraph.graph import StateGraph, END, add_messages
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, ToolMessage
+from langgraph.graph import END, StateGraph, add_messages
 
+from src.agent import tools as tools_mod
+from src.agent.ask_user import detect_ask, format_ask_cli, sanitize_ask_message
+from src.agent.authz import REPL_SESSION_ID, Verdict, authorize, normalize_mode, protect
+from src.agent.authz import ledger as authz_ledger
+from src.agent.authz import pending as authz_pending
 from src.agent.llm import llm
+from src.agent.memory import PendingCache, process_pending_self
+from src.agent.memory.constants import PENDING_THRESHOLD
 from src.agent.prompt_context import strip_labels
 from src.agent.tools import TOOLS, is_failure_result
-from src.agent.ask_user import detect_ask, sanitize_ask_message, format_ask_cli
-from src.agent.memory import process_pending_self, PendingCache
-from src.agent.memory.constants import PENDING_THRESHOLD
+
+# 连续多少轮「工具调用全部被拒」就收工（评审 I6）。
+# 一次全拒不算数 —— 模型可能换条路（改写 tmp/ 下的文件）就通了。
+MAX_DENY_STREAK = 3
 
 
 def _ensure_unique_tool_use_ids(messages: list) -> None:
@@ -150,7 +159,11 @@ class InterleavedState:
     pending_tool_calls: list = field(default_factory=list)  # 临时存储待执行的工具调用
     step_count: int = 0
     session_id: Optional[str] = None  # None = REPL (不写 pending);WebSocket 注入 uuid
+    interactive: bool = False  # True = 终端交互（REPL）→ escalate 在终端里问
     pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
+    pending_auth: Optional[dict] = None  # 本轮挂起的鉴权批次；非 None 表示在等用户裁决
+    deny_streak: int = 0  # 连续「全部被拒」的轮数（评审 I6）
+    authz_mode: str = "auto"  # 审批模式：auto=判官裁决，manual=用户逐条裁决
 
 
 # ==================== Content Block Parsing ====================
@@ -533,17 +546,80 @@ def generate(state: InterleavedState) -> dict:
     }
 
 
-def execute_tools(state: InterleavedState) -> dict:
-    """Execute pending tool calls and return results."""
-    tool_messages = []
+def _snapshot_protected() -> Path | None:
+    """给 bash 执行拍一张受保护区的快照。拍不了就返回 None（不挡工具执行）。"""
+    try:
+        return protect.snapshot(tools_mod.WORKDIR)
+    except OSError:
+        return None
 
-    # Build a name->tool map
+
+def _apply_protection(snapshot_dir, result_str: str) -> str:
+    """比对快照与现状，把越界的改动还原掉，并把这次调用判为失败。
+
+    还原报告拼在原始输出前面 —— 主 agent 要先看到「保护区被动过」，
+    再看到命令本身说了什么。
+    """
+    try:
+        report = protect.diff_and_restore(snapshot_dir, tools_mod.WORKDIR)
+    except OSError:
+        return result_str
+    if not report["restored"]:
+        return result_str
+    return (
+        "Error: 隔离兜底触发：命令改动了受保护区域，已还原。\n"
+        f"{protect.format_report(report)}\n\n"
+        f"命令原始输出：\n{result_str}"
+    )
+
+
+def run_single_tool(tool_name: str, tool_input: dict) -> str:
+    """执行一个工具，返回结果字符串。找不到工具 → "Error: Unknown tool 'x'"。
+
+    工具执行只有这一处实现 —— 图里的 `execute_tools` 和提权恢复都用它，
+    两边跑出来的结果必须一模一样。
+    """
     tool_map = {}
     for t in TOOLS:
         if hasattr(t, "name"):
             tool_map[t.name] = t
         elif hasattr(t, "__name__"):
             tool_map[t.__name__] = t
+
+    tool = tool_map.get(tool_name)
+    if tool is None:
+        result = f"Error: Unknown tool '{tool_name}'"
+        result_str = str(result)
+    else:
+        # bash 前后拍快照 —— 隔离兜底（spec §5.6）。
+        # background=True 的 bash 不走这条路（Popen 立刻返回，还原跑完后台
+        # 进程还没动文件），那一类由 L2 判官强制挡。
+        snapshot_dir = None
+        if tool_name == "bash" and not (tool_input or {}).get("background"):
+            snapshot_dir = _snapshot_protected()
+        try:
+            try:
+                result = tool.invoke(tool_input or {})
+            except Exception as e:  # noqa: BLE001 —— 工具崩了不能掀翻整轮，兜成一条错误结果
+                result = f"Error: {e}"
+            result_str = str(result)
+            if snapshot_dir is not None:
+                result_str = _apply_protection(snapshot_dir, result_str)
+        finally:
+            # 快照比对完就没用了 —— 不删的话每次 bash 都在 tmp/_protect/ 里
+            # 留一份受保护区的副本，跑几十次就是几百 MB。
+            if snapshot_dir is not None:
+                protect.cleanup(snapshot_dir)
+
+    # 轻量触发：当工具返回失败时，提示模型记录
+    if is_failure_result(result_str):
+        result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+    return result_str
+
+
+def execute_tools(state: InterleavedState) -> dict:
+    """Execute pending tool calls and return results."""
+    tool_messages = []
 
     for tool_use in state.pending_tool_calls:
         if isinstance(tool_use, dict):
@@ -572,20 +648,7 @@ def execute_tools(state: InterleavedState) -> dict:
 
         print_tool_call(tool_name, raw_input, state.step_count)
 
-        tool = tool_map.get(tool_name)
-        if tool is None:
-            result = f"Error: Unknown tool '{tool_name}'"
-            print(f"  Error: {result}", flush=True)
-        else:
-            try:
-                result = tool.invoke(raw_input)
-            except Exception as e:
-                result = f"Error: {e}"
-
-        # 轻量触发：当工具返回失败时，提示模型记录
-        result_str = str(result)
-        if is_failure_result(result_str):
-            result_str += "\n\n[System note] It seems there has been an error. Please immediately use the memory tool to record this mistake. Before responding to the user, you need to review this error and ensure it has been recorded."
+        result_str = run_single_tool(tool_name, raw_input)
 
         print_tool_result(result_str, state.step_count)
 
@@ -610,24 +673,276 @@ def _route(state: InterleavedState) -> Literal["execute_tools", "done"]:
         return "done"
 
 
+# ==================== Authorization Node ====================
+
+def _tool_call_fields(tool_use) -> tuple[str, str, dict]:
+    """从一条 tool_use 里取 (tool_call_id, tool_name, tool_input)。"""
+    if isinstance(tool_use, dict):
+        tool_id = tool_use.get("id") or ""
+        tool_name = tool_use.get("name") or ""
+        raw_input = tool_use.get("input") or {}
+        if not raw_input and tool_use.get("partial_json"):
+            import json
+            try:
+                raw_input = json.loads(tool_use["partial_json"])
+            except Exception:
+                raw_input = {}
+    else:
+        tool_id = getattr(tool_use, "id", "") or ""
+        tool_name = getattr(tool_use, "name", "") or ""
+        raw_input = getattr(tool_use, "input", {}) or {}
+    if not isinstance(raw_input, dict):
+        raw_input = {}
+    return tool_id, tool_name, raw_input
+
+
+def build_auth_request_event(
+    v: Verdict, tool_call_id: str, batch_id: str, step: int = 0
+) -> dict:
+    """构造 SSE 的 auth_request 事件。
+
+    `step` 取发起这轮工具调用的那一步 —— 恒为 0 会让前端把这一轮的卡片
+    全归到「第 0 步」，同一批里的两张卡看起来像同一张。
+    """
+    return {
+        "type": "auth_request",
+        "tool_call_id": tool_call_id,
+        "question": v.question or v.reason,
+        "reason": v.reason,
+        "pattern": v.pattern,
+        "batch_id": batch_id,
+        "step": step,
+    }
+
+
+def _prompt_cli_decision(v: Verdict) -> str:
+    """REPL 里问用户一个操作要不要执行。返回 allow_once / allow_always / deny。
+
+    非法输入按「拒绝」处理 —— 宁可少做一次，不可误做一次。
+    """
+    question = v.question or v.reason or "是否执行这个操作？"
+    lines = [
+        f"\n\033[93m[待批准] {question}\033[0m",
+        f"  理由：{v.reason}",
+        "  1. 允许一次",
+        "  2. 允许并记住",
+        "  3. 拒绝",
+        "  → 输入 1/2/3：",
+    ]
+    print("\n".join(lines), flush=True)
+    try:
+        raw = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        return "deny"
+    if raw == "1":
+        return "allow_once"
+    if raw == "2":
+        return "allow_always"
+    return "deny"
+
+
+def authorize_node(state: InterleavedState) -> dict:
+    """裁决整批 pending_tool_calls。
+
+    批次原子性：只要有一个调用 escalate，**整批挂起**，本轮不执行任何工具
+    —— 一个 tool_use 缺了配对的 tool_result，上游 API 会直接报 400。
+    """
+    calls = list(state.pending_tool_calls or [])
+    if not calls:
+        return {"pending_tool_calls": [], "pending_auth": None}
+
+    session_id = getattr(state, "session_id", None)
+    interactive = bool(getattr(state, "interactive", False))
+    # 闸门的会话身份：浏览器会话用 session_id，REPL 用自己的号。
+    # 没有身份的话授权落进「没有会话」的公共桶 —— 那是 server 模式在用的，
+    # 等于把一个入口的批准带给了另一个入口（评审 M5）。
+    gate_session_id = session_id or (REPL_SESSION_ID if interactive else None)
+    # 审批模式：auto = 判官裁决；manual = 用户逐条裁决（前端按钮切过来的）。
+    authz_mode = normalize_mode(getattr(state, "authz_mode", "auto"))
+    verdicts: list[dict] = []
+    for call in calls:
+        tool_id, tool_name, tool_input = _tool_call_fields(call)
+        v = authorize(
+            tool_name, tool_input, session_id=gate_session_id, mode=authz_mode
+        )
+        verdicts.append(
+            {
+                "tool_call_id": tool_id,
+                "tool_name": tool_name,
+                "tool_input": tool_input,
+                "verdict": v,
+            }
+        )
+
+    escalations = [x for x in verdicts if x["verdict"].decision == "escalate"]
+
+    # ---- 终端交互（REPL）：直接在终端里问，批内当场解决 ----
+    # 「是不是终端」由调用方显式声明（interactive=True），不靠 session_id 猜 ——
+    # 猜错一次就变成去问服务端终端（评审 C3）。
+    if escalations and interactive:
+        for item in escalations:
+            choice = _prompt_cli_decision(item["verdict"])
+            if choice == "deny":
+                item["verdict"] = Verdict(
+                    "deny", item["verdict"].layer, "用户拒绝了这个操作"
+                )
+                continue
+            if choice == "allow_always":
+                pattern = item["verdict"].pattern
+                if pattern:
+                    authz_ledger.record_grant(pattern, session_id=gate_session_id)
+            item["verdict"] = Verdict(
+                "allow", item["verdict"].layer, item["verdict"].reason
+            )
+        escalations = []
+
+    # ---- 既没有会话（弹不了卡）也不是终端（问不了人）→ 没人能裁决，关闭式拒绝 ----
+    if escalations and session_id is None:
+        for item in escalations:
+            item["verdict"] = Verdict(
+                "deny", item["verdict"].layer, "该执行路径不支持人工审批"
+            )
+        escalations = []
+
+    # ---- 有 escalate → 整批挂起 ----
+    if escalations:
+        batch_id = authz_pending.save_batch(
+            session_id,
+            [
+                {
+                    "tool_call_id": x["tool_call_id"],
+                    "tool_name": x["tool_name"],
+                    "tool_input": x["tool_input"],
+                    "verdict": x["verdict"].decision,
+                    "reason": x["verdict"].reason,
+                    "pattern": x["verdict"].pattern,
+                }
+                for x in verdicts
+            ],
+            [
+                {
+                    "tool_call_id": x["tool_call_id"],
+                    "tool_name": x["tool_name"],
+                    "tool_input": x["tool_input"],
+                    "question": x["verdict"].question or x["verdict"].reason,
+                    "reason": x["verdict"].reason,
+                    "pattern": x["verdict"].pattern,
+                }
+                for x in escalations
+            ],
+        )
+        emitter = _event_emitter.get()
+        for item in escalations:
+            event = build_auth_request_event(
+                item["verdict"],
+                item["tool_call_id"],
+                batch_id,
+                step=getattr(state, "step_count", 0),
+            )
+            if emitter:
+                emitter(event)
+            print(
+                f"\n\033[93m[待批准] {event['question']}\033[0m",
+                flush=True,
+            )
+        return {
+            "messages": [],
+            "pending_tool_calls": [],
+            "pending_auth": {
+                "batch_id": batch_id,
+                "session_id": session_id,
+                "pending": [
+                    {
+                        "tool_call_id": x["tool_call_id"],
+                        "tool_name": x["tool_name"],
+                        "question": x["verdict"].question or x["verdict"].reason,
+                        "reason": x["verdict"].reason,
+                        "pattern": x["verdict"].pattern,
+                    }
+                    for x in escalations
+                ],
+            },
+        }
+
+    # ---- 没有 escalate → allow 的留下执行，deny 的当场产拒绝说明 ----
+    messages: list = []
+    allowed: list = []
+    for item, call in zip(verdicts, calls):
+        v = item["verdict"]
+        if v.decision == "deny":
+            messages.append(
+                ToolMessage(
+                    content=f"授权拒绝：{v.reason}",
+                    name=item["tool_name"],
+                    tool_call_id=item["tool_call_id"],
+                )
+            )
+        else:
+            allowed.append(call)
+
+    # 连续全拒的轮数（评审 I6）：模型看到拒绝多半会再发一次同样的调用，
+    # 再被拒、再回 generate —— 唯一的刹车是递归上限，用户看到的是
+    # GraphRecursionError（像是系统坏了）。这里自己数着，到顶就收工。
+    denied_count = sum(1 for x in verdicts if x["verdict"].decision == "deny")
+    all_denied = bool(calls) and denied_count == len(calls)
+    deny_streak = (getattr(state, "deny_streak", 0) + 1) if all_denied else 0
+    if deny_streak >= MAX_DENY_STREAK and messages:
+        messages[-1].content += (
+            f"\n[System note] 连续 {deny_streak} 轮工具调用全部被授权拒绝，"
+            "本轮到此为止。请直接告诉用户这个操作被拒绝了，不要重试。"
+        )
+
+    return {
+        "messages": messages,
+        "pending_tool_calls": allowed,
+        "pending_auth": None,
+        "deny_streak": deny_streak,
+    }
+
+
+def _route_after_authorize(state: InterleavedState) -> Literal["execute_tools", "generate", "done"]:
+    """authorize 之后的路由。
+
+    - 有挂起的鉴权批次 → 本轮结束（等用户裁决）。
+    - 还有放行的调用 → 去执行。
+    - 连续全拒到顶 → 本轮结束（模型在原地重试，评审 I6）。
+    - 其余（全被拒但还没到顶）→ 回 generate，让模型看到拒绝说明并给用户一个交代。
+    """
+    if getattr(state, "pending_auth", None):
+        return "done"
+    if state.pending_tool_calls:
+        return "execute_tools"
+    if getattr(state, "deny_streak", 0) >= MAX_DENY_STREAK:
+        return "done"
+    return "generate"
+
+
 # ==================== Graph Factory ====================
 
 def build_graph() -> StateGraph:
     """Build and return the thinking-aware LangGraph.
 
     Graph structure:
-      generate ──(pending_tool_calls?)──► execute_tools ──► generate
-                ──(else)──► END
+      generate ──(pending_tool_calls?)──► authorize ──► execute_tools ──► generate
+                ──(else)──► END                    └──(escalate)──► END
+
+    `authorize` 必须在 `execute_tools` 之前 —— 工具执行之前先过闸门。
     """
     builder = StateGraph(InterleavedState, input=InterleavedState, output=InterleavedState)
 
     # Add nodes
     builder.add_node("generate", generate)
+    builder.add_node("authorize", authorize_node)
     builder.add_node("execute_tools", execute_tools)
 
     # Edges
     builder.add_conditional_edges("generate", _route, {
+        "execute_tools": "authorize",
+        "done": END,
+    })
+    builder.add_conditional_edges("authorize", _route_after_authorize, {
         "execute_tools": "execute_tools",
+        "generate": "generate",
         "done": END,
     })
     builder.add_edge("execute_tools", "generate")

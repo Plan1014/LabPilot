@@ -6,17 +6,28 @@ All tools are @tool-decorated functions exposed to the LangGraph agent.
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, List
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
+from src.agent import paths
 from src.agent.config import WORKDIR, SKILLS_DIR
 from src.agent.memory.core import CoreMemoryManager
 
 
 # ==================== Dangerous Command Guard ====================
+# 这是**终局守卫**：命令在起进程之前就被拒，工具自己拒，不依赖上层。
+#
+# 闸门层（`src/agent/authz/`）**不复制**这份正则（spec D2）—— 复制两份
+# 意味着以后改一处漏一处，而两边不一致的时候没人知道该信谁。闸门层要问
+# 「这条命令危险吗」，直接调这里的函数。
+#
+# 同文件里的 `bash_blocked_write_target` 是另一回事：**写目标保护**
+# （spec D13）—— 命令要改受保护区（仓库自身）就拒。它不扫危险模式，
+# 只解析写目标落在哪。两者都是「工具自己拒」，与闸门层无关。
+#
 # All patterns are anchored at word boundaries so that legitimate names like
 # `mytaskkill.exe` or `shutdown_check.ps1` are NOT falsely blocked.
 # Matching is case-insensitive (re.IGNORECASE) — Windows built-ins are
@@ -70,6 +81,643 @@ def _dangerous_match(command: str) -> str:
     return m.group(0) if m else ""
 
 
+# ==================== bash 命令级判定 ====================
+# 这些判定住在 tools.py 而不是鉴权层（spec D13）：bash 是高自由度工具，命令语义
+# 的判断必须和工具执行待在一起 —— 工具自己在执行前就会拒，闸门被绕过也照样生效。
+#
+# 两条铁律：
+#   1. 只解析「写动词的目标参数」，绝不扫全文找路径 —— 否则 `echo "会改 src/x.py"`
+#      这种字面量会造成误伤。
+#   2. 只允许漏判，不允许错判。解析不出的形态（python -c 里拼的路径、含变量的
+#      路径、sh -c 套娃）一律判「没命中」放行，交给上层判官与快照兜底。
+
+# 只读命令表 —— 这些命令只看不改，agent 用 bash 读源码是合法退路，绝不能拦
+READ_ONLY_EXECUTABLES: frozenset[str] = frozenset({
+    "cat", "head", "tail", "less", "more", "wc", "ls", "dir", "stat", "file",
+    "du", "df", "grep", "rg", "find", "tree", "diff", "cmp", "md5sum",
+    "sha256sum", "echo", "type", "which", "pwd", "date",
+})
+
+# 重定向运算符：`>` `>>` `1>` `2>` `&>`
+_REDIRECT_OP_RE = re.compile(r"^(?:\d*>>?|&>)$")
+
+# 会改动文件的命令 → 目标参数取哪几个
+#   "all"  = 全部位置参数（rm / mv / mkdir / touch —— mv 的源也算，
+#            把仓库里的文件搬走同样是破坏；mkdir 的每个参数都是一个新目录）
+#   "last" = 最后一个位置参数（cp / patch —— 只有目标是写）
+#   "pathlike" = 位置参数里「像路径的那些」（chmod / chown / truncate ——
+#            模式、属主、大小也是位置参数，但不是路径）
+_WRITE_VERB_TARGETS: dict[str, str] = {
+    "tee": "all",
+    "mv": "all",
+    "rm": "all",
+    "rmdir": "all",
+    "del": "all",
+    "erase": "all",
+    "remove-item": "all",
+    "cp": "last",
+    "sed": "all",
+    "patch": "last",
+    "rsync": "last",
+    "scp": "last",
+    "install": "last",
+    "truncate": "pathlike",
+    "chmod": "pathlike",
+    "chown": "pathlike",
+    "mkdir": "all",
+    "touch": "all",
+}
+
+# 这些选项会吃掉下一个 token —— 那个 token 是选项的参数，不是文件目标。
+# `chmod --reference src/ref src/x` 里 src/ref 只被读，不该当成写目标。
+_CONSUMES_NEXT_ARG: dict[str, tuple[str, ...]] = {
+    "chmod": ("--reference",),
+    "chown": ("--reference", "--from"),
+    "truncate": ("--size", "--reference"),
+    "sed": ("-e", "--expression", "-f", "--file"),
+}
+
+
+def split_bash_segments(command: str) -> list[str]:
+    """把命令按 `&&` `||` `;` `|` 换行拆成子命令。
+
+    引号内的分隔符不拆。空段丢弃。
+    """
+    if not command:
+        return []
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "&" and i + 1 < n and command[i + 1] == "&":
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch == "|" and i + 1 < n and command[i + 1] == "|":
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in ("|", ";", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [s.strip() for s in segments if s.strip()]
+
+
+def _tokenize(segment: str) -> list[str]:
+    """把一段命令切成 token。
+
+    - 引号内的空格不分、引号本身去掉（`"a b"` → `a b` 一个 token）
+    - 重定向运算符单独成 token（`>` `>>` `1>` `2>` `&>`）
+    - 引号内的 `>` 不当运算符（`find . -name "x>y"` 不该被当成重定向）
+    """
+    tokens: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+
+    def flush() -> None:
+        if buf:
+            tokens.append("".join(buf))
+            buf.clear()
+
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch.isspace():
+            flush()
+            i += 1
+            continue
+        if ch == ">":
+            op = ">"
+            j = i + 1
+            if j < n and segment[j] == ">":
+                op = ">>"
+                j += 1
+            prefix = "".join(buf)
+            buf.clear()
+            if prefix and not (prefix.isdigit() or prefix == "&"):
+                # 形如 `hi>out.txt` —— 前半段是普通 token，不是 fd 号
+                tokens.append(prefix)
+                tokens.append(">")
+            else:
+                tokens.append(prefix + op)
+            i = j
+            continue
+        buf.append(ch)
+        i += 1
+    flush()
+    return tokens
+
+
+def _exe_name(token: str) -> str:
+    """取可执行名：剥目录、剥 .exe/.cmd/.bat/.ps1 后缀，转小写。
+
+    `C:\\Windows\\System32\\del.exe` → `del`
+    """
+    name = token.strip().strip("\"'")
+    for sep in ("\\", "/"):
+        if sep in name:
+            name = name.rsplit(sep, 1)[-1]
+    name = name.strip("\"'")
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        if name.lower().endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name.lower()
+
+
+def _is_redirect_op(token: str) -> bool:
+    return bool(_REDIRECT_OP_RE.match(token))
+
+
+# curl 里「会往磁盘写东西」的选项 —— 白名单不能放行带这些选项的 curl，
+# 而且能明确指出写目标的要把目标解析出来。
+#
+# curl 是 skills 里的高频工具，白名单会放行它。输出选项漏解析 =
+# `curl -o src/x.txt http://127.0.0.1:8001/` 一路放行改受保护区。
+CURL_WRITE_OPTIONS: tuple[str, ...] = (
+    "-o", "--output", "-O", "--output-dir", "-J", "--remote-header-name",
+    "-D", "--dump-header", "--trace", "--trace-ascii", "--stderr",
+)
+
+# 会把本地文件传出去的选项 —— 不写本地（不是写目标），但它读本地文件。
+CURL_UPLOAD_OPTIONS: tuple[str, ...] = ("-T", "--upload-file", "-F", "--form")
+
+# 明确给出写目标的 curl 选项 → 目标在下一个 token 还是 `=` 后面
+_CURL_TARGET_OPTIONS: dict[str, str] = {
+    "-o": "next", "--output": "next", "--output-dir": "next",
+    "-D": "next", "--dump-header": "next", "--trace": "next",
+    "--trace-ascii": "next", "--stderr": "next",
+}
+
+
+def curl_has_output_option(args: list[str]) -> bool:
+    """curl 的参数里有没有输出 / 上传类选项。
+
+    白名单的语义是「skills 里的只读探活请求」—— 带输出选项的 curl
+    已经不是同一类东西，不能算命中（闸门层用它，见 rules.match_skill_curl）。
+
+    选项名**大小写敏感**（`-T` 是上传、`-t` 是 telnet），所以按原样比。
+    """
+    for a in args:
+        for opt in CURL_WRITE_OPTIONS + CURL_UPLOAD_OPTIONS:
+            if a == opt or (opt.startswith("--") and a.startswith(opt + "=")):
+                return True
+    return False
+
+
+def _short_flags(args: list[str]) -> set[str]:
+    """短选项里的字母集合（`-czf` → {c, z, f}）。"""
+    flags: set[str] = set()
+    for a in args:
+        if a.startswith("--") or not a.startswith("-"):
+            continue
+        for ch in a[1:]:
+            flags.add(ch)
+    return flags
+
+
+def _is_f_option(token: str) -> bool:
+    """这个 token 是不是 tar 的 `-f`（含 `-cf` / `-czf` 这种短选项簇）。"""
+    if token in ("-f", "--file"):
+        return True
+    return token.startswith("-") and not token.startswith("--") and "f" in token[1:]
+
+
+def _positional(args: list[str]) -> list[str]:
+    """位置参数（去掉 `-` 开头的选项）。"""
+    return [a for a in args if not a.startswith("-")]
+
+
+def _looks_like_path(arg: str) -> bool:
+    """这个位置参数像不像一个路径。
+
+    chmod/chown/truncate 的位置参数里混着模式（`+x` / `755`）、属主（`me`）、
+    大小（`100`）—— 它们不是路径。当成目标的话，L1 会说「试图修改只读区域 +x」
+    并硬拒：`chmod +x tmp/run.sh` 是 agent 在沙箱里最常见的操作之一，
+    卡在确定性拒绝层，判官和用户都放行不了。
+
+    判据：含路径分隔符、有文件后缀、或确实存在。字面量三条都不满足。
+    判不出来就当不是目标 —— 漏判比错判安全。
+    """
+    if not arg:
+        return False
+    if "/" in arg or "\\" in arg:
+        return True
+    try:
+        if Path(arg).suffix:
+            return True
+    except (OSError, ValueError):
+        return False
+    try:
+        return (WORKDIR / arg).exists()
+    except OSError:
+        return False
+
+
+def bash_write_targets(segment: str) -> list[str]:
+    """返回该子命令的写目标（原始字符串）。
+
+    只解析写动词的目标参数，不扫全文找路径。识别不出目标时返回空列表 ——
+    漏判比错判安全。
+    """
+    if not segment:
+        return []
+    tokens = _tokenize(segment)
+    if not tokens:
+        return []
+
+    targets: list[str] = []
+    args: list[str] = []
+    i = 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if _is_redirect_op(tok):
+            nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+            if nxt and not nxt.startswith("&"):
+                # `2>&1` 里的 `&1` 是 fd 复制，不是文件目标
+                targets.append(nxt)
+                i += 2
+                continue
+            i += 1
+            continue
+        args.append(tok)
+        i += 1
+
+    exe = _exe_name(tokens[0])
+
+    # 选项吃掉下一个 token 时，那个 token 是选项的参数，不是文件目标
+    # （`chmod --reference src/ref src/x` 里 src/ref 只被读）。
+    consumes = _CONSUMES_NEXT_ARG.get(exe, ())
+    saw_script_opt = False
+    if consumes:
+        kept: list[str] = []
+        skip_next = False
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a in consumes:
+                skip_next = True
+                saw_script_opt = True
+                continue
+            kept.append(a)
+        args = kept
+
+    if exe == "dd":
+        # dd 的写目标藏在 `of=` 里，不是位置参数
+        for a in args:
+            if a.startswith("of="):
+                targets.append(a[3:])
+        return targets
+
+    if exe == "find":
+        # find 的写目标藏在 -fprint / -fprintf / -fls 里，不是位置参数。
+        # 这三个选项会把匹配结果写进文件 —— `find` 在只读命令表里，
+        # 但带着这些选项时它就是写命令。
+        for i, a in enumerate(args):
+            for opt in ("-fprint", "-fprintf", "-fls"):
+                if a == opt:
+                    if i + 1 < len(args):
+                        targets.append(args[i + 1])
+                elif a.startswith(opt + "="):
+                    targets.append(a[len(opt) + 1:])
+        return targets
+
+    if exe == "diff":
+        # diff 的写目标藏在 --output= 里
+        for i, a in enumerate(args):
+            if a == "--output":
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--output="):
+                targets.append(a[len("--output="):])
+        return targets
+
+    if exe == "curl":
+        # curl 的写目标藏在输出选项里：`-o FILE` 写响应体，
+        # `--output-dir DIR` 写目录。curl 是 skills 里的高频工具，
+        # 白名单会放行它 —— 输出选项必须在这里被认出来。
+        for i, a in enumerate(args):
+            how = _CURL_TARGET_OPTIONS.get(a)
+            if how == "next":
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--") and "=" in a:
+                name, _, value = a.partition("=")
+                if name in _CURL_TARGET_OPTIONS and value:
+                    targets.append(value)
+        return targets
+
+    if exe == "wget":
+        # wget 的写目标：`-O FILE` / `--output-document=FILE` / `-P DIR`
+        for i, a in enumerate(args):
+            if a in ("-O", "--output-document", "-P", "--directory-prefix"):
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif a.startswith("--") and "=" in a:
+                name, _, value = a.partition("=")
+                if name in ("--output-document", "--directory-prefix") and value:
+                    targets.append(value)
+        return targets
+
+    if exe == "tar":
+        # 建档（-c）时 `-f` 是要生成的归档文件；解档（-x）时 `-C` 是落地目录。
+        # 两者的角色相反 —— 建档时的 `-C src` 只是「从这里开始打包」，
+        # 不是写目标，当成写目标会硬拒 `tar -cf tmp/a.tar -C src .` 这种正常命令。
+        flags = _short_flags(args)
+        for i, a in enumerate(args):
+            if "x" in flags and a in ("-C", "--directory"):
+                if i + 1 < len(args):
+                    targets.append(args[i + 1])
+            elif "x" in flags and a.startswith("--directory="):
+                targets.append(a[len("--directory="):])
+            elif "c" in flags and _is_f_option(a):
+                # `-cf` / `-czf` 是短选项簇 —— 归档文件跟在簇后面那个 token
+                if i + 1 < len(args) and args[i + 1] != "-":
+                    targets.append(args[i + 1])
+        return targets
+
+    mode = _WRITE_VERB_TARGETS.get(exe)
+    if mode is None:
+        return targets
+
+    if exe == "sed" and not any(
+        a == "--in-place" or (a.startswith("-i") and not a.startswith("--"))
+        for a in args
+    ):
+        # sed 不带 -i 是读
+        return targets
+
+    positional = _positional(args)
+    if not positional:
+        return targets
+    if exe == "sed" and not saw_script_opt:
+        # 第一个位置参数是 sed 脚本（`s/a/b/`），不是文件 —— 没有 -e 时它
+        # 就在脚本位置。`sed -i s/a/b/` 改的是标准输入，不动文件；
+        # 把脚本当目标会把「s/a/b/」说成受保护区路径，硬拒一条正常命令。
+        positional = positional[1:]
+        if not positional:
+            return targets
+    if mode == "all":
+        targets.extend(positional)
+    elif mode == "last":
+        targets.append(positional[-1])
+    else:  # pathlike
+        targets.extend(p for p in positional if _looks_like_path(p))
+    return targets
+
+
+def bash_blocked_write_target(command: str) -> str | None:
+    """命令里有写目标落在只读区 → 返回理由串；否则 None。
+
+    理由串必须指出**是哪一段**、原文是什么、目标是谁 —— 不能是一句笼统的
+    「命令危险」。复合命令按段判定：bash 是一个子进程，跑一半停不下来。
+    """
+    for idx, segment in enumerate(split_bash_segments(command), start=1):
+        for target in bash_write_targets(segment):
+            if paths.classify_target(target) == "repo_readonly":
+                return (
+                    f"命令第 {idx} 段 `{segment.strip()}` "
+                    f"试图修改只读区域 {target}"
+                )
+    return None
+
+
+def _is_read_only_segment(segment: str) -> bool:
+    """这一段是否只读。"""
+    tokens = _tokenize(segment)
+    if not tokens:
+        return False
+    exe = _exe_name(tokens[0])
+    for tok in tokens[1:]:
+        if _is_redirect_op(tok):
+            return False
+    if exe == "git":
+        return _is_read_only_git(tokens[1:])
+    if exe not in READ_ONLY_EXECUTABLES:
+        return False
+    if exe == "find":
+        for a in tokens[1:]:
+            if a.startswith(("-delete", "-exec", "-ok", "-fprint", "-fprintf", "-fls")):
+                return False
+    if exe == "diff":
+        for a in tokens[1:]:
+            if a.startswith("--output"):
+                return False
+    return True
+
+
+def _is_read_only_git(args: list[str]) -> bool:
+    """git 子命令是不是只读的。
+
+    只读子命令不该被拦，也不该花判官调用（spec D7a：agent 用 bash 读源码
+    是合法退路，`git status` / `git log` 同理）。
+    """
+    if not args:
+        return False
+    # 跳过全局选项（`git --no-pager status`）
+    rest: list[str] = []
+    for a in args:
+        if not rest and a.startswith("-"):
+            continue
+        rest.append(a)
+    if not rest or rest[0].lower() not in _GIT_READ_ONLY_SUBCOMMANDS:
+        return False
+    for a in rest[1:]:
+        low = a.lower()
+        # `git diff --output=FILE` 会把结果写进文件
+        if low.startswith("--output") or low == "-o":
+            return False
+    return True
+
+
+# ==================== git 破坏性命令 ====================
+# git 不改"文件路径"，它直接改工作区和历史 —— 效果比改文件更狠：
+# 用户没提交的改动一旦没了，快照兜底也救不回来（.git 不在受保护集合里，
+# 而 `git reset --hard` 抹掉的历史快照根本存不下来）。
+#
+# 判的是**子命令**，不是正则扫全文 —— git 的子命令是有限的几个词，
+# 逐个查表比正则稳，也不会误伤 `echo "git reset --hard"` 这种字符串。
+
+# 无论带什么参数都要拒的 git 子命令
+_GIT_ALWAYS_DENY: dict[str, str] = {
+    "push": "会把改动推到远端 —— 本项目禁止推送",
+    "filter-branch": "会重写提交历史",
+}
+
+# git 只读子命令 —— 这些只看不改
+_GIT_READ_ONLY_SUBCOMMANDS: frozenset[str] = frozenset({
+    "status", "diff", "log", "show", "blame", "describe", "rev-parse",
+    "ls-files", "ls-tree", "shortlog", "cat-file", "whatchanged", "name-rev",
+})
+
+
+def _git_arg_is_repo_path(arg: str) -> bool:
+    """这个 git 参数是仓库里的路径，还是分支名？
+
+    分支名可以带斜杠（`feat/x`），所以不能只看有没有 `/`：
+
+    - `.` `..` → 路径
+    - 带文件后缀 → 路径
+    - 首段是仓库里真实存在的目录 → 路径（`src/agent/xxx`）
+    - 其余（`feat/x`、纯分支名）→ 分支名
+    """
+    if arg in (".", ".."):
+        return True
+    parts = PurePosixPath(arg.replace("\\", "/")).parts
+    if not parts:
+        return False
+    if PurePosixPath(arg.replace("\\", "/")).suffix:
+        return True
+    if len(parts) < 2:
+        return False
+    try:
+        return (WORKDIR / parts[0]).is_dir()
+    except OSError:
+        return False
+
+
+def _git_subcommand_reason(args: list[str]) -> str | None:
+    """git 子命令会不会毁掉工作区或历史 → 理由串；不会 → None。"""
+    if not args:
+        return None
+    sub = args[0].lower()
+    rest = args[1:]
+    low = [a.lower() for a in rest]
+
+    if sub in _GIT_ALWAYS_DENY:
+        return _GIT_ALWAYS_DENY[sub]
+
+    if sub == "reset":
+        if "--hard" in low:
+            return "会丢弃工作区里未提交的改动（`git reset --hard`）"
+        return None
+
+    if sub == "clean":
+        if any(a in ("-n", "--dry-run") for a in low):
+            return None
+        return "会删除未跟踪的文件（`git clean`）"
+
+    if sub == "restore":
+        # `git restore --staged` 只动暂存区，不丢工作区里的内容
+        # （`--staged --worktree` 两个一起才是恢复工作区）
+        if "--staged" in low and "--worktree" not in low:
+            return None
+        return "会丢弃工作区里未提交的改动（`git restore`）"
+
+    if sub == "checkout":
+        if "--orphan" in low:
+            return "会清空工作区（`git checkout --orphan`）"
+        if "--" in rest:
+            return "会丢弃工作区里未提交的改动（`git checkout -- <路径>`）"
+        for a in rest:
+            if a.startswith("-"):
+                continue
+            if _git_arg_is_repo_path(a):
+                return f"会丢弃 {a} 上未提交的改动（`git checkout`）"
+        return None
+
+    if sub == "switch":
+        if "--discard-changes" in low:
+            return "会丢弃工作区里未提交的改动（`git switch --discard-changes`）"
+        if any(a in ("-C", "--force-create") for a in rest):
+            return "会强制重建分支，丢掉该分支上的提交（`git switch -C`）"
+        return None
+
+    if sub == "branch":
+        if any(a in ("-D", "--delete-force") for a in rest):
+            return "会删掉分支上的提交（`git branch -D`）"
+        return None
+
+    if sub == "stash":
+        if low and low[0] in ("drop", "clear"):
+            return f"会丢掉暂存起来的改动（`git stash {low[0]}`）"
+        return None
+
+    if sub == "reflog":
+        if low and low[0] == "expire":
+            return "会清掉历史里可回溯的引用（`git reflog expire`）"
+        return None
+
+    if sub == "gc":
+        if any(a.startswith("--prune=now") for a in low):
+            return "会永久删除不可达对象（`git gc --prune=now`）"
+        return None
+
+    if sub == "remote":
+        if low and low[0] in ("remove", "set-url"):
+            return f"会改掉远端指向（`git remote {low[0]}`）"
+        return None
+
+    if sub == "worktree":
+        if low and low[0] == "remove":
+            return "会删掉工作树（`git worktree remove`）"
+        return None
+
+    return None
+
+
+def git_blocked_reason(command: str) -> str | None:
+    """命令里有会毁掉工作区/历史的 git 子命令 → 返回理由串；否则 None。
+
+    按段判定，理由里说明是哪一段 —— 和 `bash_blocked_write_target` 同一套话术。
+    """
+    for idx, segment in enumerate(split_bash_segments(command), start=1):
+        tokens = _tokenize(segment)
+        if not tokens:
+            continue
+        if _exe_name(tokens[0]) != "git":
+            continue
+        reason = _git_subcommand_reason(tokens[1:])
+        if reason:
+            return f"命令第 {idx} 段 `{segment.strip()}` {reason}"
+    return None
+
+
+def is_read_only_bash(command: str) -> bool:
+    """整条命令是否只读 —— 每一段都只读才算。
+
+    只读命令不该被拦，也不该花判官调用（spec D7a）。
+    """
+    segments = split_bash_segments(command)
+    if not segments:
+        return False
+    return all(_is_read_only_segment(s) for s in segments)
+
+
 # ==================== Error Type Conventions ====================
 
 ERROR_PREFIXES = [
@@ -104,6 +752,10 @@ def err(prefix: str, detail: str = "") -> str:
     return f"{prefix}: {detail}" if detail else prefix
 
 
+# bash 执行的超时上限（秒）。超时后会杀掉整棵进程树并返回 —— 不是永远挂着。
+BASH_TIMEOUT_S = 120
+
+
 # 全局管理器实例（延迟初始化）
 _core_memory_manager: CoreMemoryManager = None
 
@@ -117,9 +769,15 @@ def _get_core_manager() -> CoreMemoryManager:
 # ==================== Security ====================
 
 def safe_path(p: str) -> Path:
-    """Resolve path safely, preventing directory traversal attacks."""
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+    """Resolve path safely, preventing directory traversal attacks.
+
+    比较的基准要解开符号链接/junction（`WORKDIR.resolve()`）——
+    否则链接形态的 checkout 下 `is_relative_to` 恒 False，
+    读文件写文件全被当成「逃逸出工作区」。
+    """
+    base = WORKDIR.resolve()
+    path = (base / p).resolve()
+    if not path.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
@@ -143,6 +801,15 @@ def bash(command: str, background: bool = False) -> str:
         # 把命中的模式名带回去,让 Agent 能把规则记进 Core Memory
         matched = _dangerous_match(command)
         return err("Error", f"危险行为拒绝执行: {matched}")
+    # 写目标保护：命令要改只读区（仓库自身）就拒绝 —— 在起进程之前就拒，
+    # 命令根本没跑。理由里说清是哪一段、目标是谁。
+    blocked = bash_blocked_write_target(command)
+    if blocked:
+        return err("Error", f"危险行为拒绝执行: {blocked}")
+    # git 改写类命令：不动文件路径，但一样能把用户的改动弄没
+    git_blocked = git_blocked_reason(command)
+    if git_blocked:
+        return err("Error", f"危险行为拒绝执行: {git_blocked}")
     try:
         if background:
             # Windows: hide console window for background process
@@ -153,6 +820,8 @@ def bash(command: str, background: bool = False) -> str:
                 command,
                 shell=True,
                 cwd=WORKDIR,
+                # 后台服务不该占着父进程的 stdin
+                stdin=subprocess.DEVNULL,
                 startupinfo=startupinfo,
             )
             return f"[Background] Process started: {command[:80]}"
@@ -161,18 +830,84 @@ def bash(command: str, background: bool = False) -> str:
             if "curl" in command.lower() and "-s" not in command:
                 command = command.replace("curl.exe", "curl.exe -s")
                 command = command.replace("curl ", "curl -s ")
-            r = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=WORKDIR,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
+                # 命令吐二进制 / 非法字节时不能把工具打崩 —— 解码失败会
+                # 抛出去，进程就没人管了（变成孤儿进程）。
+                errors="replace",
+                # agent 没法回答 stdin 上的提问。继承来的终端会让交互式脚本
+                # （`input()`）永远等着 —— 工具线程就这么挂住了。
+                # 给 NUL：命令立刻拿到 EOF，自己退出。
+                stdin=subprocess.DEVNULL,
+                # POSIX 上把子进程放进自己的进程组，超时时能整组杀掉
+                start_new_session=(os.name != "nt"),
             )
-            out = (r.stdout or "").strip()
+            timed_out = False
+            try:
+                stdout, stderr = proc.communicate(timeout=BASH_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_process_tree(proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
+                    # 树杀不掉的话，至少把直接子进程杀掉 —— 不留孤儿
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+            out = (stdout or "").strip()
+            # 命令失败时把 stderr 带回去 —— 只回 stdout 的话，agent 只看到
+            # 半句提示，看不出是失败还是成功。
+            if proc.returncode not in (0, None):
+                detail = (stderr or "").strip()
+                if detail:
+                    out = f"{out}\n{detail}".strip() if out else detail
+            if timed_out:
+                return err(
+                    "Error",
+                    f"命令超时（{BASH_TIMEOUT_S}s），已终止：{command[:120]}"
+                    + (f"\n{out[:2000]}" if out else ""),
+                )
             return out[:50000] if out else "(no output)"
     except Exception as e:
         return err("Error", str(e))
+
+
+def _kill_process_tree(proc) -> None:
+    """杀掉整个进程树。
+
+    `shell=True` 时 cmd.exe 只是中间人 —— 真正跑命令的 python 是它的**孙进程**。
+    超时只杀直接子进程的话，孙进程还攥着 stdout 管道不放，
+    `communicate()` 就一直等 EOF —— 线程永久挂住，界面上看着像系统卡死了。
+
+    Windows 用 `taskkill /T`（按父子关系杀整棵树），POSIX 用进程组。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        import signal
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
 
 
 @tool

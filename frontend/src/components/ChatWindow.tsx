@@ -4,6 +4,7 @@ import InputArea from "./InputArea";
 import HistoryModal from "./HistoryModal";
 import MemoryModal from "./MemoryModal";
 import AskUserCard from "./AskUserCard";
+import AuthCard from "./AuthCard";
 import { useSSE } from "../hooks/useSSE";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { getStoredSessionId, persistSessionId, parseHistoryMessages } from "../hooks/useSession";
@@ -13,7 +14,23 @@ import {
   shouldKeepOnStop,
   inputPlaceholder,
 } from "../utils/askUser";
-import type { Message as MessageType, SessionMeta } from "../types/events";
+import {
+  authPlaceholder,
+  authRequestsFromPending,
+  deriveAuthState,
+} from "../utils/authCard";
+import {
+  otherMode,
+  readStoredMode,
+  writeStoredMode,
+} from "../utils/authzMode";
+import type {
+  AuthChoice,
+  AuthzMode,
+  Message as MessageType,
+  SessionMeta,
+  SSEEvent,
+} from "../types/events";
 import { CircleNotch, Clock, Brain } from "@phosphor-icons/react";
 
 const API_BASE = "http://127.0.0.1:8000";
@@ -39,14 +56,82 @@ export default function ChatWindow() {
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
+  // 审批模式 —— 整个对话有效，刷新页面也还在。
+  const [authzMode, setAuthzMode] = useState<AuthzMode>(() => readStoredMode());
+  const authzModeRef = useRef(authzMode);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { events, sendQuery, isConnected, error, abort } = useSSE();
+  const { events, sendQuery, sendAuthDecision, isConnected, error, abort } =
+    useSSE();
+
+  // 模式存起来（刷新后还在）+ 通知那条路要用最新值
+  useEffect(() => {
+    authzModeRef.current = authzMode;
+    writeStoredMode(authzMode);
+  }, [authzMode]);
+
+  const toggleAuthzMode = useCallback(() => {
+    setAuthzMode((prev) => otherMode(prev));
+  }, []);
 
   // WebSocket for notifications
   const { notifications, isConnected: wsConnected } = useWebSocket();
 
   // 提问状态：待答提问、已答对照
   const askState = useMemo(() => deriveAskState(messages), [messages]);
+
+  // 鉴权状态：待批调用、已裁决对照
+  const authState = useMemo(() => deriveAuthState(messages), [messages]);
+
+  /**
+   * 刷新后重建待批卡片。
+   *
+   * 会话历史里只有 tool_use、没有 tool_result —— 后端那边批次还挂着。
+   * 从 /auth/pending 把待批项捞回来，塞进最后一条 assistant 消息。
+   */
+  const withPendingAuth = useCallback(
+    async (
+      msgs: MessageType[],
+      sessionId: string
+    ): Promise<MessageType[]> => {
+      try {
+        const res = await fetch(
+          `${API_BASE}/auth/pending?session_id=${encodeURIComponent(sessionId)}`
+        );
+        if (!res.ok) return msgs;
+        const reqs = authRequestsFromPending(await res.json());
+        if (reqs.length === 0) return msgs;
+        const authEvents: SSEEvent[] = reqs.map((r) => ({
+          type: "auth_request",
+          tool_call_id: r.toolCallId,
+          question: r.question,
+          reason: r.reason,
+          pattern: r.pattern,
+          batch_id: r.batchId,
+          step: 0,
+        }));
+        const out = [...msgs];
+        for (let i = out.length - 1; i >= 0; i--) {
+          if (out[i].role === "assistant") {
+            out[i] = { ...out[i], events: [...out[i].events, ...authEvents] };
+            return out;
+          }
+        }
+        // 一条 assistant 消息都没有 —— 补一条装着卡片
+        out.push({
+          id: `assistant-auth-${Date.now()}`,
+          role: "assistant",
+          content: "",
+          events: authEvents,
+          isComplete: true,
+        });
+        return out;
+      } catch {
+        // 拿不到就当没有待批 —— 前端不该因为这个挂掉
+        return msgs;
+      }
+    },
+    []
+  );
 
   // Restore session on mount if there's a stored session_id but no messages yet
   useEffect(() => {
@@ -59,8 +144,9 @@ export default function ChatWindow() {
             if (!res.ok) throw new Error("not found");
             return res.json();
           })
-          .then((data) => {
-            setMessages(parseHistoryMessages(data.messages));
+          .then(async (data) => {
+            const restored = parseHistoryMessages(data.messages);
+            setMessages(await withPendingAuth(restored, storedId));
           })
           .catch(() => {
             // Session not found in Redis, clear storage
@@ -123,6 +209,7 @@ export default function ChatWindow() {
       !shouldDeliverNotification({
         undeliveredCount: undelivered.length,
         hasPendingAsk: askState.pendingAsk !== null,
+        hasPendingAuth: authState.pending !== null,
         isStreaming,
         streamingMessageId,
       })
@@ -170,8 +257,8 @@ export default function ChatWindow() {
       storedId,
       formatted,
     });
-    sendQuery(formatted, storedId);
-  }, [notifications, askState.pendingAsk, isStreaming, streamingMessageId]);
+    sendQuery(formatted, storedId, authzModeRef.current);
+  }, [notifications, askState.pendingAsk, authState.pending, isStreaming, streamingMessageId]);
 
   const formatNotification = (notif: { source?: string; type?: string; result?: Record<string, unknown>; timestamp?: string }): string => {    const ts_str = notif.timestamp ? `[${notif.timestamp}] ` : "";
     const source_str = notif.source ? `[${notif.source}] ` : "";
@@ -224,9 +311,9 @@ export default function ChatWindow() {
       setStreamingMessageId(assistantMessageId);
 
       const storedId = getStoredSessionId();
-      await sendQuery(query, storedId);
+      await sendQuery(query, storedId, authzMode);
     },
-    [abort, sendQuery]
+    [abort, sendQuery, authzMode]
   );
 
   // 点选项作答 —— 直接把选项文本提交；后端会把它当作对上一问的回答。
@@ -235,6 +322,29 @@ export default function ChatWindow() {
       void handleSubmit(label);
     },
     [handleSubmit]
+  );
+
+  // 裁决一个待批调用 —— 后端补齐 tool_result 后会重跑图，新开一条消息接着渲染。
+  const handleAuthDecide = useCallback(
+    async (toolCallId: string, choice: AuthChoice) => {
+      const sessionId = getStoredSessionId();
+      if (!sessionId) return;
+      const assistantMessageId = crypto.randomUUID();
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: assistantMessageId,
+          role: "assistant",
+          content: "",
+          events: [],
+          isComplete: false,
+        },
+      ]);
+      setIsStreaming(true);
+      setStreamingMessageId(assistantMessageId);
+      await sendAuthDecision(sessionId, toolCallId, choice, authzMode);
+    },
+    [sendAuthDecision, authzMode]
   );
 
   const listSessions = useCallback(async (): Promise<SessionMeta[]> => {
@@ -260,7 +370,7 @@ export default function ChatWindow() {
           .filter(
             (msg) =>
               msg.id !== streamingMessageId ||
-              shouldKeepOnStop(msg, askState.answers)
+              shouldKeepOnStop(msg, askState.answers, authState.decisions)
           )
           .map((msg) =>
             msg.id === streamingMessageId ? { ...msg, isComplete: true } : msg
@@ -285,10 +395,11 @@ export default function ChatWindow() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       persistSessionId(id);
-      setMessages(parseHistoryMessages(data.messages));
+      const restored = parseHistoryMessages(data.messages);
+      setMessages(await withPendingAuth(restored, id));
       setShowHistory(false);
     },
-    []
+    [withPendingAuth]
   );
 
   const deleteSession = useCallback(async (id: string) => {
@@ -370,7 +481,12 @@ export default function ChatWindow() {
           </div>
         )}
         {messages.map((msg) => (
-          <Message key={msg.id} {...msg} askAnswers={askState.answers} />
+          <Message
+            key={msg.id}
+            {...msg}
+            askAnswers={askState.answers}
+            authDecisions={authState.decisions}
+          />
         ))}
         <div ref={messagesEndRef} />
       </main>
@@ -384,12 +500,29 @@ export default function ChatWindow() {
         />
       )}
 
+      {/* 待批鉴权卡片 —— 位置跟提问卡片一致 */}
+      {authState.pending && (
+        <AuthCard
+          request={authState.pending}
+          onDecide={(choice) => {
+            void handleAuthDecide(authState.pending!.toolCallId, choice);
+          }}
+          disabled={isStreaming}
+        />
+      )}
+
       {/* Input */}
       <InputArea
         onSubmit={handleSubmit}
         isStreaming={isStreaming}
         onStop={handleStop}
-        placeholder={inputPlaceholder(askState.pendingAsk !== null)}
+        authzMode={authzMode}
+        onToggleAuthzMode={toggleAuthzMode}
+        placeholder={
+          authState.pending
+            ? authPlaceholder(true)
+            : inputPlaceholder(askState.pendingAsk !== null)
+        }
       />
 
       {/* History Modal */}

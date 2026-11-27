@@ -1,5 +1,7 @@
 import React, { useState } from "react";
 import { PaperPlaneTilt, StopCircle } from "@phosphor-icons/react";
+import type { AuthzMode } from "../types/events";
+import { modeDescription, modeLabel } from "../utils/authzMode";
 
 interface Props {
   onSubmit: (query: string) => void;
@@ -7,6 +9,10 @@ interface Props {
   onStop?: () => void;
   /** 输入框占位文案 */
   placeholder?: string;
+  /** 当前审批模式（auto / manual） */
+  authzMode: AuthzMode;
+  /** 点左下角的模式按钮 */
+  onToggleAuthzMode: () => void;
 }
 
 export default function InputArea({
@@ -14,8 +20,11 @@ export default function InputArea({
   isStreaming,
   onStop,
   placeholder = "Ask LabPilot...",
+  authzMode,
+  onToggleAuthzMode,
 }: Props) {
   const [input, setInput] = useState("");
+  const [showModeInfo, setShowModeInfo] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -32,6 +41,12 @@ export default function InputArea({
       onSubmit(input.trim());
       setInput("");
     }
+  };
+
+  // 切模式的同时展开那行说明 —— 用户得知道自己在哪个模式里。
+  const handleToggleMode = () => {
+    onToggleAuthzMode();
+    setShowModeInfo(true);
   };
 
   return (
@@ -63,6 +78,32 @@ export default function InputArea({
             <PaperPlaneTilt size={20} weight="regular" />
           )}
         </button>
+      </div>
+
+      {/* 左下角：审批模式切换 —— 按钮上写的就是当前模式 */}
+      <div className="mt-2 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={handleToggleMode}
+          title={modeDescription(authzMode)}
+          className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+            authzMode === "manual"
+              ? "border-[#d97757] bg-[#fef7f4] text-[#d97757]"
+              : "border-[#e5e5e5] bg-[#f5f5f5] text-[#666666]"
+          }`}
+        >
+          {modeLabel(authzMode)}
+        </button>
+        {showModeInfo && (
+          <button
+            type="button"
+            onClick={() => setShowModeInfo(false)}
+            title="点击收起"
+            className="text-[11px] text-[#999999] hover:text-[#666666] transition-colors"
+          >
+            {modeDescription(authzMode)}
+          </button>
+        )}
       </div>
     </form>
   );

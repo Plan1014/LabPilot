@@ -63,6 +63,8 @@ def _init_schema(conn: sqlite3.Connection):
             CREATE INDEX IF NOT EXISTS idx_messages_session
             ON messages(session_id, id)
         """)
+        # 鉴权台账不在这个库里 —— 它住在 agent 写不了的地方
+        # （`src/agent/authz/db.py`）。这个库在 data/ 里，agent 写得动。
 
 
 # ==================== Message Serialization ====================

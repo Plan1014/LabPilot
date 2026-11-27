@@ -205,6 +205,20 @@ test("shouldDeliverNotification 本轮还在跑时不投递通知", () => {
   );
 });
 
+test("shouldDeliverNotification 有待批鉴权时不投递通知", () => {
+  // 投递通知 = 直接敲字 → 后端会把最早的待批判成拒绝
+  assert.equal(
+    shouldDeliverNotification({
+      undeliveredCount: 1,
+      hasPendingAsk: false,
+      hasPendingAuth: true,
+      isStreaming: false,
+      streamingMessageId: null,
+    }),
+    false,
+  );
+});
+
 test("shouldDeliverNotification 没有未投递通知时不投递", () => {
   assert.equal(
     shouldDeliverNotification({
@@ -247,6 +261,28 @@ test("shouldKeepOnStop 保留还没被回答的提问", () => {
   };
   assert.equal(shouldKeepOnStop(message, new Map()), true);
   assert.equal(shouldKeepOnStop(message, new Map([["c1", "参数集 A"]])), false);
+});
+
+test("shouldKeepOnStop 保留还没裁决的鉴权请求", () => {
+  const message = {
+    id: "m1",
+    role: "assistant",
+    content: "",
+    isComplete: false,
+    events: [
+      {
+        type: "auth_request",
+        question: "要执行吗？",
+        tool_call_id: "c1",
+        step: 0,
+      },
+    ],
+  };
+  assert.equal(shouldKeepOnStop(message, new Map()), true);
+  assert.equal(
+    shouldKeepOnStop(message, new Map(), new Map([["c1", "allow_once"]])),
+    false,
+  );
 });
 
 test("shouldKeepOnStop 普通消息不保留", () => {

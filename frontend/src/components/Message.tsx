@@ -3,8 +3,10 @@ import ThinkingBlock from "./ThinkingBlock";
 import ToolResultBlock from "./ToolResultBlock";
 import TextBlock from "./TextBlock";
 import AskUserCard from "./AskUserCard";
-import type { SSEEvent } from "../types/events";
+import AuthCard from "./AuthCard";
+import type { AuthChoice, SSEEvent } from "../types/events";
 import { deriveAskState } from "../utils/askUser";
+import { deriveAuthState } from "../utils/authCard";
 
 interface Props {
   role: "user" | "assistant";
@@ -14,6 +16,8 @@ interface Props {
   isSystemPrompt?: boolean;
   /** tool_call_id -> 回答文本（来自整个会话流） */
   askAnswers?: Map<string, string>;
+  /** tool_call_id -> 用户的鉴权裁决（来自整个会话流） */
+  authDecisions?: Map<string, AuthChoice>;
 }
 
 // Sort order within a step: thinking=0, tool_call=1, tool_result=2, text=3
@@ -23,6 +27,7 @@ const TYPE_ORDER: Record<string, number> = {
   tool_result: 2,
   text: 3,
   ask_user: 4,
+  auth_request: 5,
 };
 
 export default function Message({
@@ -32,6 +37,7 @@ export default function Message({
   isComplete,
   isSystemPrompt,
   askAnswers,
+  authDecisions,
 }: Props) {
   const isUser = role === "user";
 
@@ -57,6 +63,24 @@ export default function Message({
     const fromAll = askAnswers?.get(toolCallId);
     if (fromAll !== undefined) return fromAll;
     return localAnswers.get(toolCallId);
+  };
+
+  // 本条消息里的待批调用；裁决从整会话的 authDecisions 里取
+  // （裁决可能落在后一条消息的 tool_result 事件里）。
+  const { requests: authRequests, decisions: localDecisions } =
+    deriveAuthState([
+      {
+        id: "self",
+        role: "assistant",
+        content: "",
+        events: sortedEvents,
+        isComplete: true,
+      },
+    ]);
+  const decisionOf = (toolCallId: string): AuthChoice | undefined => {
+    const fromAll = authDecisions?.get(toolCallId);
+    if (fromAll !== undefined) return fromAll;
+    return localDecisions.get(toolCallId);
   };
 
   // Group consecutive thinking events for ThinkingBlock
@@ -94,6 +118,26 @@ export default function Message({
           key={`ask-${i}`}
           ask={ask ?? { toolCallId: ev.tool_call_id ?? "", question: "", options: [] }}
           answer={answerOf(ev.tool_call_id ?? "")}
+          compact
+        />
+      );
+      i++;
+    } else if (ev.type === "auth_request") {
+      // 待批调用 —— 对话流里只显示紧凑摘要，可交互卡片在上方弹窗里
+      const req = authRequests.find((r) => r.toolCallId === ev.tool_call_id);
+      renderBlocks.push(
+        <AuthCard
+          key={`auth-${i}`}
+          request={
+            req ?? {
+              toolCallId: ev.tool_call_id ?? "",
+              question: ev.question ?? "",
+              reason: ev.reason ?? "",
+              pattern: ev.pattern ?? null,
+              batchId: ev.batch_id ?? "",
+            }
+          }
+          decision={decisionOf(ev.tool_call_id ?? "")}
           compact
         />
       );

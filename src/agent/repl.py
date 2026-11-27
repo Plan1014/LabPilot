@@ -254,7 +254,9 @@ def main() -> None:
         # 调用 graph
         try:
             result = graph.invoke(
-                {"messages": langchain_messages},
+                # interactive=True —— 终端交互，escalate 在这里当场问用户。
+                # 不靠「没有 session_id」来认 REPL（评审 C3）。
+                {"messages": langchain_messages, "interactive": True},
                 config={"recursion_limit": 100},
             )
 
