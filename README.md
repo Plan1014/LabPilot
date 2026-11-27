@@ -301,6 +301,7 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 | 介质 | 路径 | 存什么 |
 |------|------|--------|
 | SQLite | `data/memory/tasks.db` | 会话历史 + 任务状态（TTL 默认 30 天） |
+| SQLite | `.labpilot/authz.db` | 鉴权台账（用户批准过的操作范围）。**不在 `data/` 里** —— 那是 agent 可写区，台账放那儿 agent 就能自己给自己签通行证 |
 | ChromaDB | `data/memory/chroma_db/` | 事实记忆 + 对话摘要（向量检索） |
 | JSON | `data/sessions/*.json` | 会话归档 |
 | 文件 | `.transcripts/` | 压缩前的对话原文 |

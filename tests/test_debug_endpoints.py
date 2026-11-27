@@ -32,9 +32,12 @@ def stub_memory(monkeypatch):
 def isolated_session_store(tmp_path, monkeypatch):
     """会话库指向临时文件 —— 测试不该往用户的 tasks.db 里写。"""
     import src.agent.session_manager as session_manager
+    from src.agent import paths
 
     monkeypatch.setattr(session_manager, "SQLITE_DB_PATH", tmp_path / "tasks.db")
     monkeypatch.setattr(session_manager, "_sql_conn", None)
+    # 台账跟着工作区走 —— 指到临时目录，测试不该往用户的库里写
+    monkeypatch.setattr(paths, "WORKDIR", tmp_path)
     yield
 
 

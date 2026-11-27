@@ -13,8 +13,12 @@ from src.agent.authz import pending as authz_pending
 
 @pytest.fixture
 def db(tmp_path, monkeypatch):
+    from src.agent import paths
+
     monkeypatch.setattr(session_manager, "SQLITE_DB_PATH", tmp_path / "tasks.db")
     monkeypatch.setattr(session_manager, "_sql_conn", None)
+    # 台账跟着工作区走 —— 指到临时目录，测试不该往用户的库里写
+    monkeypatch.setattr(paths, "WORKDIR", tmp_path)
     yield
     monkeypatch.setattr(session_manager, "_sql_conn", None)
 

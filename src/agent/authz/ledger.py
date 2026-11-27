@@ -27,9 +27,10 @@ def reset_session_grants() -> None:
 
 
 def _conn():
-    from src.agent import session_manager
+    # 台账自己的库 —— 不跟会话历史共用一个文件（评审 I1）
+    from src.agent.authz import db
 
-    return session_manager._get_conn()
+    return db.get_conn()
 
 
 # ==================== 记录 ====================
