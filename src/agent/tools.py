@@ -752,6 +752,10 @@ def err(prefix: str, detail: str = "") -> str:
     return f"{prefix}: {detail}" if detail else prefix
 
 
+# bash 执行的超时上限（秒）。超时后会杀掉整棵进程树并返回 —— 不是永远挂着。
+BASH_TIMEOUT_S = 120
+
+
 # 全局管理器实例（延迟初始化）
 _core_memory_manager: CoreMemoryManager = None
 
@@ -810,6 +814,8 @@ def bash(command: str, background: bool = False) -> str:
                 command,
                 shell=True,
                 cwd=WORKDIR,
+                # 后台服务不该占着父进程的 stdin
+                stdin=subprocess.DEVNULL,
                 startupinfo=startupinfo,
             )
             return f"[Background] Process started: {command[:80]}"
@@ -818,18 +824,84 @@ def bash(command: str, background: bool = False) -> str:
             if "curl" in command.lower() and "-s" not in command:
                 command = command.replace("curl.exe", "curl.exe -s")
                 command = command.replace("curl ", "curl -s ")
-            r = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=WORKDIR,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=120,
+                # 命令吐二进制 / 非法字节时不能把工具打崩 —— 解码失败会
+                # 抛出去，进程就没人管了（变成孤儿进程）。
+                errors="replace",
+                # agent 没法回答 stdin 上的提问。继承来的终端会让交互式脚本
+                # （`input()`）永远等着 —— 工具线程就这么挂住了。
+                # 给 NUL：命令立刻拿到 EOF，自己退出。
+                stdin=subprocess.DEVNULL,
+                # POSIX 上把子进程放进自己的进程组，超时时能整组杀掉
+                start_new_session=(os.name != "nt"),
             )
-            out = (r.stdout or "").strip()
+            timed_out = False
+            try:
+                stdout, stderr = proc.communicate(timeout=BASH_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _kill_process_tree(proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
+                    # 树杀不掉的话，至少把直接子进程杀掉 —— 不留孤儿
+                    try:
+                        proc.kill()
+                    except OSError:
+                        pass
+            out = (stdout or "").strip()
+            # 命令失败时把 stderr 带回去 —— 只回 stdout 的话，agent 只看到
+            # 半句提示，看不出是失败还是成功。
+            if proc.returncode not in (0, None):
+                detail = (stderr or "").strip()
+                if detail:
+                    out = f"{out}\n{detail}".strip() if out else detail
+            if timed_out:
+                return err(
+                    "Error",
+                    f"命令超时（{BASH_TIMEOUT_S}s），已终止：{command[:120]}"
+                    + (f"\n{out[:2000]}" if out else ""),
+                )
             return out[:50000] if out else "(no output)"
     except Exception as e:
         return err("Error", str(e))
+
+
+def _kill_process_tree(proc) -> None:
+    """杀掉整个进程树。
+
+    `shell=True` 时 cmd.exe 只是中间人 —— 真正跑命令的 python 是它的**孙进程**。
+    超时只杀直接子进程的话，孙进程还攥着 stdout 管道不放，
+    `communicate()` 就一直等 EOF —— 线程永久挂住，界面上看着像系统卡死了。
+
+    Windows 用 `taskkill /T`（按父子关系杀整棵树），POSIX 用进程组。
+    """
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        return
+    if proc.poll() is not None:
+        return
+    try:
+        import signal
+
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
 
 
 @tool
