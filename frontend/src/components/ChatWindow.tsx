@@ -19,8 +19,14 @@ import {
   authRequestsFromPending,
   deriveAuthState,
 } from "../utils/authCard";
+import {
+  otherMode,
+  readStoredMode,
+  writeStoredMode,
+} from "../utils/authzMode";
 import type {
   AuthChoice,
+  AuthzMode,
   Message as MessageType,
   SessionMeta,
   SSEEvent,
@@ -50,9 +56,22 @@ export default function ChatWindow() {
   const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [showMemory, setShowMemory] = useState(false);
+  // 审批模式 —— 整个对话有效，刷新页面也还在。
+  const [authzMode, setAuthzMode] = useState<AuthzMode>(() => readStoredMode());
+  const authzModeRef = useRef(authzMode);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const { events, sendQuery, sendAuthDecision, isConnected, error, abort } =
     useSSE();
+
+  // 模式存起来（刷新后还在）+ 通知那条路要用最新值
+  useEffect(() => {
+    authzModeRef.current = authzMode;
+    writeStoredMode(authzMode);
+  }, [authzMode]);
+
+  const toggleAuthzMode = useCallback(() => {
+    setAuthzMode((prev) => otherMode(prev));
+  }, []);
 
   // WebSocket for notifications
   const { notifications, isConnected: wsConnected } = useWebSocket();
@@ -238,7 +257,7 @@ export default function ChatWindow() {
       storedId,
       formatted,
     });
-    sendQuery(formatted, storedId);
+    sendQuery(formatted, storedId, authzModeRef.current);
   }, [notifications, askState.pendingAsk, authState.pending, isStreaming, streamingMessageId]);
 
   const formatNotification = (notif: { source?: string; type?: string; result?: Record<string, unknown>; timestamp?: string }): string => {    const ts_str = notif.timestamp ? `[${notif.timestamp}] ` : "";
@@ -292,9 +311,9 @@ export default function ChatWindow() {
       setStreamingMessageId(assistantMessageId);
 
       const storedId = getStoredSessionId();
-      await sendQuery(query, storedId);
+      await sendQuery(query, storedId, authzMode);
     },
-    [abort, sendQuery]
+    [abort, sendQuery, authzMode]
   );
 
   // 点选项作答 —— 直接把选项文本提交；后端会把它当作对上一问的回答。
@@ -323,9 +342,9 @@ export default function ChatWindow() {
       ]);
       setIsStreaming(true);
       setStreamingMessageId(assistantMessageId);
-      await sendAuthDecision(sessionId, toolCallId, choice);
+      await sendAuthDecision(sessionId, toolCallId, choice, authzMode);
     },
-    [sendAuthDecision]
+    [sendAuthDecision, authzMode]
   );
 
   const listSessions = useCallback(async (): Promise<SessionMeta[]> => {
@@ -497,6 +516,8 @@ export default function ChatWindow() {
         onSubmit={handleSubmit}
         isStreaming={isStreaming}
         onStop={handleStop}
+        authzMode={authzMode}
+        onToggleAuthzMode={toggleAuthzMode}
         placeholder={
           authState.pending
             ? authPlaceholder(true)

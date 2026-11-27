@@ -1,16 +1,21 @@
 import { useState, useCallback, useRef } from "react";
-import type { AuthChoice, SSEEvent } from "../types/events";
+import type { AuthChoice, AuthzMode, SSEEvent } from "../types/events";
 import { persistSessionId } from "./useSession";
 
 interface UseSSEReturn {
   isConnected: boolean;
   error: string | null;
   events: SSEEvent[];
-  sendQuery: (query: string, sessionId?: string | null) => Promise<string | null>;
+  sendQuery: (
+    query: string,
+    sessionId?: string | null,
+    mode?: AuthzMode
+  ) => Promise<string | null>;
   sendAuthDecision: (
     sessionId: string,
     toolCallId: string,
-    choice: AuthChoice
+    choice: AuthChoice,
+    mode?: AuthzMode
   ) => Promise<string | null>;
   clearEvents: () => void;
   abort: () => void;
@@ -126,7 +131,11 @@ export function useSSE(
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const sendQuery = useCallback(
-    async (query: string, sessionId?: string | null): Promise<string | null> => {
+    async (
+      query: string,
+      sessionId?: string | null,
+      mode?: AuthzMode
+    ): Promise<string | null> => {
       // [LABPILOT-DEBUG] 入口：记录本次 sendQuery 的所有入参和是否有旧流
       console.log("[LABPILOT-DEBUG] sendQuery ENTRY", {
         query: query.slice(0, 100),
@@ -146,7 +155,10 @@ export function useSSE(
       setEvents([]);
 
       try {
-        const body: { query: string; session_id?: string } = { query };
+        const body: { query: string; session_id?: string; authz_mode: string } = {
+          query,
+          authz_mode: mode ?? "auto",
+        };
         if (sessionId) {
           body.session_id = sessionId;
         }
@@ -198,7 +210,8 @@ export function useSSE(
     async (
       sessionId: string,
       toolCallId: string,
-      choice: AuthChoice
+      choice: AuthChoice,
+      mode?: AuthzMode
     ): Promise<string | null> => {
       setError(null);
       setIsConnected(true);
@@ -212,6 +225,7 @@ export function useSSE(
             session_id: sessionId,
             tool_call_id: toolCallId,
             choice,
+            authz_mode: mode ?? "auto",
           }),
         });
 

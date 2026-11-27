@@ -62,12 +62,14 @@ class QueryRequest(BaseModel):
     """Payload for /query endpoint."""
     query: str
     session_id: Optional[str] = None  # 省略 → 新建会话
+    authz_mode: str = "auto"  # auto=判官裁决 / manual=用户逐条裁决
 
 
 class SessionQueryRequest(BaseModel):
     """Payload for /session/query endpoint."""
     query: str
     session_id: Optional[str] = None
+    authz_mode: str = "auto"  # auto=判官裁决 / manual=用户逐条裁决
 
 
 class AuthRespondRequest(BaseModel):
@@ -75,6 +77,7 @@ class AuthRespondRequest(BaseModel):
     session_id: str
     tool_call_id: str
     choice: str
+    authz_mode: str = "auto"  # 恢复后的新一轮沿用这个模式
 
 
 # ==================== NotificationQueue ====================
@@ -524,6 +527,7 @@ def create_session_router():
                 + _tool_row_events(recovery_rows)
             ),
             query_label=req.query,
+            authz_mode=req.authz_mode,
         )
 
     return router
@@ -539,6 +543,7 @@ async def _stream_agent_turn(
     new_messages: list[dict] | None = None,
     extra_events: list[dict] | None = None,
     query_label: str = "",
+    authz_mode: str = "auto",
 ) -> StreamingResponse:
     """跑一轮 agent，把 SSE 吐给前端。
 
@@ -596,7 +601,8 @@ async def _stream_agent_turn(
 
             # Stream events
             async for event in graph.astream_events(
-                {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0, "session_id": session_id},
+                {"messages": langchain_messages, "pending_tool_calls": [], "step_count": 0,
+                 "session_id": session_id, "authz_mode": authz_mode},
                 config={"recursion_limit": 100},
                 stream_mode="values",
             ):
@@ -820,6 +826,7 @@ def create_auth_router():
             new_messages=list(tool_rows),
             extra_events=_tool_row_events(tool_rows),
             query_label="",
+            authz_mode=req.authz_mode,
         )
 
     return router
@@ -991,6 +998,7 @@ def create_sse_router():
             compiled_memory=compiled_memory,
             retrieved=rag_retrieved,
             query_label=req.query,
+            authz_mode=req.authz_mode,
         )
 
     return router

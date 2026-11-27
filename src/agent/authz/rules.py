@@ -39,6 +39,19 @@ FIXED_PATH_WRITE_TOOLS: frozenset[str] = frozenset({
     "replace_core_block",
 })
 
+# 手动模式下仍然免审批的规则 —— 只看不改的那部分，外加写死路径的记忆写入。
+#
+# 手动模式（manual）的意思是「命令与写操作由用户裁决」，不是「每个工具调用
+# 都点一次」。只读工具和只读 bash 放行；记忆工具写的是固定路径（data/memory），
+# 不是用户可控的路径，卡住它等于把记忆系统瘫掉。
+# 不在名单里的：writable_zone（写文件）、skill_curl（curl 仪器接口）——
+# 这两类正是手动模式要交给用户裁决的。
+MANUAL_EXEMPT_RULES: frozenset[str] = frozenset({
+    "read_only_tool",
+    "read_only_bash",
+    "fixed_path_memory_tool",
+})
+
 # URL 前缀白名单只认回环地址 —— skills 里的 curl 指向本机的仪器服务
 _LOOPBACK_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost"})
 

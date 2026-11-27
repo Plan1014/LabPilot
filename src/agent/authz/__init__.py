@@ -8,6 +8,12 @@
 - **L3 转人工**—— 判官拿不准就问用户。
 
 L1 命中就永远不看 L0 —— 否则一条白名单就能把黑名单绕过去。
+
+**两种审批模式**（前端输入栏左下角的按钮切换）：
+
+- `auto`：判官裁决，拿不准才问用户。
+- `manual`：判官不下场 —— 只读操作照旧放行，其余（写文件、curl、
+  非只读命令）一律转给用户裁决。L1 的硬拒绝不随模式变。
 """
 
 import time
@@ -20,7 +26,29 @@ from langchain_core.tools import StructuredTool
 from . import audit, ledger, patterns, rules
 from . import judge as judge_module
 
-__all__ = ["REPL_SESSION_ID", "Verdict", "authorize", "wrap_tools_with_gate"]
+__all__ = [
+    "AUTO_MODE",
+    "MANUAL_MODE",
+    "REPL_SESSION_ID",
+    "Verdict",
+    "authorize",
+    "normalize_mode",
+    "wrap_tools_with_gate",
+]
+
+# 审批模式 —— auto = 判官自动裁决；manual = 用户逐条裁决。
+AUTO_MODE = "auto"
+MANUAL_MODE = "manual"
+
+
+def normalize_mode(mode: str | None) -> str:
+    """认不出来的模式一律当 auto。
+
+    模式认错的后果不对称：当成 manual 只是多问用户几次，当成 auto 则可能
+    悄悄放行 —— 所以认不出来时保持既有行为。
+    """
+    return MANUAL_MODE if mode == MANUAL_MODE else AUTO_MODE
+
 
 # 终端会话的身份。REPL 没有浏览器会话号，用这个固定的号 ——
 # 落进「没有会话」的公共桶就等于把终端里批准的授权带去了别的执行入口。
@@ -50,10 +78,29 @@ def _judge_trace(result) -> dict:
     }
 
 
+def _manual_question(tool_name: str, tool_input: dict) -> str:
+    """手动模式下问用户的那句话 —— 要看得见要执行的是什么。"""
+    tool_input = tool_input or {}
+    if tool_name == "bash":
+        command = (tool_input.get("command") or "").strip()
+        if len(command) > 120:
+            command = command[:117] + "…"
+        return f"要执行这条命令吗？{command}" if command else "要执行这条命令吗？"
+    if tool_name in ("write_file", "edit_file"):
+        verb = "写入" if tool_name == "write_file" else "修改"
+        path = tool_input.get("path") or "（未指定路径）"
+        return f"要{verb} {path} 吗？"
+    return f"要调用 {tool_name} 吗？"
+
+
 def authorize(
-    tool_name: str, tool_input: dict, *, session_id: str | None = None
+    tool_name: str, tool_input: dict, *, session_id: str | None = None, mode: str = AUTO_MODE
 ) -> Verdict:
-    """裁决一个工具调用。"""
+    """裁决一个工具调用。
+
+    `mode` —— "auto" 由判官裁决，"manual" 由用户逐条裁决（只读操作除外）。
+    认不出来的模式按 auto 走。
+    """
     started = time.monotonic()
 
     def finish(v: Verdict) -> Verdict:
@@ -83,6 +130,22 @@ def authorize(
                 "L0",
                 f"命中已授权模式 {granted}",
                 matched_rule="ledger",
+            )
+        )
+
+    # ---- 手动模式：判官不下场，非只读的一切都交给用户 ----
+    if normalize_mode(mode) == MANUAL_MODE:
+        whitelisted, rule_name = rules.is_l0_whitelisted(tool_name, tool_input)
+        if whitelisted and rule_name in rules.MANUAL_EXEMPT_RULES:
+            return finish(Verdict("allow", "L0", "命中白名单规则", matched_rule=rule_name))
+        return finish(
+            Verdict(
+                "escalate",
+                "L3",
+                "手动模式：命令与写操作由用户裁决",
+                question=_manual_question(tool_name, tool_input),
+                # 模式照常推导 —— 「允许并记住」在手动模式下也要能点
+                pattern=patterns.derive_pattern(tool_name, tool_input),
             )
         )
 

@@ -47,6 +47,14 @@ export interface AskAsk {
 
 // ==================== 鉴权类型 ====================
 
+/**
+ * 审批模式 —— 输入栏左下角的按钮切换。
+ *
+ * auto：判官自动裁决，拿不准才问用户。
+ * manual：判官不下场，命令与写操作一律由用户裁决。
+ */
+export type AuthzMode = "auto" | "manual";
+
 /** 用户对一个工具调用的裁决 —— 固定三项，顺序不变。 */
 export type AuthChoice = "allow_once" | "allow_always" | "deny";
 

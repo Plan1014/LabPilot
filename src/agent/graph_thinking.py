@@ -27,7 +27,7 @@ from langgraph.graph import END, StateGraph, add_messages
 
 from src.agent import tools as tools_mod
 from src.agent.ask_user import detect_ask, format_ask_cli, sanitize_ask_message
-from src.agent.authz import REPL_SESSION_ID, Verdict, authorize, protect
+from src.agent.authz import REPL_SESSION_ID, Verdict, authorize, normalize_mode, protect
 from src.agent.authz import ledger as authz_ledger
 from src.agent.authz import pending as authz_pending
 from src.agent.llm import llm
@@ -163,6 +163,7 @@ class InterleavedState:
     pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
     pending_auth: Optional[dict] = None  # 本轮挂起的鉴权批次；非 None 表示在等用户裁决
     deny_streak: int = 0  # 连续「全部被拒」的轮数（评审 I6）
+    authz_mode: str = "auto"  # 审批模式：auto=判官裁决，manual=用户逐条裁决
 
 
 # ==================== Content Block Parsing ====================
@@ -756,10 +757,14 @@ def authorize_node(state: InterleavedState) -> dict:
     # 没有身份的话授权落进「没有会话」的公共桶 —— 那是 server 模式在用的，
     # 等于把一个入口的批准带给了另一个入口（评审 M5）。
     gate_session_id = session_id or (REPL_SESSION_ID if interactive else None)
+    # 审批模式：auto = 判官裁决；manual = 用户逐条裁决（前端按钮切过来的）。
+    authz_mode = normalize_mode(getattr(state, "authz_mode", "auto"))
     verdicts: list[dict] = []
     for call in calls:
         tool_id, tool_name, tool_input = _tool_call_fields(call)
-        v = authorize(tool_name, tool_input, session_id=gate_session_id)
+        v = authorize(
+            tool_name, tool_input, session_id=gate_session_id, mode=authz_mode
+        )
         verdicts.append(
             {
                 "tool_call_id": tool_id,
