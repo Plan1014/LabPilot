@@ -86,16 +86,24 @@ def list_pending(session_id: str) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
-def record_decision(tool_call_id: str, choice: str) -> dict | None:
-    """记一次裁决。找不到待批记录 → None。"""
+def record_decision(
+    tool_call_id: str, choice: str, session_id: str | None = None
+) -> dict | None:
+    """记一次裁决。找不到待批记录 → None。
+
+    `session_id` 给了就只认这个会话下的记录 —— 提权是「谁点的谁批」，
+    不校验归属的话，任意会话都能替别人放行（评审 I3）。
+    """
     if choice not in VALID_CHOICES:
         raise ValueError(f"invalid choice: {choice!r}")
+    sql = "UPDATE auth_pending SET status = ? WHERE tool_call_id = ? AND status = 'pending'"
+    params: list = [choice, tool_call_id]
+    if session_id is not None:
+        sql += " AND session_id = ?"
+        params.append(session_id)
     conn = _conn()
     with conn:
-        cur = conn.execute(
-            "UPDATE auth_pending SET status = ? WHERE tool_call_id = ? AND status = 'pending'",
-            (choice, tool_call_id),
-        )
+        cur = conn.execute(sql, params)
         if cur.rowcount == 0:
             return None
     return get_pending_by_tool_call_id(tool_call_id)

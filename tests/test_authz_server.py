@@ -158,6 +158,22 @@ def test_respond_with_unknown_tool_call_id_is_404(client, db):
     assert r.status_code == 404
 
 
+def test_respond_rejects_a_pending_call_belonging_to_another_session(client, db):
+    """I3：待批记录挂在别的会话下 → 不能替它做裁决。
+
+    不校验会话归属的话，任意会话都能放行别人的操作 —— 提权回路就漏了。
+    """
+    _make_batch("s1")
+    r = client.post(
+        "/auth/respond",
+        json={"session_id": "s2", "tool_call_id": "c1", "choice": "allow_once"},
+    )
+    assert r.status_code == 403
+    # 原记录没被动过，也没有给 s2 留下授权
+    assert authz_pending.get_pending_by_tool_call_id("c1")["status"] == "pending"
+    assert ledger.list_grants(session_id="s2") == []
+
+
 def test_respond_records_decision(client, db):
     _make_batch("s1")
     r = client.post(

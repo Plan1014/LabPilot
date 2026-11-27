@@ -726,7 +726,7 @@ def _deny_earliest_pending_if_typed(session_id: str, query: str) -> list[dict]:
     if not rows:
         return []
     earliest = rows[0]
-    authz_pending.record_decision(earliest["tool_call_id"], "deny")
+    authz_pending.record_decision(earliest["tool_call_id"], "deny", session_id=session_id)
     if not authz_pending.batch_is_resolved(earliest["batch_id"]):
         remaining = len(authz_pending.list_pending(session_id))
         raise HTTPException(
@@ -783,7 +783,19 @@ def create_auth_router():
                 status_code=400, detail=f"invalid choice: {req.choice!r}"
             )
 
-        row = authz_pending.record_decision(req.tool_call_id, req.choice)
+        # 待批记录是谁的，就是谁批 —— 不校验会话归属的话，任意会话都能
+        # 替别人放行（评审 I3）。
+        existing = authz_pending.get_pending_by_tool_call_id(req.tool_call_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="没有这个待批调用")
+        if existing.get("session_id") != req.session_id:
+            raise HTTPException(
+                status_code=403, detail="这个待批调用不属于当前会话"
+            )
+
+        row = authz_pending.record_decision(
+            req.tool_call_id, req.choice, session_id=req.session_id
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="没有这个待批调用")
 
