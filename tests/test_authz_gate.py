@@ -5,6 +5,7 @@ L1 命中就永远不看白名单 —— 否则一条白名单能把黑名单绕
 """
 
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -212,3 +213,25 @@ def test_the_audit_entry_records_the_fallback_answer(db, tmp_path, monkeypatch):
     entry = json.loads(log_path.read_text(encoding="utf-8").strip())
     assert entry["judge_fallback"] is True
     assert entry["judge_model_used"] == "fallback-model"
+
+
+def test_the_audit_entry_carries_local_and_utc_times(db, tmp_path, monkeypatch):
+    """日志里的时间要能直接看：本地时间带时区偏移，UTC 另存一份方便换算。"""
+    log_path = tmp_path / "authz.log"
+    monkeypatch.setattr(audit, "AUTHZ_LOG_PATH", log_path)
+    monkeypatch.setattr(
+        judge_module,
+        "judge",
+        lambda *a, **k: judge_module.JudgeResult("allow", "只读", "", raw="{}"),
+    )
+    authorize("bash", {"command": "python tmp/x.py"})
+    entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+
+    local = datetime.fromisoformat(entry["ts_local"])
+    utc = datetime.fromisoformat(entry["ts_utc"])
+    # 本地时间跟着**这台机器**的时区走 —— 在中国是 +0800，换台机器就是当地的
+    assert local.utcoffset() == datetime.now().astimezone().utcoffset()
+    # 两个时间说的是同一瞬间，跟 epoch 对得上
+    assert local.timestamp() == pytest.approx(entry["ts"], abs=1)
+    assert utc.utcoffset() == timedelta(0)
+    assert utc.timestamp() == pytest.approx(entry["ts"], abs=1)

@@ -6,6 +6,7 @@
 import json
 import time
 from collections import deque
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,6 +25,19 @@ AUTHZ_LOG_PATH: Path | None = None
 _RECENT: deque = deque(maxlen=500)
 
 
+def _now_stamps() -> tuple[float, str, str]:
+    """三个时间：epoch、本地时间、UTC。
+
+    本地时间跟着**跑这份代码的机器**走 —— 用户在中国看到 +0800，
+    换个时区的机器看就是当地的偏移，不用自己换算。
+    本地时间带偏移量（ISO 8601），UTC 那份不带歧义 —— 换算用哪个都行。
+    """
+    now = time.time()
+    local = datetime.fromtimestamp(now).astimezone()
+    utc = datetime.fromtimestamp(now, tz=UTC)
+    return now, local.isoformat(timespec="seconds"), utc.isoformat(timespec="seconds")
+
+
 def log_verdict(
     verdict: "Verdict",
     *,
@@ -33,8 +47,11 @@ def log_verdict(
     elapsed_ms: int,
 ) -> None:
     """记一条判定。写文件失败 → 静默忽略。"""
+    ts, ts_local, ts_utc = _now_stamps()
     entry = {
-        "ts": time.time(),
+        "ts": ts,
+        "ts_local": ts_local,
+        "ts_utc": ts_utc,
         "session_id": session_id,
         "tool": tool_name,
         "layer": verdict.layer,
