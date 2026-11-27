@@ -176,3 +176,39 @@ def test_verdict_dataclass_defaults():
     assert v.matched_rule is None
     assert v.question == ""
     assert v.pattern is None
+
+
+# ==================== 审计里留判官的痕迹 ====================
+
+def test_the_audit_entry_keeps_the_judges_raw_output(db, tmp_path, monkeypatch):
+    """审计要能回答「判官到底说了什么」。"""
+    log_path = tmp_path / "authz.log"
+    monkeypatch.setattr(audit, "AUTHZ_LOG_PATH", log_path)
+    monkeypatch.setattr(
+        judge_module,
+        "judge",
+        lambda *a, **k: judge_module.JudgeResult(
+            "allow", "只读", "", raw='{"decision":"allow"}', model_used="judge-model"
+        ),
+    )
+    authorize("bash", {"command": "python tmp/x.py"})
+    entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert entry["judge_raw"] == '{"decision":"allow"}'
+    assert entry["judge_model_used"] == "judge-model"
+    assert entry["judge_fallback"] is False
+
+
+def test_the_audit_entry_records_the_fallback_answer(db, tmp_path, monkeypatch):
+    log_path = tmp_path / "authz.log"
+    monkeypatch.setattr(audit, "AUTHZ_LOG_PATH", log_path)
+    monkeypatch.setattr(
+        judge_module,
+        "judge",
+        lambda *a, **k: judge_module.JudgeResult(
+            "allow", "只读", "", raw="{}", model_used="fallback-model", fallback_used=True
+        ),
+    )
+    authorize("bash", {"command": "python tmp/x.py"})
+    entry = json.loads(log_path.read_text(encoding="utf-8").strip())
+    assert entry["judge_fallback"] is True
+    assert entry["judge_model_used"] == "fallback-model"

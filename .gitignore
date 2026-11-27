@@ -93,7 +93,7 @@ tmp/
 credentials.json
 secrets/
 data/
-.labpilot/            # 鉴权台账 —— agent 写不了，也不该进版本库
+.labpilot/            # 鉴权台账 + 审计日志 —— agent 写不了，也不该进版本库
 docs/
 !docs/architecture.mmd       # 架构图源文件 (Mermaid)
 !docs/images/                # 架构图渲染产物

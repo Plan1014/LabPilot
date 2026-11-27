@@ -35,6 +35,19 @@ class Verdict:
     matched_rule: str | None = None
     question: str = ""
     pattern: str | None = None  # 仅 escalate 时可能非空（「允许并记住」的模式）
+    # 判官这一趟的痕迹（L2 才有值）—— 审计要能复盘判官说了什么
+    judge_raw: str = ""
+    judge_model_used: str = ""
+    judge_fallback: bool = False
+
+
+def _judge_trace(result) -> dict:
+    """把判官结果里的痕迹摘出来，塞进 Verdict。"""
+    return {
+        "judge_raw": result.raw,
+        "judge_model_used": result.model_used,
+        "judge_fallback": result.fallback_used,
+    }
 
 
 def authorize(
@@ -80,9 +93,9 @@ def authorize(
     # ---- L2：判官 ----
     result = judge_module.judge(tool_name, tool_input)
     if result.decision == "allow":
-        return finish(Verdict("allow", "L2", result.reason))
+        return finish(Verdict("allow", "L2", result.reason, **_judge_trace(result)))
     if result.decision == "deny":
-        return finish(Verdict("deny", "L2", result.reason))
+        return finish(Verdict("deny", "L2", result.reason, **_judge_trace(result)))
     return finish(
         Verdict(
             "escalate",
@@ -91,6 +104,7 @@ def authorize(
             question=result.question,
             # 模式由确定性推导给出 —— 判官不参与模式决定（spec D8）
             pattern=patterns.derive_pattern(tool_name, tool_input),
+            **_judge_trace(result),
         )
     )
 

@@ -52,3 +52,21 @@ def test_writing_a_grant_into_the_session_db_does_not_authorize_anything(layout)
         pass  # 表已经不在会话库里了 —— 更好
 
     assert ledger.match_grant("bash", {"command": "rm -rf /"}, session_id=None) is None
+
+
+def test_the_audit_log_is_not_in_the_agent_writable_zone(layout):
+    """审计日志也不能落在 agent 写得了的地方 —— 否则 agent 能改自己的审计记录。
+
+    台账（authz.db）和审计日志（authz.log）是一对：一个是「授权凭据」，
+    一个是「授权经过」。两个都得在 agent 的手外面。
+    """
+    from src.agent import tools
+    from src.agent.authz import audit
+
+    log_file = audit.authz_log_path()
+    assert log_file
+    # 在工作区里（否则这条测试跟工作区无关）
+    assert paths.resolve_in_workdir(str(log_file)) is not None
+    assert not paths.is_writable_path(str(log_file))
+    # bash 往那儿写也要按只读区拦下来
+    assert tools.bash_blocked_write_target("echo x > .labpilot/authz.log")

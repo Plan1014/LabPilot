@@ -23,6 +23,9 @@ FALLBACK_MODEL_ENV = "AUTHZ_FALLBACK_MODEL_ID"
 JUDGE_TIMEOUT_S = 30
 FAILURE_THRESHOLD = 3
 
+# 原始输出最多留这么多字 —— 一条撑爆日志没有意义
+MAX_RAW_CHARS = 2000
+
 _FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$", re.MULTILINE)
 
 
@@ -31,6 +34,11 @@ class JudgeResult:
     decision: Literal["allow", "deny", "escalate"]
     reason: str
     question: str
+    # 这一趟的痕迹 —— 审计要能回答「判官到底说了什么、这次是谁答的」。
+    # 没有这两样，事后只剩一句结论，没法复盘。
+    raw: str = ""
+    model_used: str = ""
+    fallback_used: bool = False
 
 
 _consecutive_failures = 0
@@ -146,6 +154,7 @@ def parse_judge_output(raw: str) -> JudgeResult | None:
         decision=decision,
         reason=reason if isinstance(reason, str) else "",
         question=question if isinstance(question, str) else "",
+        raw=raw,
     )
 
 
@@ -154,6 +163,9 @@ def judge(tool_name: str, tool_input: dict) -> JudgeResult:
 
     降级阶梯：主模型 → 备用模型 → 转人工；连续失败 ≥ 3 次后直接转人工，
     不再等超时。
+
+    返回值里带着这一趟的痕迹（原始输出 / 谁答的 / 是不是走了备用）——
+    审计要靠它们回答「判官当时到底说了什么」。
     """
     model_id = judge_model_id()
     if not model_id:
@@ -171,12 +183,24 @@ def judge(tool_name: str, tool_input: dict) -> JudgeResult:
             "自动审批服务不可用，请人工决定是否执行这个操作。",
         )
 
-    result = _try_model(model_id, tool_name, tool_input)
+    result, raw = _try_model(model_id, tool_name, tool_input)
+    used_model = model_id
+    fallback_used = False
 
     if result is None:
         fallback = fallback_model_id()
         if fallback and fallback != model_id:
-            result = _try_model(fallback, tool_name, tool_input)
+            fb_result, fb_raw = _try_model(fallback, tool_name, tool_input)
+            if fb_result is not None:
+                result = fb_result
+                raw = fb_raw
+                used_model = fallback
+                fallback_used = True
+            else:
+                # 备用也没答上来 —— 记主判官的输出，它最可能是原因
+                raw = raw or fb_raw
+
+    raw = (raw or "")[:MAX_RAW_CHARS]
 
     if result is None:
         _bump_failure()
@@ -184,18 +208,29 @@ def judge(tool_name: str, tool_input: dict) -> JudgeResult:
             "escalate",
             "自动审批不可用",
             "自动审批服务不可用，请人工决定是否执行这个操作。",
+            raw=raw,
+            model_used=used_model,
         )
 
     reset_failures()
+    result.raw = raw
+    result.model_used = used_model
+    result.fallback_used = fallback_used
     return result
 
 
-def _try_model(model_id: str, tool_name: str, tool_input: dict) -> JudgeResult | None:
+def _try_model(
+    model_id: str, tool_name: str, tool_input: dict
+) -> tuple[JudgeResult | None, str]:
+    """试一个模型。返回 (裁决, 原始输出)。
+
+    原始输出单独带出来 —— 解析失败的时候，它就是唯一的线索。
+    """
     try:
         client = _make_client(model_id)
     except Exception:  # noqa: BLE001 —— 建不起客户端（没配 key、模型名错）也是失败
-        return None
+        return None, ""
     raw = _call_model(client, tool_name, tool_input)
     if raw is None:
-        return None
-    return parse_judge_output(raw)
+        return None, ""
+    return parse_judge_output(raw), raw

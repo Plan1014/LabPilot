@@ -194,3 +194,42 @@ def test_user_message_contains_only_the_tool_call():
     assert "cat src/x.py" in msg
     # 不能带会话历史 / 用户原话
     assert "用户" not in msg
+
+
+# ==================== 判官这一趟的痕迹 ====================
+# 审计要能回答两个问题：判官到底说了什么（原始输出）、这次是谁答的
+# （主判官还是备用）。没有这两样，事后只能看到一句结论。
+
+def test_the_result_carries_the_judges_raw_output(monkeypatch):
+    raw = json.dumps({"decision": "allow", "reason": "只读"})
+    _install(monkeypatch, FakeClient(content=raw))
+    r = judge.judge("bash", {"command": "ls"})
+    assert r.raw == raw
+    assert r.model_used == "judge-model"
+    assert r.fallback_used is False
+
+
+def test_the_result_records_that_the_fallback_answered(monkeypatch):
+    primary = FakeClient(raises=RuntimeError("down"))
+    raw = json.dumps({"decision": "allow", "reason": "ok"})
+    _install(monkeypatch, primary, FakeClient(content=raw))
+    r = judge.judge("bash", {"command": "ls"})
+    assert r.decision == "allow"
+    assert r.fallback_used is True
+    assert r.model_used == "fallback-model"
+    assert r.raw == raw
+
+
+def test_a_failed_judge_keeps_the_unparseable_output(monkeypatch):
+    """解析不出来的时候，原始输出最要紧 —— 它就是「为什么没解析出来」的答案。"""
+    _install(monkeypatch, FakeClient(content="garbage"))
+    r = judge.judge("bash", {"command": "ls"})
+    assert r.decision == "escalate"
+    assert r.raw == "garbage"
+
+
+def test_the_raw_output_is_truncated(monkeypatch):
+    """原始输出可能很长 —— 日志不该被一条撑爆。"""
+    _install(monkeypatch, FakeClient(content="x" * 10000))
+    r = judge.judge("bash", {"command": "ls"})
+    assert len(r.raw) <= judge.MAX_RAW_CHARS
