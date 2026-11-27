@@ -4,8 +4,14 @@ L1 黑名单是确定性的，但它挡不住所有 bash 形态（`python -c` �
 提取不到）。这层是**执行后**的保险，不是主防线：
 
 - 执行前：把受保护区域复制到 `tmp/_protect/<随机名>/`
-- 执行后：比对快照与现状 → 被改/被删的还原，新出现的删掉
+- 执行后：比对快照与现状 → 被改/被删的还原，新出现的移出（**不销毁**）
 - 有任何差异 → 本次调用判为失败，附还原报告交回主 agent
+
+**不销毁用户的文件**：受保护区里新出现（或被改动）的文件，可能是用户自己
+在编辑器里写的，不是 agent 写的。直接删掉就是毁掉别人的劳动成果。所以
+「多出来的文件」和「被改动文件的当前版本」都**搬到隔离目录**
+`.labpilot/protect-quarantine/<随机名>/`，报告里给出路径，人要的话自己取回。
+还原（把快照版本写回原位）照旧做 —— 保护区还是要回到调用前的样子。
 
 **为什么不用 git 还原**：`git checkout` 会把用户自己的未提交改动一起抹掉 ——
 LabPilot 正在被开发，工作区随时有 WIP。快照存的是「执行那一刻」的真实状态。
@@ -50,6 +56,12 @@ GENERATED_ARTIFACT_PATTERNS: tuple[str, ...] = (
 
 # 快照根目录（相对 workdir）
 PROTECT_DIR_NAME = "_protect"
+
+# 隔离目录（相对 workdir）—— 被移出来的文件放这儿，等人来取。
+# 放在 `.labpilot/` 下（不是 `tmp/`）：那里 agent 写不了，
+# 免得「隔离」的东西被 agent 自己顺手改掉。
+QUARANTINE_DIR_NAME = "protect-quarantine"
+QUARANTINE_PARENT = ".labpilot"
 
 
 def is_generated_artifact(path: Path, workdir: Path) -> bool:
@@ -154,6 +166,39 @@ def _copy_back(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
+def _quarantine_dir(workdir: Path) -> Path:
+    """这次隔离用的目录（还不建，用到才建）。"""
+    return Path(workdir) / QUARANTINE_PARENT / QUARANTINE_DIR_NAME / uuid.uuid4().hex
+
+
+def _preserve(live_path: Path, key: str, quarantine_root: Path) -> bool:
+    """把现场那份内容**抄一份**到隔离目录 —— 原文件不动。
+
+    抄成功 → True（内容留住了）；抄失败 → False（调用方决定怎么办）。
+    """
+    dest = quarantine_root / key
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(live_path, dest)
+        return True
+    except OSError:
+        return False
+
+
+def _remove_to_quarantine(live_path: Path, key: str, quarantine_root: Path) -> bool:
+    """把现场那个文件**搬走**到隔离目录 —— 受保护区里不留它，但也不销毁。
+
+    搬成功 → True；搬失败 → False（文件留在原地，调用方报告出来）。
+    """
+    dest = quarantine_root / key
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(live_path), str(dest))
+        return True
+    except OSError:
+        return False
+
+
 def _prune_empty_dirs(path: Path, stop: Path) -> None:
     """删掉空目录（往上删到 stop 为止）。删不掉就算了。"""
     parent = path.parent
@@ -168,12 +213,16 @@ def _prune_empty_dirs(path: Path, stop: Path) -> None:
 def diff_and_restore(snapshot_dir: Path, workdir: Path) -> dict:
     """比对快照与现状，把差异还原掉。
 
-    返回 `{"changed": [...], "removed": [...], "added": [...], "restored": bool}`，
+    返回
+    `{"changed": [...], "removed": [...], "added": [...], "quarantined": [...],
+    "quarantine_dir": str | None, "restored": bool}`，
     路径是相对 workdir 的正斜杠形式（`src/agent/tools.py`）。
 
-    - changed：内容被改 → 从快照还原
+    - changed：内容被改 → 从快照还原；现场那份**搬进隔离目录**（不销毁）
     - removed：文件被删 → 从快照还原
-    - added：新出现的文件 → 删掉
+    - added：新出现的文件 → **搬进隔离目录**（不销毁）
+
+    隔离目录在 `.labpilot/protect-quarantine/<随机名>/`，报告里给出路径。
     """
     workdir = Path(workdir)
     snapshot_dir = Path(snapshot_dir)
@@ -181,7 +230,33 @@ def diff_and_restore(snapshot_dir: Path, workdir: Path) -> dict:
     changed: list[str] = []
     removed: list[str] = []
     added: list[str] = []
+    quarantined: list[str] = []
+    quarantine_failed: list[str] = []
     restored = False
+
+    quarantine_root: Path | None = None
+
+    def _root() -> Path:
+        nonlocal quarantine_root
+        if quarantine_root is None:
+            quarantine_root = _quarantine_dir(workdir)
+        return quarantine_root
+
+    def preserve(live_path: Path, key: str) -> bool:
+        """把现场那份内容抄一份进隔离目录（原文件不动）。"""
+        if _preserve(live_path, key, _root()):
+            quarantined.append(key)
+            return True
+        quarantine_failed.append(key)
+        return False
+
+    def remove_to_quarantine(live_path: Path, key: str) -> bool:
+        """把现场那个文件搬进隔离目录（受保护区里不留它，也不销毁）。"""
+        if _remove_to_quarantine(live_path, key, _root()):
+            quarantined.append(key)
+            return True
+        quarantine_failed.append(key)
+        return False
 
     for rel in paths.PROTECTED_DIRS:
         snap_files = _collect(snapshot_dir / rel, rel, workdir)
@@ -196,6 +271,9 @@ def diff_and_restore(snapshot_dir: Path, workdir: Path) -> dict:
                 restored = True
             elif _differs(snap_path, live_path):
                 changed.append(key)
+                # 现场那份先留一份底 —— 可能是用户自己改的。
+                # 留底失败也照样还原（保护区优先），但报告里会说明。
+                preserve(live_path, key)
                 _copy_back(snap_path, workdir / key)
                 restored = True
 
@@ -203,10 +281,9 @@ def diff_and_restore(snapshot_dir: Path, workdir: Path) -> dict:
             if key in snap_files:
                 continue
             added.append(key)
-            try:
-                live_path.unlink()
-            except OSError:
-                continue
+            # 新出现的文件不删 —— 搬进隔离目录，人要的话自己取回。
+            # 搬不动就留在原地（不销毁），报告里会说出来。
+            remove_to_quarantine(live_path, key)
             _prune_empty_dirs(live_path, live_root)
             restored = True
 
@@ -220,20 +297,21 @@ def diff_and_restore(snapshot_dir: Path, workdir: Path) -> dict:
                 restored = True
             elif _differs(snap_path, live_path):
                 changed.append(name)
+                preserve(live_path, name)
                 _copy_back(snap_path, live_path)
                 restored = True
         elif live_path.is_file():
             added.append(name)
-            try:
-                live_path.unlink()
-            except OSError:
-                pass
+            remove_to_quarantine(live_path, name)
             restored = True
 
     return {
         "changed": sorted(changed),
         "removed": sorted(removed),
         "added": sorted(added),
+        "quarantined": sorted(quarantined),
+        "quarantine_failed": sorted(quarantine_failed),
+        "quarantine_dir": str(quarantine_root) if quarantine_root else None,
         "restored": restored,
     }
 
@@ -244,6 +322,13 @@ def format_report(report: dict) -> str:
     for label, key in (("被修改", "changed"), ("被删除", "removed"), ("被新增", "added")):
         for path in report.get(key, []):
             lines.append(f"- {label}：{path}")
+    quarantined = report.get("quarantined") or []
+    if quarantined:
+        lines.append("")
+        lines.append("以下文件已移到隔离目录（没有删除，需要的话自己取回）：")
+        for path in quarantined:
+            lines.append(f"- {path}")
+        lines.append(f"隔离目录：{report.get('quarantine_dir')}")
     return "\n".join(lines)
 
 

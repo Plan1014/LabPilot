@@ -5,9 +5,11 @@
 
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
+from src.agent import paths
 from src.agent.authz import protect
 
 
@@ -105,6 +107,69 @@ def test_restore_removes_added_file(workdir):
     (workdir / "src" / "new.py").write_text("new", encoding="utf-8")
     protect.diff_and_restore(snap, workdir)
     assert not (workdir / "src" / "new.py").exists()
+
+
+# ==================== 隔离（不销毁用户文件） ====================
+
+def test_an_added_file_is_quarantined_instead_of_deleted(workdir):
+    """受保护区里新出现的文件不能直接删掉 —— 那可能是用户自己写的。
+
+    删了就是销毁用户的劳动成果。改成搬到隔离目录，内容留着。
+    """
+    snap = protect.snapshot(workdir)
+    (workdir / "src" / "new.py").write_text("new", encoding="utf-8")
+
+    report = protect.diff_and_restore(snap, workdir)
+
+    assert not (workdir / "src" / "new.py").exists()
+    quarantine = Path(report["quarantine_dir"])
+    assert (quarantine / "src" / "new.py").read_text(encoding="utf-8") == "new"
+    assert "src/new.py" in report["quarantined"]
+
+
+def test_a_changed_file_keeps_its_newer_version_in_quarantine(workdir):
+    """被改动的文件：现场恢复成快照版本，但用户那份新内容不能消失。"""
+    snap = protect.snapshot(workdir)
+    (workdir / "src" / "agent" / "tools.py").write_text("tampered", encoding="utf-8")
+
+    report = protect.diff_and_restore(snap, workdir)
+
+    assert (workdir / "src" / "agent" / "tools.py").read_text(encoding="utf-8") == "original"
+    quarantine = Path(report["quarantine_dir"])
+    assert (quarantine / "src" / "agent" / "tools.py").read_text(encoding="utf-8") == "tampered"
+    assert "src/agent/tools.py" in report["quarantined"]
+
+
+def test_the_report_points_at_the_quarantine_directory(workdir):
+    """报告得告诉人文件去哪了 —— 否则等于悄悄弄丢了东西。"""
+    snap = protect.snapshot(workdir)
+    (workdir / "src" / "new.py").write_text("new", encoding="utf-8")
+
+    report = protect.diff_and_restore(snap, workdir)
+    text = protect.format_report(report)
+
+    assert report["quarantine_dir"] in text
+    assert "src/new.py" in text
+
+
+def test_the_quarantine_lives_outside_the_protected_areas(workdir):
+    """隔离目录不能在受保护区里 —— 否则下一次比对又把它算成差异。"""
+    snap = protect.snapshot(workdir)
+    (workdir / "src" / "new.py").write_text("new", encoding="utf-8")
+
+    report = protect.diff_and_restore(snap, workdir)
+    quarantine = Path(report["quarantine_dir"])
+
+    assert ".labpilot" in quarantine.parts
+    for rel in paths.PROTECTED_DIRS:
+        assert not quarantine.is_relative_to(workdir / rel)
+
+
+def test_nothing_quarantined_when_nothing_changed(workdir):
+    snap = protect.snapshot(workdir)
+    report = protect.diff_and_restore(snap, workdir)
+    assert report["quarantined"] == []
+    assert report.get("quarantine_dir") is None
 
 
 # ==================== 生成物 ====================
