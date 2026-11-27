@@ -352,3 +352,77 @@ def test_escalate_without_session_and_without_interactive_is_denied(db, monkeypa
     assert len(tool_msgs) == 1
     assert tool_msgs[0].content.startswith("授权拒绝：")
     assert result["pending_auth"] is None
+
+
+# ==================== 全拒死循环（评审 I6）====================
+
+def test_all_denied_rounds_end_the_turn_instead_of_looping(db, monkeypatch):
+    """全被拒时不能一路回 generate —— 模型会一直重试，最后撞递归上限。
+
+    以前唯一的刹车是 recursion_limit，用户看到的是 GraphRecursionError
+    （像是系统坏了），而不是「这个操作被拒绝了」（评审 I6）。
+    """
+    from src.agent import graph_thinking
+
+    calls = []
+
+    class AlwaysDeniedLLM:
+        """不管怎样都去写保护区 —— 每一轮都会被 L1 拒掉。"""
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            calls.append(1)
+            return AIMessage(content="", tool_calls=[
+                {"id": f"c{len(calls)}", "name": "write_file", "type": "tool_call",
+                 "args": {"path": "src/evil.py", "content": "boom"}},
+            ])
+
+    monkeypatch.setattr(graph_thinking, "llm", AlwaysDeniedLLM())
+
+    graph = graph_thinking.build_graph()
+    result = graph.invoke(
+        {"messages": [], "pending_tool_calls": [], "step_count": 0},
+        config={"recursion_limit": 100},
+    )
+
+    # 没有撞递归上限 —— 全拒的轮数有上限
+    assert len(calls) <= graph_thinking.MAX_DENY_STREAK
+    # 每一轮都产了拒绝说明
+    tool_msgs = _tool_messages(result["messages"])
+    assert tool_msgs
+    assert all(m.content.startswith("授权拒绝：") for m in tool_msgs)
+
+
+def test_a_denied_round_is_followed_by_a_new_one(db, monkeypatch):
+    """一次全拒不该立刻终止 —— 模型可能换条路（写 tmp/）就通了。"""
+    from src.agent import graph_thinking
+
+    class FirstDeniedThenOk:
+        def __init__(self):
+            self.calls = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[
+                    {"id": "c1", "name": "write_file", "type": "tool_call",
+                     "args": {"path": "src/evil.py", "content": "boom"}},
+                ])
+            return AIMessage(content="好了")
+
+    fake = FirstDeniedThenOk()
+    monkeypatch.setattr(graph_thinking, "llm", fake)
+
+    graph = graph_thinking.build_graph()
+    result = graph.invoke(
+        {"messages": [], "pending_tool_calls": [], "step_count": 0},
+        config={"recursion_limit": 100},
+    )
+
+    assert fake.calls == 2
+    assert result["messages"][-1].content == "好了"

@@ -36,6 +36,10 @@ from src.agent.memory.constants import PENDING_THRESHOLD
 from src.agent.prompt_context import strip_labels
 from src.agent.tools import TOOLS, is_failure_result
 
+# 连续多少轮「工具调用全部被拒」就收工（评审 I6）。
+# 一次全拒不算数 —— 模型可能换条路（改写 tmp/ 下的文件）就通了。
+MAX_DENY_STREAK = 3
+
 
 def _ensure_unique_tool_use_ids(messages: list) -> None:
     """保证整个 messages 列表里所有 tool_use id 跨 message 唯一.
@@ -158,6 +162,7 @@ class InterleavedState:
     interactive: bool = False  # True = 终端交互（REPL）→ escalate 在终端里问
     pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
     pending_auth: Optional[dict] = None  # 本轮挂起的鉴权批次；非 None 表示在等用户裁决
+    deny_streak: int = 0  # 连续「全部被拒」的轮数（评审 I6）
 
 
 # ==================== Content Block Parsing ====================
@@ -870,10 +875,23 @@ def authorize_node(state: InterleavedState) -> dict:
         else:
             allowed.append(call)
 
+    # 连续全拒的轮数（评审 I6）：模型看到拒绝多半会再发一次同样的调用，
+    # 再被拒、再回 generate —— 唯一的刹车是递归上限，用户看到的是
+    # GraphRecursionError（像是系统坏了）。这里自己数着，到顶就收工。
+    denied_count = sum(1 for x in verdicts if x["verdict"].decision == "deny")
+    all_denied = bool(calls) and denied_count == len(calls)
+    deny_streak = (getattr(state, "deny_streak", 0) + 1) if all_denied else 0
+    if deny_streak >= MAX_DENY_STREAK and messages:
+        messages[-1].content += (
+            f"\n[System note] 连续 {deny_streak} 轮工具调用全部被授权拒绝，"
+            "本轮到此为止。请直接告诉用户这个操作被拒绝了，不要重试。"
+        )
+
     return {
         "messages": messages,
         "pending_tool_calls": allowed,
         "pending_auth": None,
+        "deny_streak": deny_streak,
     }
 
 
@@ -882,12 +900,15 @@ def _route_after_authorize(state: InterleavedState) -> Literal["execute_tools", 
 
     - 有挂起的鉴权批次 → 本轮结束（等用户裁决）。
     - 还有放行的调用 → 去执行。
-    - 全部被拒 → 回 generate，让模型看到拒绝说明并给用户一个交代。
+    - 连续全拒到顶 → 本轮结束（模型在原地重试，评审 I6）。
+    - 其余（全被拒但还没到顶）→ 回 generate，让模型看到拒绝说明并给用户一个交代。
     """
     if getattr(state, "pending_auth", None):
         return "done"
     if state.pending_tool_calls:
         return "execute_tools"
+    if getattr(state, "deny_streak", 0) >= MAX_DENY_STREAK:
+        return "done"
     return "generate"
 
 

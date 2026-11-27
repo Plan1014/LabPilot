@@ -165,11 +165,30 @@ def _pattern_matches(pattern: str, tool_name: str, tool_input: dict) -> bool:
         segment = segments[0].strip()
         if not segment:
             return False
-        if segment == payload or segment.startswith(payload + " "):
+        if _prefix_matches(segment, payload):
             return True
         return fnmatch.fnmatchcase(segment, payload)
 
     return False
+
+
+# 前缀的合法接缝。空格之外还有 URL / 路径的分隔符 ——
+# 「允许并记住」了 `curl http://127.0.0.1:8001`，下一条 `.../run` 也该命中
+# （评审 M2）；但端口、主机、文件名不同的不能顺手放行。
+_BOUNDARY_CHARS = frozenset(" \t/?#&")
+
+
+def _prefix_matches(segment: str, payload: str) -> bool:
+    """payload 是 segment 的前缀，且接缝落在边界上。
+
+    只按空格分界太严 —— `curl http://127.0.0.1:8001` 记下来了，下一条
+    `curl http://127.0.0.1:8001/run` 却匹配不上，「记住」名不副实。
+    只按裸前缀又太松 —— `...:8001` 会匹配 `...:80011`，`tmp/a` 会匹配 `tmp/ab`。
+    """
+    if not segment.startswith(payload):
+        return False
+    rest = segment[len(payload):]
+    return rest == "" or rest[0] in _BOUNDARY_CHARS
 
 
 def _relative_to_workdir(raw: str) -> str | None:

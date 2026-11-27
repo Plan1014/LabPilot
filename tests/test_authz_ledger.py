@@ -49,6 +49,38 @@ def test_grant_matches_write_file_by_path_prefix(db):
     assert not ledger.match_grant("write_file", {"path": "src/x.py"})
 
 
+# ==================== 模式的前缀边界（评审 M2）====================
+# 「允许并记住」要真的管用：记住了基址，下一条子路径就该命中。
+# 但也不能退化成裸前缀 —— 端口不同、路径不同的东西不能顺手放行。
+
+
+def test_a_remembered_url_grant_covers_the_sub_path(db):
+    ledger.record_grant("bash:curl http://127.0.0.1:8001")
+    assert ledger.match_grant("bash", {"command": "curl http://127.0.0.1:8001/run"})
+
+
+def test_a_remembered_url_grant_does_not_cover_a_different_port(db):
+    ledger.record_grant("bash:curl http://127.0.0.1:8001")
+    assert not ledger.match_grant("bash", {"command": "curl http://127.0.0.1:80011/run"})
+
+
+def test_a_remembered_url_grant_does_not_cover_a_different_host(db):
+    ledger.record_grant("bash:curl http://127.0.0.1:8001")
+    assert not ledger.match_grant(
+        "bash", {"command": "curl http://127.0.0.1:8001.evil.com/run"}
+    )
+
+
+def test_a_remembered_path_grant_does_not_cover_a_sibling_with_the_same_prefix(db):
+    ledger.record_grant("bash:cat tmp/a")
+    assert not ledger.match_grant("bash", {"command": "cat tmp/ab"})
+
+
+def test_a_remembered_path_grant_covers_a_path_below_it(db):
+    ledger.record_grant("bash:cat tmp/a")
+    assert ledger.match_grant("bash", {"command": "cat tmp/a/b.txt"})
+
+
 def test_grant_matches_bash_by_exe_and_path(db):
     ledger.record_grant("bash:python tmp/analyze.py")
     assert ledger.match_grant("bash", {"command": "python tmp/analyze.py --x 1"})
