@@ -14,12 +14,17 @@ import time
 from dataclasses import dataclass
 from typing import Literal
 
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import StructuredTool
 
 from . import audit, ledger, patterns, rules
 from . import judge as judge_module
 
-__all__ = ["Verdict", "authorize", "wrap_tools_with_gate"]
+__all__ = ["REPL_SESSION_ID", "Verdict", "authorize", "wrap_tools_with_gate"]
+
+# 终端会话的身份。REPL 没有浏览器会话号，用这个固定的号 ——
+# 落进「没有会话」的公共桶就等于把终端里批准的授权带去了别的执行入口。
+REPL_SESSION_ID = "repl"
 
 
 @dataclass
@@ -90,6 +95,19 @@ def authorize(
     )
 
 
+def _session_id_of(config: RunnableConfig | None) -> str | None:
+    """从运行配置里取会话标识。
+
+    server 模式（LangGraph）每个 thread 一个会话 —— 授权要按 thread 隔离，
+    不能让所有 thread 共用一个「没有会话」的桶（评审 I4）。
+    """
+    if not config:
+        return None
+    configurable = config.get("configurable") or {}
+    thread_id = configurable.get("thread_id")
+    return str(thread_id) if thread_id else None
+
+
 def _make_gated_tool(t):
     """把一个工具包成「先问闸门再执行」的工具。
 
@@ -101,8 +119,8 @@ def _make_gated_tool(t):
     description = getattr(t, "description", "") or ""
     args_schema = getattr(t, "args_schema", None)
 
-    def _gated(**kwargs):
-        verdict = authorize(name, kwargs)
+    def _gated(config: RunnableConfig = None, **kwargs):
+        verdict = authorize(name, kwargs, session_id=_session_id_of(config))
         if verdict.decision == "allow":
             return original.invoke(kwargs)
         if verdict.decision == "escalate":

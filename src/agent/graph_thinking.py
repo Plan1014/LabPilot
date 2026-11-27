@@ -27,7 +27,7 @@ from langgraph.graph import END, StateGraph, add_messages
 
 from src.agent import tools as tools_mod
 from src.agent.ask_user import detect_ask, format_ask_cli, sanitize_ask_message
-from src.agent.authz import Verdict, authorize, protect
+from src.agent.authz import REPL_SESSION_ID, Verdict, authorize, protect
 from src.agent.authz import ledger as authz_ledger
 from src.agent.authz import pending as authz_pending
 from src.agent.llm import llm
@@ -746,10 +746,15 @@ def authorize_node(state: InterleavedState) -> dict:
         return {"pending_tool_calls": [], "pending_auth": None}
 
     session_id = getattr(state, "session_id", None)
+    interactive = bool(getattr(state, "interactive", False))
+    # 闸门的会话身份：浏览器会话用 session_id，REPL 用自己的号。
+    # 没有身份的话授权落进「没有会话」的公共桶 —— 那是 server 模式在用的，
+    # 等于把一个入口的批准带给了另一个入口（评审 M5）。
+    gate_session_id = session_id or (REPL_SESSION_ID if interactive else None)
     verdicts: list[dict] = []
     for call in calls:
         tool_id, tool_name, tool_input = _tool_call_fields(call)
-        v = authorize(tool_name, tool_input, session_id=session_id)
+        v = authorize(tool_name, tool_input, session_id=gate_session_id)
         verdicts.append(
             {
                 "tool_call_id": tool_id,
@@ -764,7 +769,7 @@ def authorize_node(state: InterleavedState) -> dict:
     # ---- 终端交互（REPL）：直接在终端里问，批内当场解决 ----
     # 「是不是终端」由调用方显式声明（interactive=True），不靠 session_id 猜 ——
     # 猜错一次就变成去问服务端终端（评审 C3）。
-    if escalations and getattr(state, "interactive", False):
+    if escalations and interactive:
         for item in escalations:
             choice = _prompt_cli_decision(item["verdict"])
             if choice == "deny":
@@ -775,7 +780,7 @@ def authorize_node(state: InterleavedState) -> dict:
             if choice == "allow_always":
                 pattern = item["verdict"].pattern
                 if pattern:
-                    authz_ledger.record_grant(pattern)
+                    authz_ledger.record_grant(pattern, session_id=gate_session_id)
             item["verdict"] = Verdict(
                 "allow", item["verdict"].layer, item["verdict"].reason
             )

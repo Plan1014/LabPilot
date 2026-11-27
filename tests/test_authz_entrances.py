@@ -14,6 +14,20 @@ from src.agent.authz.judge import JudgeResult
 
 
 @pytest.fixture
+def db(tmp_path, monkeypatch):
+    """会话库指向临时文件 —— 测试不该往用户的 tasks.db 里写。"""
+    from src.agent import session_manager
+    from src.agent.authz import ledger
+
+    monkeypatch.setattr(session_manager, "SQLITE_DB_PATH", tmp_path / "tasks.db")
+    monkeypatch.setattr(session_manager, "_sql_conn", None)
+    ledger.reset_session_grants()
+    yield
+    ledger.reset_session_grants()
+    monkeypatch.setattr(session_manager, "_sql_conn", None)
+
+
+@pytest.fixture
 def gated_read_file(tmp_path, monkeypatch):
     """一个被闸门套住的 read_file，指向临时目录。"""
     from src.agent import paths
@@ -113,8 +127,80 @@ def test_wrapped_tool_never_raises_on_deny(tmp_path, monkeypatch):
     assert isinstance(out, str)
 
 
-# ==================== 记忆子 agent ====================
+# ==================== 授权按会话隔离（评审 I4）====================
+# server 模式的闸门包装器原来不透传 session_id —— 所有会话共用「没有会话」
+# 这一个桶，会话级的宽授权在别的 thread 里也生效、也认不出是谁批的。
 
+
+def _curl_to_odd_port():
+    """一条会落到 L2 的 curl —— 回环地址，但不是仪器服务的已知端口。
+
+    推出来的模式是「宽」的（只进会话内存，不持久化）。
+    """
+    return "curl http://127.0.0.1:9999/x"
+
+
+def test_wrapped_tool_matches_a_grant_recorded_for_the_same_thread(
+    tmp_path, monkeypatch, db
+):
+    """同一个 thread 里的授权要能命中 —— 否则「允许并记住」在这条路上白记。"""
+    from src.agent import authz, paths
+    from src.agent.authz import ledger
+
+    monkeypatch.setattr(paths, "WORKDIR", tmp_path)
+    monkeypatch.setattr(tools, "WORKDIR", tmp_path)
+    (tmp_path / "tmp").mkdir()
+
+    ledger.record_grant(f"bash:{_curl_to_odd_port()}", session_id="thread-1")
+
+    asked = []
+    monkeypatch.setattr(
+        authz.judge_module,
+        "judge",
+        lambda tool_name, tool_input: asked.append(tool_name)
+        or JudgeResult(decision="escalate", reason="拿不准", question="要执行吗？"),
+    )
+
+    wrapped = wrap_tools_with_gate([tools.bash])[0]
+    wrapped.invoke(
+        {"command": _curl_to_odd_port()},
+        config={"configurable": {"thread_id": "thread-1"}},
+    )
+
+    assert asked == []  # 命中授权就不该再去问判官
+
+
+def test_wrapped_tool_does_not_match_a_grant_from_another_thread(
+    tmp_path, monkeypatch, db
+):
+    """别的 thread 的授权不能在这儿生效 —— 授权是「谁批的谁用」。"""
+    from src.agent import authz, paths
+    from src.agent.authz import ledger
+
+    monkeypatch.setattr(paths, "WORKDIR", tmp_path)
+    monkeypatch.setattr(tools, "WORKDIR", tmp_path)
+    (tmp_path / "tmp").mkdir()
+
+    ledger.record_grant(f"bash:{_curl_to_odd_port()}", session_id="thread-1")
+
+    monkeypatch.setattr(
+        authz.judge_module,
+        "judge",
+        lambda tool_name, tool_input: JudgeResult(
+            decision="escalate", reason="拿不准", question="要执行吗？"
+        ),
+    )
+
+    wrapped = wrap_tools_with_gate([tools.bash])[0]
+    out = wrapped.invoke(
+        {"command": _curl_to_odd_port()},
+        config={"configurable": {"thread_id": "thread-2"}},
+    )
+
+    assert "不支持人工审批" in out
+
+
+# ==================== 记忆子 agent ====================
 def test_memory_agent_tool_list_has_no_bash_or_write_file():
     """记忆子 agent 只该拿着记忆工具 —— 原来它拿着含 bash 的全量工具表。"""
     from src.agent.memory.memory_agent import MEMORY_TOOLS

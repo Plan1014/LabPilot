@@ -288,6 +288,40 @@ def test_repl_allow_always_records_grant(db, monkeypatch):
     assert "bash:python tmp/x.py" in patterns
 
 
+def test_repl_wide_grant_is_recorded_under_the_repl_identity(db, monkeypatch):
+    """REPL 的宽授权要挂在自己的号上（评审 M5）。
+
+    「没有会话」那个桶是 server 模式的闸门包装器在用的 —— 落进去就等于把
+    终端里批准的授权带去了另一个执行入口。
+
+    宽模式今天推不出来（`derive_pattern` 只推窄模式），所以这里直接把模式
+    换成宽的 —— 钉的是「授权归到谁名下」这条路由规则，不是模式的推导。
+    """
+    from src.agent import graph_thinking
+    from src.agent.authz import ledger
+    from src.agent.authz import patterns as authz_patterns
+
+    command = "curl http://127.0.0.1:9999/x"
+
+    monkeypatch.setattr(judge_module, "judge", FakeJudge())
+    monkeypatch.setattr(graph_thinking, "_prompt_cli_decision", lambda v: "allow_always")
+    monkeypatch.setattr(
+        authz_patterns, "derive_pattern", lambda *a, **k: f"bash:{command}"
+    )
+    fake = _fake_llm([
+        {"id": "c1", "name": "bash", "type": "tool_call", "args": {"command": command}},
+    ])
+    monkeypatch.setattr(graph_thinking, "llm", fake)
+
+    graph = graph_thinking.build_graph()
+    graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0, "interactive": True})
+
+    # 挂在 REPL 自己的号上
+    assert ledger.match_grant("bash", {"command": command}, session_id="repl") == f"bash:{command}"
+    # 「没有会话」的路径（server 模式）捡不到
+    assert ledger.match_grant("bash", {"command": command}, session_id=None) is None
+
+
 def test_escalate_without_session_and_without_interactive_is_denied(db, monkeypatch):
     """既没有会话（弹不了卡）也不是终端（问不了人）→ 没人能裁决 → 关闭式拒绝。
 
