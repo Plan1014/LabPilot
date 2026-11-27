@@ -202,6 +202,19 @@ LabPilot/
 - 两种模式都能在卡片上点「允许并记住」—— 记下来的模式之后直接放行。
 - 审计日志：`.labpilot/authz.log`（每次裁决一行 JSONL）；`GET /debug/authz?n=50` 看最近的决定。
 
+### 执行后兜底：快照与隔离
+
+L1 挡不住所有 bash 形态（路径藏在 `python -c` 里就提取不到）。所以每次 bash 前
+会把受保护区拍一份快照，执行后比对：
+
+- **被改动 / 被删除的文件** → 还原回快照里的样子（保护区回到调用前）。
+- **多出来的文件**（可能是你自己在编辑器里写的）→ **不删**，移到隔离目录
+  `.labpilot/protect-quarantine/<随机名>/`，报告里给出路径，要的话自己取回。
+- **被改动文件的现场版本** → 也**抄一份**进隔离目录，你那份新内容不会消失。
+
+隔离目录放在 `.labpilot/` 下而不是 `tmp/` —— 那里 agent 写不了，
+免得「隔离」的东西被 agent 自己顺手改掉。
+
 ---
 
 ## 向 Agent 提问
@@ -329,6 +342,7 @@ Agent 有一个 `ask_user` 工具。当它遇到需要用户决策的节点（�
 | SQLite | `data/memory/tasks.db` | 会话历史 + 任务状态（TTL 默认 30 天） |
 | SQLite | `.labpilot/authz.db` | 鉴权台账（用户批准过的操作范围）。**不在 `data/` 里** —— 那是 agent 可写区，台账放那儿 agent 就能自己给自己签通行证 |
 | 日志 | `.labpilot/authz.log` | 鉴权审计（每次裁决一行 JSONL：哪一层、批没批、判官原话、谁答的、时间戳 `ts` epoch + `ts_local` 本地时间带时区偏移 + `ts_utc`）。同样**不在 `data/` 里** —— 否则 agent 能改自己的审计记录 |
+| 文件 | `.labpilot/protect-quarantine/` | 执行后兜底隔离区：受保护区里被 bash 改动 / 新出现的文件移到这里（**不删除**，要的话自己取回）。同样在 agent 写不了的地方 |
 | ChromaDB | `data/memory/chroma_db/` | 事实记忆 + 对话摘要（向量检索） |
 | JSON | `data/sessions/*.json` | 会话归档 |
 | 文件 | `.transcripts/` | 压缩前的对话原文 |

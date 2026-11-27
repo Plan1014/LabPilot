@@ -769,9 +769,15 @@ def _get_core_manager() -> CoreMemoryManager:
 # ==================== Security ====================
 
 def safe_path(p: str) -> Path:
-    """Resolve path safely, preventing directory traversal attacks."""
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+    """Resolve path safely, preventing directory traversal attacks.
+
+    比较的基准要解开符号链接/junction（`WORKDIR.resolve()`）——
+    否则链接形态的 checkout 下 `is_relative_to` 恒 False，
+    读文件写文件全被当成「逃逸出工作区」。
+    """
+    base = WORKDIR.resolve()
+    path = (base / p).resolve()
+    if not path.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 

@@ -72,3 +72,46 @@ def test_resolve_in_workdir_returns_absolute_path(workdir):
     p = paths.resolve_in_workdir("tmp/a.txt")
     assert p is not None
     assert p == (workdir / "tmp" / "a.txt").resolve()
+
+
+# ==================== 链接形态的工作区 ====================
+# checkout 有可能是个符号链接（Windows 上是 junction）。路径解析会把它
+# 解开，而比较的基准如果不解开，两边永远对不上 —— 所有路径都被判成
+# outside → write_file / edit_file 全被 L1 拒（假阳性，用户根本没法写文件）。
+
+
+def test_a_linked_workdir_does_not_make_every_path_look_outside(
+    junction_workdir, monkeypatch
+):
+    monkeypatch.setattr(paths, "WORKDIR", junction_workdir)
+    assert paths.classify_target("tmp/a.txt") == "writable"
+    assert paths.classify_target("src/agent/tools.py") == "repo_readonly"
+
+
+def test_a_linked_workdir_still_protects_the_protected_dirs(
+    junction_workdir, monkeypatch
+):
+    monkeypatch.setattr(paths, "WORKDIR", junction_workdir)
+    assert paths.is_protected_path("src/agent/tools.py")
+    assert not paths.is_writable_path("src/agent/tools.py")
+
+
+def test_a_linked_workdir_still_protects_the_root_files(junction_workdir, monkeypatch):
+    """根文件保护在链接形态下也不能漏 —— 漏了就等于放行改 .env。"""
+    monkeypatch.setattr(paths, "WORKDIR", junction_workdir)
+    assert paths.is_protected_path(".env")
+    assert paths.is_protected_path("README.md")
+    assert paths.classify_target(".env") == "repo_readonly"
+
+
+def test_a_linked_workdir_still_rejects_paths_outside_it(junction_workdir, monkeypatch):
+    """链接形态不能顺手把「工作区外」也放进来。"""
+    monkeypatch.setattr(paths, "WORKDIR", junction_workdir)
+    assert paths.classify_target("../outside.txt") == "outside"
+    assert paths.resolve_in_workdir("../outside.txt") is None
+
+
+def test_a_linked_workdir_yields_a_relative_path_inside_it(junction_workdir, monkeypatch):
+    """相对路径的推导也要跟着解开的基准走 —— 推导不出就等于「记住」功能失灵。"""
+    monkeypatch.setattr(paths, "WORKDIR", junction_workdir)
+    assert paths.relative_to_workdir("tmp/exp1/a.txt") == "tmp/exp1/a.txt"

@@ -192,10 +192,4 @@ def _prefix_matches(segment: str, payload: str) -> bool:
 
 
 def _relative_to_workdir(raw: str) -> str | None:
-    resolved = paths.resolve_in_workdir(raw)
-    if resolved is None:
-        return None
-    try:
-        return resolved.relative_to(paths.WORKDIR).as_posix()
-    except ValueError:
-        return None
+    return paths.relative_to_workdir(raw)

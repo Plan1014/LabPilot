@@ -32,9 +32,8 @@ def derive_pattern(tool_name: str, tool_input: dict) -> str | None:
         if resolved is None or not paths.is_writable_path(path):
             return None
         parent = resolved.parent
-        try:
-            rel = parent.relative_to(paths.WORKDIR).as_posix()
-        except ValueError:
+        rel = paths.relative_path_of(parent)
+        if rel is None:
             return None
         return f"{tool_name}:{rel}/**"
 
@@ -67,9 +66,8 @@ def derive_pattern(tool_name: str, tool_input: dict) -> str | None:
         resolved = paths.resolve_in_workdir(arg)
         if resolved is None or not paths.is_writable_path(arg):
             return None
-        try:
-            rel = resolved.relative_to(paths.WORKDIR).as_posix()
-        except ValueError:
+        rel = paths.relative_path_of(resolved)
+        if rel is None:
             return None
         return f"bash:{exe} {rel}"
 
