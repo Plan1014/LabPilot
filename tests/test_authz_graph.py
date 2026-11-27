@@ -229,7 +229,7 @@ def test_escalate_writes_pending_rows(db, monkeypatch):
 # ==================== REPL 分支 ====================
 
 def test_repl_prompts_and_continues(db, monkeypatch):
-    """REPL（无 session_id）→ 终端里问，不写库。"""
+    """REPL（interactive=True）→ 终端里问，不写库。"""
     from src.agent import graph_thinking
 
     monkeypatch.setattr(judge_module, "judge", FakeJudge())
@@ -241,7 +241,7 @@ def test_repl_prompts_and_continues(db, monkeypatch):
     monkeypatch.setattr(graph_thinking, "llm", fake)
 
     graph = graph_thinking.build_graph()
-    result = graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0})
+    result = graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0, "interactive": True})
 
     # 批准 → 工具执行，产 tool_result
     tool_msgs = _tool_messages(result["messages"])
@@ -262,7 +262,7 @@ def test_repl_deny_produces_denial_tool_result(db, monkeypatch):
     monkeypatch.setattr(graph_thinking, "llm", fake)
 
     graph = graph_thinking.build_graph()
-    result = graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0})
+    result = graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0, "interactive": True})
 
     tool_msgs = _tool_messages(result["messages"])
     assert len(tool_msgs) == 1
@@ -282,7 +282,35 @@ def test_repl_allow_always_records_grant(db, monkeypatch):
     monkeypatch.setattr(graph_thinking, "llm", fake)
 
     graph = graph_thinking.build_graph()
-    graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0})
+    graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0, "interactive": True})
 
     patterns = [g["pattern"] for g in ledger.list_grants()]
     assert "bash:python tmp/x.py" in patterns
+
+
+def test_escalate_without_session_and_without_interactive_is_denied(db, monkeypatch):
+    """既没有会话（弹不了卡）也不是终端（问不了人）→ 没人能裁决 → 关闭式拒绝。
+
+    以前这条路会退化成「问服务端终端」（评审 C3）。
+    """
+    from src.agent import graph_thinking
+
+    monkeypatch.setattr(judge_module, "judge", FakeJudge())
+    monkeypatch.setattr(
+        graph_thinking,
+        "_prompt_cli_decision",
+        lambda v: pytest.fail("没有终端就不该问终端"),
+    )
+    fake = _fake_llm([
+        {"id": "c1", "name": "bash", "type": "tool_call",
+         "args": {"command": "python tmp/x.py"}},
+    ])
+    monkeypatch.setattr(graph_thinking, "llm", fake)
+
+    graph = graph_thinking.build_graph()
+    result = graph.invoke({"messages": [], "pending_tool_calls": [], "step_count": 0})
+
+    tool_msgs = _tool_messages(result["messages"])
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].content.startswith("授权拒绝：")
+    assert result["pending_auth"] is None

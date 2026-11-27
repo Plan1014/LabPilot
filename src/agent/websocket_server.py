@@ -61,6 +61,7 @@ class NotifyRequest(BaseModel):
 class QueryRequest(BaseModel):
     """Payload for /query endpoint."""
     query: str
+    session_id: Optional[str] = None  # 省略 → 新建会话
 
 
 class SessionQueryRequest(BaseModel):
@@ -945,10 +946,7 @@ def create_sse_router():
     async def query_agent(req: QueryRequest):
         """Stream SSE events from agent graph execution."""
         logger.info("[/query] called — query_len=%d", len(req.query))
-        from src.agent.graph_thinking import (
-            build_graph, set_event_emitter, InterleavedState
-        )
-        graph = build_graph()
+        from src.agent.session_manager import create_session, get_session_history
 
         # === Core Memory 注入（缓存失效策略）===
         from src.agent.memory.core import CoreMemoryManager
@@ -969,77 +967,18 @@ def create_sse_router():
         )
         # === RAG 检索结束 ===
 
-        event_queue: queue.Queue = queue.Queue()
-        seen_keys: set[str] = set()
+        # 这条路也得有会话 —— 没有会话，escalate 就没人能裁决：待批批次存不下，
+        # 卡片也发不到客户端，只会去问服务端终端（评审 C3）。
+        session_id = req.session_id or create_session()
+        history = get_session_history(session_id) if req.session_id else []
 
-        def emitter(event: dict):
-            key = _event_dedup_key(event)
-            if key not in seen_keys:
-                seen_keys.add(key)
-                event_queue.put(event)
-
-        async def event_generator():
-            set_event_emitter(emitter)
-            try:
-                # 构建 initial_state，注入 Base System + Core Memory
-                from src.agent.prompt_context import build_prompt_messages
-                from src.agent.tools import SKILLS, TOOLS
-
-                messages_list = build_prompt_messages(
-                    history=[{"role": "user", "content": req.query}],
-                    core_memory=compiled_memory,
-                    retrieved=rag_retrieved,
-                    tools=TOOLS,
-                    skills=SKILLS.descriptions(),
-                )
-
-                # PROMPT_DEBUG=1 —— 把这一轮完整输入打到后端终端（第二轮起只打增量）
-                from src.agent.prompt_debug import maybe_dump
-                maybe_dump(messages_list, {
-                    "session_id": None,
-                    "query": req.query,
-                    "threshold": relevance_threshold(),
-                    "tool_count": len(TOOLS),
-                    "retrieved_facts": len(rag_retrieved.facts),
-                    "retrieved_summaries": len(rag_retrieved.summaries),
-                    "history_rows": 1,
-                }, tools=TOOLS, state_key="sse")
-
-                initial_state = {
-                    "messages": messages_list,
-                    "pending_tool_calls": [],
-                    "step_count": 0,
-                }
-                async for event in graph.astream_events(
-                    initial_state,
-                    config={"recursion_limit": 100},
-                    stream_mode="values",
-                ):
-                    event_type = event.get("event", "")
-                    if event_type == "on_chain_end":
-                        # Drain queue → sort by step → yield immediately
-                        pending: list[dict] = []
-                        while True:
-                            try:
-                                pending.append(event_queue.get_nowait())
-                            except queue.Empty:
-                                break
-                        pending.sort(key=lambda e: e.get("step", 0))
-                        for ev in pending:
-                            yield f"data: {json.dumps(ev)}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'step': 0})}\n\n"
-            finally:
-                set_event_emitter(None)
-                seen_keys.clear()
-
-        return StreamingResponse(
-            event_generator(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+        return await _stream_agent_turn(
+            session_id=session_id,
+            history=history,
+            turn_rows=[{"role": "user", "content": req.query}],
+            compiled_memory=compiled_memory,
+            retrieved=rag_retrieved,
+            query_label=req.query,
         )
 
     return router

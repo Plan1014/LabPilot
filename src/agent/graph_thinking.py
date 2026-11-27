@@ -155,6 +155,7 @@ class InterleavedState:
     pending_tool_calls: list = field(default_factory=list)  # 临时存储待执行的工具调用
     step_count: int = 0
     session_id: Optional[str] = None  # None = REPL (不写 pending);WebSocket 注入 uuid
+    interactive: bool = False  # True = 终端交互（REPL）→ escalate 在终端里问
     pending_ask: Optional[dict] = None  # 本轮发出的提问；非 None 表示在等用户回答
     pending_auth: Optional[dict] = None  # 本轮挂起的鉴权批次；非 None 表示在等用户裁决
 
@@ -760,8 +761,10 @@ def authorize_node(state: InterleavedState) -> dict:
 
     escalations = [x for x in verdicts if x["verdict"].decision == "escalate"]
 
-    # ---- REPL：没有 session_id → 直接在终端里问，批内当场解决 ----
-    if escalations and session_id is None:
+    # ---- 终端交互（REPL）：直接在终端里问，批内当场解决 ----
+    # 「是不是终端」由调用方显式声明（interactive=True），不靠 session_id 猜 ——
+    # 猜错一次就变成去问服务端终端（评审 C3）。
+    if escalations and getattr(state, "interactive", False):
         for item in escalations:
             choice = _prompt_cli_decision(item["verdict"])
             if choice == "deny":
@@ -775,6 +778,14 @@ def authorize_node(state: InterleavedState) -> dict:
                     authz_ledger.record_grant(pattern)
             item["verdict"] = Verdict(
                 "allow", item["verdict"].layer, item["verdict"].reason
+            )
+        escalations = []
+
+    # ---- 既没有会话（弹不了卡）也不是终端（问不了人）→ 没人能裁决，关闭式拒绝 ----
+    if escalations and session_id is None:
+        for item in escalations:
+            item["verdict"] = Verdict(
+                "deny", item["verdict"].layer, "该执行路径不支持人工审批"
             )
         escalations = []
 

@@ -383,6 +383,71 @@ def test_typed_text_while_pending_is_treated_as_deny(client, db, fake_graph, mon
     assert tool_rows[0]["content"].startswith("授权拒绝：")
 
 
+def test_query_route_escalation_becomes_a_card_not_a_server_terminal_prompt(
+    client, db, monkeypatch
+):
+    """C3：`POST /query` 这条路没有会话 → escalate 会去问**服务端终端**。
+
+    浏览器里的用户永远等不到卡片，问的却是守着服务端控制台的人。
+    现在 `/query` 也拿到会话 → 卡片照常发给客户端，服务端终端不该被问。
+    """
+    import builtins
+
+    from langchain_core.messages import AIMessage
+
+    from src.agent import graph_thinking
+    from src.agent import memory as memory_mod
+    from src.agent.authz import judge as judge_module
+    from src.agent.prompt_context import RetrievedMemory
+
+    class _StubRetriever:
+        def retrieve(self, query, threshold=None):
+            return RetrievedMemory(facts=[], summaries=[])
+
+    monkeypatch.setattr(memory_mod, "memory_retriever", _StubRetriever())
+
+    class FakeJudge:
+        def __call__(self, tool_name, tool_input):
+            return judge_module.JudgeResult("escalate", "不确定", "要执行吗？")
+
+    monkeypatch.setattr(judge_module, "judge", FakeJudge())
+
+    class FakeLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def bind_tools(self, tools):
+            return self
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[
+                    {"id": "c1", "name": "bash", "type": "tool_call",
+                     "args": {"command": "python tmp/x.py"}},
+                ])
+            return AIMessage(content="好了")
+
+    monkeypatch.setattr(graph_thinking, "llm", FakeLLM())
+
+    def _no_stdin(prompt=""):
+        raise AssertionError("escalate 不该去问服务端终端")
+
+    monkeypatch.setattr(builtins, "input", _no_stdin)
+
+    r = client.post("/query", json={"query": "跑一下"})
+    assert r.status_code == 200
+    events = _sse_events(r.text)
+    reqs = [e for e in events if e.get("type") == "auth_request"]
+    assert len(reqs) == 1
+    assert reqs[0]["tool_call_id"] == "c1"
+    # 客户端拿得到会话号 —— 它要靠这个号去 /auth/respond 回卡
+    done = [e for e in events if e.get("type") == "done"]
+    assert done and done[0]["session_id"]
+    # 待批记录落库，且挂在真实会话下（不是 NULL）
+    assert len(authz_pending.list_pending(done[0]["session_id"])) == 1
+
+
 # ==================== 多 escalate 批次（评审 C4）====================
 # 一轮里两个调用都要人裁决时，两张卡片都得出来。
 # 后端的事件去重键是 `type:step:name:content:result:input` —— auth_request
